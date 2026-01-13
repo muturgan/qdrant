@@ -49,6 +49,8 @@ pub struct ServiceConfig {
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
+    #[serde(default)]
+    pub jwt_blacklist: Option<String>,
 
     #[serde(default)]
     pub hide_jwt_dashboard: Option<bool>,
@@ -319,11 +321,16 @@ impl Settings {
         // Using HMAC-SHA256, recommended secret size is 32 bytes
         const JWT_RECOMMENDED_SECRET_LENGTH: usize = 256 / 8;
 
-        let all_keys_are_empty = self.service.api_key.clone().unwrap_or_default().is_empty()
+        let all_keys_are_empty = self
+            .service
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
             && self
                 .service
                 .alt_api_key
-                .clone()
+                .as_deref()
                 .unwrap_or_default()
                 .is_empty();
 
