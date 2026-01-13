@@ -168,7 +168,7 @@ impl TryFrom<Option<&str>> for Blacklist {
             }
         };
 
-        return Ok(Blacklist(blacklist));
+        Ok(Blacklist(blacklist))
     }
 }
 
