@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::{env, io};
 
 use api::grpc::transport_channel_pool::{
@@ -39,7 +40,7 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
     #[serde(default)]
-    pub jwt_blacklist: Option<String>,
+    pub jwt_blacklist: Option<BlacklistConfig>,
 
     #[serde(default)]
     pub hide_jwt_dashboard: Option<bool>,
@@ -71,6 +72,13 @@ impl ServiceConfig {
     pub fn hardware_reporting(&self) -> bool {
         self.hardware_reporting.unwrap_or_default()
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum BlacklistConfig {
+    Raw(String),
+    Parsed(HashMap<String, HashSet<String>>),
 }
 
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
