@@ -38,6 +38,8 @@ pub struct ServiceConfig {
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
+    #[serde(default)]
+    pub jwt_blacklist: Option<String>,
 
     #[serde(default)]
     pub hide_jwt_dashboard: Option<bool>,
@@ -310,12 +312,12 @@ impl Settings {
 
         // Log if JWT RBAC is enabled but no API key is set
         if self.service.jwt_rbac.unwrap_or_default() {
-            if self.service.api_key.clone().unwrap_or_default().is_empty() {
+            let api_key = self.service.api_key.as_deref().unwrap_or_default();
+
+            if api_key.is_empty() {
                 log::warn!("JWT RBAC configured but no API key set, JWT RBAC is not enabled")
             // Log if JWT RAC is enabled, API key is set but smaller than recommended size for JWT secret
-            } else if self.service.api_key.clone().unwrap_or_default().len()
-                < JWT_RECOMMENDED_SECRET_LENGTH
-            {
+            } else if api_key.len() < JWT_RECOMMENDED_SECRET_LENGTH {
                 log::warn!(
                     "It is highly recommended to use an API key of {JWT_RECOMMENDED_SECRET_LENGTH} bytes when JWT RBAC is enabled",
                 )
