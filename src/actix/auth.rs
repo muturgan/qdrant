@@ -93,7 +93,7 @@ impl PathMode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Blacklist(HashMap<Method, HashSet<String>>);
 
 impl Blacklist {
@@ -102,7 +102,7 @@ impl Blacklist {
             return false;
         };
 
-        paths.iter().any(|path_str| {
+        let m = paths.iter().any(|path_str| {
             let mut blacklist_iter = path_str.split('/');
             let mut passed_iter = path.split('/');
 
@@ -122,7 +122,11 @@ impl Blacklist {
                     },
                 };
             }
-        })
+        });
+
+        println!("method: {method}, path: {path}, matches: {m}");
+
+        m
     }
 
     #[cfg(test)]
@@ -147,6 +151,19 @@ impl TryFrom<HashMap<String, HashSet<String>>> for Blacklist {
 
             blacklist.insert(method, paths);
         }
+
+        // Принудительно вставляю 1 элемент в blacklist
+        // TODO - удалить
+        match blacklist.get_mut(&Method::PATCH) {
+            Some(paths) => {
+                paths.insert("debugger".into());
+            }
+            None => {
+                let mut set = HashSet::new();
+                set.insert("debugger".into());
+                blacklist.insert(Method::PATCH, set);
+            }
+        };
 
         Ok(Self(blacklist))
     }
@@ -196,6 +213,19 @@ impl TryFrom<&str> for Blacklist {
                         paths.insert(path_str.trim().to_string());
                     }
                 };
+            }
+        };
+
+        // Принудительно вставляю 1 элемент в blacklist
+        // TODO - удалить
+        match blacklist.get_mut(&Method::PATCH) {
+            Some(paths) => {
+                paths.insert("debugger".into());
+            }
+            None => {
+                let mut set = HashSet::new();
+                set.insert("debugger".into());
+                blacklist.insert(Method::PATCH, set);
             }
         };
 
@@ -254,6 +284,8 @@ where
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
         let blacklist_matches = self.blacklist.matches(req.method(), path);
+        println!("actix auth: blacklist_matches: {blacklist_matches}");
+        println!("{} - {path}", req.method());
         Box::pin(async move {
             match auth_keys
                 .validate_request(
@@ -263,6 +295,8 @@ where
                 .await
             {
                 Ok((access, inference_token, auth_type, subject)) => {
+                    println!("actix validation ok");
+
                     let remote = if audit_trust_forwarded_headers() {
                         forwarded::forwarded_for(&req)
                     } else {
@@ -279,6 +313,7 @@ where
                     service.call(req).await
                 }
                 Err(e) => {
+                    println!("actix validation err: {e:?}");
                     let resp = match e {
                         AuthError::Unauthorized(e) => HttpResponse::Unauthorized().body(e),
                         AuthError::Forbidden(e) => HttpResponse::Forbidden().body(e),
