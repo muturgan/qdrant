@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{Ready, ready};
 use std::sync::Arc;
@@ -87,39 +87,34 @@ impl PathMode {
 }
 
 #[derive(Clone)]
-pub struct Blacklist(HashMap<Method, HashSet<String>>);
+pub struct Blacklist(HashMap<Method, Vec<Vec<String>>>);
 
 impl Blacklist {
     pub fn matches(&self, method: &Method, path: &str) -> bool {
-        let Some(paths) = self.0.get(method) else {
+        let Some(blacklist_patterns) = self.0.get(method) else {
             return false;
         };
 
-        paths.iter().any(|path_str| {
-            let mut blacklist_iter = path_str.split('/');
-            let mut passed_iter = path.split('/');
+        let passed_pattern = path.split('/').collect::<Vec<_>>();
 
-            loop {
-                match blacklist_iter.next() {
-                    Some(blacklist_part) => match passed_iter.next() {
-                        Some(passed_part) => {
-                            if blacklist_part != passed_part && blacklist_part != "*" {
-                                return false;
-                            }
-                        }
-                        None => return false,
-                    },
-                    None => match passed_iter.next() {
-                        Some(_passed_part) => return false,
-                        None => return true,
-                    },
-                };
+        blacklist_patterns.iter().any(|blacklist_pattern| {
+            if blacklist_pattern.len() != passed_pattern.len() {
+                return false;
             }
+
+            for (blacklist_part, passed_part) in blacklist_pattern.iter().zip(passed_pattern.iter())
+            {
+                if blacklist_part != passed_part && blacklist_part != "*" {
+                    return false;
+                }
+            }
+
+            true
         })
     }
 
     #[cfg(test)]
-    fn into_inner(self) -> HashMap<Method, HashSet<String>> {
+    fn into_inner(self) -> HashMap<Method, Vec<Vec<String>>> {
         self.0
     }
 }
@@ -156,13 +151,19 @@ impl TryFrom<Option<&str>> for Blacklist {
                     ));
                 }
 
+                let item = path_str
+                    .trim()
+                    .split('/')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+
                 match blacklist.get_mut(&method) {
                     None => {
-                        let paths = HashSet::from([path_str.trim().to_string()]);
+                        let paths = vec![item];
                         blacklist.insert(method, paths);
                     }
                     Some(paths) => {
-                        paths.insert(path_str.trim().to_string());
+                        paths.push(item);
                     }
                 };
             }
@@ -267,5 +268,16 @@ mod tests {
 
         let blacklist = Blacklist::try_from(Some("")).unwrap().into_inner();
         assert!(blacklist.is_empty());
+
+        let blacklist = Blacklist::try_from(Some(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
+        ))
+        .unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
     }
 }
