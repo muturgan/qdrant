@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use actix_web::body::{BoxBody, EitherBody};
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
+use actix_web::http::Method;
 use actix_web::{Error, FromRequest, HttpMessage, HttpResponse, ResponseError};
 use futures_util::future::LocalBoxFuture;
 use storage::rbac::Access;
@@ -14,13 +16,15 @@ use crate::common::auth::{AuthError, AuthKeys};
 pub struct Auth {
     auth_keys: AuthKeys,
     whitelist: Vec<WhitelistItem>,
+    blacklist: Blacklist,
 }
 
 impl Auth {
-    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>) -> Self {
+    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>, blacklist: Blacklist) -> Self {
         Self {
             auth_keys,
             whitelist,
+            blacklist,
         }
     }
 }
@@ -42,6 +46,7 @@ where
         ready(Ok(AuthMiddleware {
             auth_keys: Arc::new(self.auth_keys.clone()),
             whitelist: self.whitelist.clone(),
+            blacklist: self.blacklist.clone(),
             service: Arc::new(service),
         }))
     }
@@ -81,10 +86,99 @@ impl PathMode {
     }
 }
 
+#[derive(Clone)]
+pub struct Blacklist(HashMap<Method, Vec<Vec<String>>>);
+
+impl Blacklist {
+    pub fn matches(&self, method: &Method, path: &str) -> bool {
+        let Some(blacklist_patterns) = self.0.get(method) else {
+            return false;
+        };
+
+        let passed_pattern = path.split('/').collect::<Vec<_>>();
+
+        blacklist_patterns.iter().any(|blacklist_pattern| {
+            if blacklist_pattern.len() != passed_pattern.len() {
+                return false;
+            }
+
+            for (blacklist_part, passed_part) in blacklist_pattern.iter().zip(passed_pattern.iter())
+            {
+                if blacklist_part != passed_part && blacklist_part != "*" {
+                    return false;
+                }
+            }
+
+            true
+        })
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> HashMap<Method, Vec<Vec<String>>> {
+        self.0
+    }
+}
+
+impl TryFrom<Option<&str>> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+        let mut blacklist = HashMap::new();
+
+        if let Some(blacklist_str) = value
+            && !blacklist_str.is_empty()
+        {
+            for pair in blacklist_str.trim().split(',') {
+                let mut pair_iter = pair.trim().split(' ');
+
+                let Some(method_str) = pair_iter.next() else {
+                    return Err(Self::Error::other(
+                        "No method provided for a blacklist item",
+                    ));
+                };
+                let method = Method::from_bytes(method_str.trim().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
+
+                let Some(path_str) = pair_iter.next() else {
+                    return Err(Self::Error::other("No path provided for a blacklist item"));
+                };
+                if pair_iter.next().is_some() {
+                    return Err(Self::Error::other(
+                        "Provided extra parts for a blacklist item",
+                    ));
+                }
+
+                let item = path_str
+                    .trim()
+                    .split('/')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+
+                match blacklist.get_mut(&method) {
+                    None => {
+                        let paths = vec![item];
+                        blacklist.insert(method, paths);
+                    }
+                    Some(paths) => {
+                        paths.push(item);
+                    }
+                };
+            }
+        };
+
+        Ok(Blacklist(blacklist))
+    }
+}
+
 pub struct AuthMiddleware<S> {
     auth_keys: Arc<AuthKeys>,
     /// List of items whitelisted from authentication.
     whitelist: Vec<WhitelistItem>,
+    /// List of items blackisted for JWT authentication by configuration.
+    blacklist: Blacklist,
     service: Arc<S>,
 }
 
@@ -115,9 +209,13 @@ where
 
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
+        let blacklist_matches = self.blacklist.matches(req.method(), path);
         Box::pin(async move {
             match auth_keys
-                .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+                .validate_request(
+                    |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+                    blacklist_matches,
+                )
                 .await
             {
                 Ok((access, inference_token)) => {
@@ -156,5 +254,30 @@ impl FromRequest for ActixAccess {
             Access::full("All requests have full by default access when API key is not configured")
         });
         ready(Ok(ActixAccess(access)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blacklist_parsing() {
+        let blacklist = Blacklist::try_from(None).unwrap().into_inner();
+        assert!(blacklist.is_empty());
+
+        let blacklist = Blacklist::try_from(Some("")).unwrap().into_inner();
+        assert!(blacklist.is_empty());
+
+        let blacklist = Blacklist::try_from(Some(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
+        ))
+        .unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
     }
 }
