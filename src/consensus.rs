@@ -75,7 +75,7 @@ impl Consensus {
         runtime: Handle,
         reinit: bool,
     ) -> anyhow::Result<JoinHandle<std::io::Result<()>>> {
-        println!(
+        log::info!(
             "Consensus::run blacklist: {:#?}",
             settings.service.jwt_blacklist
         );
