@@ -7,10 +7,12 @@ use std::time::Duration;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
 use common::types::TelemetryDetail;
+use futures::future::Either;
 use parking_lot::Mutex as ParkingMutex;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{Filter, SizeStats, SnapshotFormat};
 use shard::snapshots::snapshot_manifest::SnapshotManifest;
+use tokio::sync::oneshot;
 
 use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
@@ -126,41 +128,41 @@ impl Shard {
         }
     }
 
-    pub async fn create_snapshot(
+    pub async fn get_snapshot_creator(
         &self,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
         manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
-        match self {
-            Shard::Local(local_shard) => {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
+        let future = match self {
+            Shard::Local(local_shard) => Either::Left(Either::Left(
                 local_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::Proxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::Proxy(proxy_shard) => Either::Left(Either::Right(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::ForwardProxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::ForwardProxy(proxy_shard) => Either::Right(Either::Left(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::QueueProxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::QueueProxy(proxy_shard) => Either::Right(Either::Right(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
             Shard::Dummy(dummy_shard) => {
-                dummy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
+                return Err(dummy_shard.create_snapshot(temp_path, tar, format, manifest, save_wal));
             }
-        }
+        };
+
+        Ok(future)
     }
 
     pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
@@ -182,7 +184,7 @@ impl Shard {
             Shard::Proxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
             Shard::ForwardProxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
             Shard::QueueProxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.on_optimizer_config_update().await,
+            Shard::Dummy(dummy_shard) => dummy_shard.on_optimizer_config_update(),
         }
     }
 
@@ -192,7 +194,7 @@ impl Shard {
             Shard::Proxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
             Shard::ForwardProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
             Shard::QueueProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.on_strict_mode_config_update().await,
+            Shard::Dummy(dummy_shard) => dummy_shard.on_strict_mode_config_update(),
         }
     }
 
@@ -469,6 +471,32 @@ impl Shard {
             Shard::ForwardProxy(forward_proxy_shard) => forward_proxy_shard.stop_gracefully().await,
             Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.stop_gracefully().await,
             Shard::Dummy(_) => {}
+        }
+    }
+
+    /// Send plunger operation
+    ///
+    /// Returns oneshot channel receiver that will be notified once the plunger operation is
+    /// processed.
+    pub async fn plunge_async(&self) -> CollectionResult<oneshot::Receiver<()>> {
+        // Fake plunger for variants that have no queue
+        let fake_plunger = || {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(());
+            rx
+        };
+
+        match self {
+            Shard::Local(local_shard) => local_shard.plunge_async().await,
+            Shard::Proxy(proxy_shard) => proxy_shard.wrapped_shard.plunge_async().await,
+            Shard::ForwardProxy(forward_proxy_shard) => {
+                forward_proxy_shard.wrapped_shard.plunge_async().await
+            }
+            Shard::QueueProxy(queue_proxy_shard) => match queue_proxy_shard.wrapped_shard() {
+                Some(wrapped_shard) => wrapped_shard.plunge_async().await,
+                None => Ok(fake_plunger()),
+            },
+            Shard::Dummy(_) => Ok(fake_plunger()),
         }
     }
 }

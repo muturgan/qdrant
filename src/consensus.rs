@@ -1489,7 +1489,12 @@ mod tests {
             update_runtime,
             general_runtime,
             ResourceBudget::default(),
-            ChannelService::new(settings.service.http_port, None, None),
+            ChannelService::new(
+                settings.service.http_port,
+                settings.service.enable_tls,
+                None,
+                None,
+            ),
             persistent_state.this_peer_id(),
             Some(operation_sender.clone()),
         );
@@ -1514,7 +1519,12 @@ mod tests {
             6335,
             ConsensusConfig::default(),
             None,
-            ChannelService::new(settings.service.http_port, None, None),
+            ChannelService::new(
+                settings.service.http_port,
+                settings.service.enable_tls,
+                None,
+                None,
+            ),
             handle.clone(),
             false,
         )

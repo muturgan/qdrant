@@ -40,26 +40,26 @@ impl DummyShard {
         }
     }
 
-    pub async fn create_snapshot(
+    pub fn create_snapshot(
         &self,
         _temp_path: &Path,
         _tar: &tar_ext::BuilderExt,
         _format: SnapshotFormat,
         _manifest: Option<SnapshotManifest>,
         _save_wal: bool,
-    ) -> CollectionResult<()> {
-        self.dummy()
+    ) -> CollectionError {
+        self.dummy_error()
     }
 
     pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
         Ok(SnapshotManifest::default())
     }
 
-    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+    pub fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.dummy()
     }
 
-    pub async fn on_strict_mode_config_update(&mut self) {}
+    pub fn on_strict_mode_config_update(&mut self) {}
 
     pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
         LocalShardTelemetry {
@@ -94,8 +94,12 @@ impl DummyShard {
         self.dummy()
     }
 
+    fn dummy_error(&self) -> CollectionError {
+        CollectionError::service_error(self.message.clone())
+    }
+
     fn dummy<T>(&self) -> CollectionResult<T> {
-        Err(CollectionError::service_error(self.message.clone()))
+        Err(self.dummy_error())
     }
 }
 
