@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::{env, io};
 
 use api::grpc::transport_channel_pool::{
@@ -50,6 +51,8 @@ pub struct ServiceConfig {
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
+    #[serde(default)]
+    pub jwt_blacklist: Option<BlacklistConfig>,
 
     #[serde(default)]
     pub hide_jwt_dashboard: Option<bool>,
@@ -81,6 +84,13 @@ impl ServiceConfig {
     pub fn hardware_reporting(&self) -> bool {
         self.hardware_reporting.unwrap_or_default()
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum BlacklistConfig {
+    Raw(String),
+    Parsed(HashMap<String, HashSet<String>>),
 }
 
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
@@ -302,6 +312,10 @@ impl Settings {
 
         // Build and merge config and deserialize into Settings, attach any load errors we had
         let mut settings: Settings = config.build()?.try_deserialize()?;
+        log::info!(
+            "Settings::new blacklist: {:#?}",
+            settings.service.jwt_blacklist
+        );
         settings.load_errors.extend(load_errors);
         Ok(settings)
     }
