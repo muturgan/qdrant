@@ -12,11 +12,9 @@ pub struct JwtParser {
 }
 
 impl JwtParser {
-    const ALGORITHM: Algorithm = Algorithm::HS256;
-
-    pub fn new(secret: &str) -> Self {
+    pub fn new(secret: &str, algorithm: Option<Algorithm>) -> Self {
         let key = DecodingKey::from_secret(secret.as_bytes());
-        let mut validation = Validation::new(Self::ALGORITHM);
+        let mut validation = Validation::new(algorithm.unwrap_or_default(/* HS256 */));
 
         // Qdrant server is the only audience
         validation.validate_aud = false;
@@ -60,11 +58,11 @@ mod tests {
 
     use super::*;
 
-    pub fn create_token(claims: &Claims) -> String {
+    pub fn create_token(claims: &Claims, algorithm: Option<Algorithm>) -> String {
         use jsonwebtoken::{EncodingKey, Header, encode};
 
         let key = EncodingKey::from_secret("secret".as_ref());
-        let header = Header::new(JwtParser::ALGORITHM);
+        let header = Header::new(algorithm.unwrap_or_default());
         encode(&header, claims, &key).unwrap()
     }
 
@@ -86,10 +84,10 @@ mod tests {
             value_exists: None,
             subject: None,
         };
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         let secret = "secret";
-        let parser = JwtParser::new(secret);
+        let parser = JwtParser::new(secret, None);
         let decoded_claims = parser.decode(&token).unwrap().unwrap();
 
         assert_eq!(claims, decoded_claims);
@@ -117,11 +115,40 @@ mod tests {
             value_exists: None,
             subject: None,
         };
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         let secret = "secret";
-        let parser = JwtParser::new(secret);
+        let parser = JwtParser::new(secret, None);
         assert!(parser.decode(&token).unwrap().is_err()); // Validation should fail due to PayloadConstraint
+    }
+
+    #[test]
+    fn test_jwt_parser_with_non_default_algorithm() {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let claims = Claims {
+            sub: None,
+            exp: Some(exp),
+            access: Access::Collection(CollectionAccessList(vec![CollectionAccess {
+                collection: "collection".to_string(),
+                access: CollectionAccessMode::ReadWrite,
+                #[expect(deprecated)]
+                payload: None,
+            }])),
+            value_exists: None,
+            subject: None,
+        };
+
+        let algorithm = Algorithm::ES256;
+        let token = create_token(&claims, algorithm.into());
+
+        let secret = "secret";
+        let parser = JwtParser::new(secret, algorithm.into());
+        let decoded_claims = parser.decode(&token).unwrap().unwrap();
+
+        assert_eq!(claims, decoded_claims);
     }
 
     #[test]
@@ -140,10 +167,10 @@ mod tests {
             subject: None,
         };
 
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         let secret = "secret";
-        let parser = JwtParser::new(secret);
+        let parser = JwtParser::new(secret, None);
         assert!(matches!(
             parser.decode(&token),
             Some(Err(AuthError::Forbidden(_)))
@@ -151,7 +178,7 @@ mod tests {
 
         // Remove the exp claim and it should work
         claims.exp = None;
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         let decoded_claims = parser.decode(&token).unwrap().unwrap();
 
@@ -168,10 +195,10 @@ mod tests {
             subject: None,
         };
 
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         let secret = "secret";
-        let parser = JwtParser::new(secret);
+        let parser = JwtParser::new(secret, None);
 
         assert!(matches!(parser.decode(&token), Some(Ok(_))));
     }
@@ -185,13 +212,17 @@ mod tests {
             value_exists: None,
             subject: None,
         };
-        let token = create_token(&claims);
+        let token = create_token(&claims, None);
 
         assert!(matches!(
-            JwtParser::new("wrong-secret").decode(&token),
+            JwtParser::new("wrong-secret", None).decode(&token),
             Some(Err(AuthError::Forbidden(_)))
         ));
 
-        assert!(JwtParser::new("secret").decode("foo.bar.baz").is_none());
+        assert!(
+            JwtParser::new("secret", None)
+                .decode("foo.bar.baz")
+                .is_none()
+        );
     }
 }

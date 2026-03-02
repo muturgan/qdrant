@@ -8,6 +8,7 @@ use collection::operations::validation;
 use collection::shards::shard::PeerId;
 use common::flags::FeatureFlags;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
+use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 use storage::types::StorageConfig;
 use validator::{Validate, ValidationError};
@@ -55,6 +56,8 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub verify_https_client_certificate: bool,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_algorithm: Option<Algorithm>,
 
     /// Same as `api_key`, can be used for rolling key rotation.
     pub alt_api_key: Option<String>,

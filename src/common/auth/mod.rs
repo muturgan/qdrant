@@ -59,11 +59,11 @@ impl AuthKeys {
                 service_config
                     .api_key
                     .as_ref()
-                    .map(|secret| JwtParser::new(secret)),
+                    .map(|secret| JwtParser::new(secret, service_config.api_key_algorithm)),
                 service_config
                     .alt_api_key
                     .as_ref()
-                    .map(|secret| JwtParser::new(secret)),
+                    .map(|secret| JwtParser::new(secret, service_config.api_key_algorithm)),
             )
         } else {
             (None, None)
