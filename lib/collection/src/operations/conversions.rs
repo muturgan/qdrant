@@ -576,20 +576,18 @@ impl From<api::grpc::qdrant::CollectionWarning> for CollectionWarning {
 
 impl From<UpdateQueueInfo> for api::grpc::qdrant::UpdateQueueInfo {
     fn from(value: UpdateQueueInfo) -> Self {
-        let UpdateQueueInfo { length, op_num } = value;
+        let UpdateQueueInfo { length } = value;
         Self {
             length: length as u64,
-            op_num: op_num.map(|x| x as u64),
         }
     }
 }
 
 impl From<api::grpc::qdrant::UpdateQueueInfo> for UpdateQueueInfo {
     fn from(value: api::grpc::qdrant::UpdateQueueInfo) -> Self {
-        let api::grpc::qdrant::UpdateQueueInfo { length, op_num } = value;
+        let api::grpc::qdrant::UpdateQueueInfo { length } = value;
         Self {
             length: length as usize,
-            op_num: op_num.map(|x| x as usize),
         }
     }
 }
@@ -1940,9 +1938,9 @@ impl TryFrom<api::grpc::qdrant::CollectionConfig> for CollectionConfig {
 impl From<rest::FeedbackStrategy> for FeedbackStrategy {
     fn from(strategy: rest::FeedbackStrategy) -> Self {
         match strategy {
-            rest::FeedbackStrategy::Naive(rest::NaiveFeedbackStrategy { a, b, c }) => {
-                FeedbackStrategy::Naive { a, b, c }
-            }
+            rest::FeedbackStrategy::Naive(rest::NaiveFeedbackStrategy {
+                naive: rest::NaiveFeedbackStrategyParams { a, b, c },
+            }) => FeedbackStrategy::Naive { a, b, c },
         }
     }
 }

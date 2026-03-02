@@ -24,8 +24,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{cmp, thread};
 
 use arc_swap::ArcSwap;
 use common::budget::ResourceBudget;
@@ -46,6 +46,7 @@ use segment::index::field_index::{CardinalityEstimation, EstimationMerge};
 use segment::segment_constructor::{build_segment, load_segment, normalize_segment_dir};
 use segment::types::{
     Filter, PayloadIndexInfo, PayloadKeyType, PointIdType, SegmentConfig, SegmentType,
+    SeqNumberType,
 };
 use shard::files::{NEWEST_CLOCKS_PATH, OLDEST_CLOCKS_PATH, ShardDataFiles};
 use shard::operations::CollectionUpdateOperations;
@@ -72,7 +73,7 @@ use crate::operations::OperationWithClockTag;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
     CollectionError, CollectionResult, OptimizationSegmentInfo, OptimizersStatus,
-    PendingOptimization, ShardInfoInternal, ShardStatus, UpdateQueueInfo,
+    PendingOptimization, ShardInfoInternal, ShardStatus, ShardUpdateQueueInfo,
     check_sparse_compatible_with_segment_config,
 };
 use crate::optimizers_builder::{OptimizersConfig, build_optimizers, clear_temp_segments};
@@ -939,8 +940,8 @@ impl LocalShard {
         SegmentsSearcher::read_filtered(segments, filter, runtime_handle, hw_counter, timeout).await
     }
 
-    pub fn local_update_queue_info(&self) -> UpdateQueueInfo {
-        UpdateQueueInfo {
+    pub fn local_update_queue_info(&self) -> ShardUpdateQueueInfo {
+        ShardUpdateQueueInfo {
             length: self.update_queue_length(),
             op_num: self.applied_seq_handler.op_num().map(|s| s as usize),
         }
@@ -1080,7 +1081,7 @@ impl LocalShard {
         let queued = scheduled
             .into_iter()
             .map(|(optimizer, segment_ids)| PendingOptimization {
-                optimizer: optimizer.name(),
+                optimizer: optimizer.name().to_string(),
                 segments: segment_ids
                     .into_iter()
                     .filter_map(|segment_id| {
@@ -1157,6 +1158,24 @@ impl LocalShard {
     /// This also updates the highest seen clocks.
     pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) {
         self.wal.update_cutoff(cutoff).await
+    }
+
+    /// Get the last N entries from the WAL
+    ///
+    /// Returns a vector of (sequence_number, operation) tuples, newest first.
+    pub async fn get_wal_entries(&self, count: u64) -> Vec<(SeqNumberType, OperationWithClockTag)> {
+        let wal = self.wal.wal.lock().await;
+
+        if wal.len(true) == 0 {
+            return Vec::new();
+        }
+
+        let count = cmp::min(count, wal.len(true));
+
+        let end = wal.last_index();
+        let start = end.saturating_sub(count);
+
+        wal.read_range(start..end + 1).rev().collect()
     }
 
     /// Check if the read rate limiter allows the operation to proceed
@@ -1298,18 +1317,16 @@ impl LocalShardClocks {
     }
 
     /// Put clock data from the disk into an archive.
-    pub async fn archive_data(from: &Path, tar: &tar_ext::BuilderExt) -> CollectionResult<()> {
+    pub fn archive_data(from: &Path, tar: &tar_ext::BuilderExt) -> CollectionResult<()> {
         let newest_clocks_from = Self::newest_clocks_path(from);
         let oldest_clocks_from = Self::oldest_clocks_path(from);
 
         if newest_clocks_from.exists() {
-            tar.append_file(&newest_clocks_from, Path::new(NEWEST_CLOCKS_PATH))
-                .await?;
+            tar.blocking_append_file(&newest_clocks_from, Path::new(NEWEST_CLOCKS_PATH))?;
         }
 
         if oldest_clocks_from.exists() {
-            tar.append_file(&oldest_clocks_from, Path::new(OLDEST_CLOCKS_PATH))
-                .await?;
+            tar.blocking_append_file(&oldest_clocks_from, Path::new(OLDEST_CLOCKS_PATH))?;
         }
 
         Ok(())

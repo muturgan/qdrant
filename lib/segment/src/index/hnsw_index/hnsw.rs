@@ -13,12 +13,12 @@ use common::cow::BoxCow;
 use common::cpu::linux_low_thread_priority;
 use common::ext::BitSliceExt as _;
 use common::flags::FeatureFlags;
+use common::fs::clear_disk_cache;
 use common::progress_tracker::ProgressTracker;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use fs_err as fs;
 use itertools::EitherOrBoth;
 use log::{debug, trace};
-use memory::fadvise::clear_disk_cache;
 use parking_lot::Mutex;
 use rand::Rng;
 use rayon::ThreadPool;
@@ -580,9 +580,9 @@ impl HNSWIndex {
                 // $1/m$ points left.
                 // So blocks larger than $1/m$ are not needed.
                 // We add multiplier for the extra safety.
-                let percolation_multiplier = 4;
+                const PERCOLATION_MULTIPLIER: usize = 4;
                 let max_block_size = if config.m > 0 {
-                    total_vector_count / average_links_per_0_level_int * percolation_multiplier
+                    total_vector_count / average_links_per_0_level_int * PERCOLATION_MULTIPLIER
                 } else {
                     usize::MAX
                 };
@@ -603,6 +603,18 @@ impl HNSWIndex {
                         &vector_storage_ref,
                         stopped,
                     );
+
+                    // This is a heuristic to skip building graph for mostly deleted blocks.
+                    // It might be, that majority of points do not actually have vectors
+                    // (vectors marked as deleted), so we can avoid building graph for such blocks.
+                    //
+                    // FYI: query heuristic does account
+                    // for deleted vectors via [`adjust_to_available_vectors`]
+                    const DELETED_POINTS_FACTOR: usize = 4; // allow block to have up to 75% of deleted points and still be indexed
+
+                    if points_to_index.len() <= full_scan_threshold / DELETED_POINTS_FACTOR {
+                        continue;
+                    }
 
                     if !is_tenant
                         && index_pos > 0
@@ -1222,14 +1234,14 @@ impl HNSWIndex {
     fn search_plain_batched(
         &self,
         vectors: &[&QueryVector],
-        filtered_points: &[PointOffsetType],
+        filtered_points: impl Iterator<Item = PointOffsetType>,
         top: usize,
         params: Option<&SearchParams>,
         vector_query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
         self.search_plain_iterator_batched(
             vectors,
-            filtered_points.iter().copied(),
+            filtered_points,
             top,
             params,
             vector_query_context,
@@ -1256,13 +1268,21 @@ impl HNSWIndex {
         params: Option<&SearchParams>,
         vector_query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        let hw_counter = &vector_query_context.hardware_counter();
+        let is_stopped = &vector_query_context.is_stopped();
+
+        let id_tracker = self.id_tracker.borrow();
         let payload_index = self.payload_index.borrow();
-        let filtered_points = payload_index.query_points(
+        let query_cardinality = payload_index.estimate_cardinality(filter, hw_counter);
+        // Assume query is already estimated to be small enough so we can iterate over all matched ids
+        let filtered_points = payload_index.iter_filtered_points(
             filter,
-            &vector_query_context.hardware_counter(),
-            &vector_query_context.is_stopped(),
+            &*id_tracker,
+            &query_cardinality,
+            hw_counter,
+            is_stopped,
         );
-        self.search_plain_batched(vectors, &filtered_points, top, params, vector_query_context)
+        self.search_plain_batched(vectors, filtered_points, top, params, vector_query_context)
     }
 
     fn discovery_search_with_graph(
