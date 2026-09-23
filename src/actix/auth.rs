@@ -13,7 +13,7 @@ use storage::rbac::{Access, AccessRequirements, CollectionMultipass};
 
 use super::forwarded;
 use super::helpers::HttpError;
-use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType};
+use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
 use crate::settings::BlacklistConfig;
 
 /// Actix middleware factory that validates API keys / JWTs and inserts an
@@ -296,6 +296,7 @@ where
                     service.call(req).await
                 }
                 Err(e) => {
+                    log_denied_auth(req.path(), remote.clone(), tracing_id, &e);
                     let resp = match e {
                         AuthError::Unauthorized(e) => HttpResponse::Unauthorized().body(e),
                         AuthError::Forbidden(e) => HttpResponse::Forbidden().body(e),
