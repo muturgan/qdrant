@@ -1,17 +1,18 @@
 mod flush;
 pub mod locked;
+pub use flush::FlushMode;
 pub mod read_points;
 mod snapshot;
 #[cfg(test)]
 mod tests;
 
-use std::cmp::{max, min};
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
-use std::ops::Deref;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -20,37 +21,64 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::process_counter::ProcessCounter;
 use common::save_on_disk::SaveOnDisk;
 use common::toposort::TopoSort;
+use common::types::{DeferredBehavior, PointOffsetType};
+use itertools::Itertools;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rand::seq::IndexedRandom;
 use segment::common::operation_error::{OperationError, OperationResult};
 use segment::data_types::named_vectors::NamedVectors;
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::entry::{
+    NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry, StorageSegmentEntry,
+};
 use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
-use segment::types::{ExtendedPointId, Payload, PointIdType, SegmentConfig, SeqNumberType};
-use smallvec::{SmallVec, smallvec};
+use segment::types::{
+    ExtendedPointId, Payload, PointIdType, RawPayload, SegmentConfig, SeqNumberType, VectorNameBuf,
+    WithVector,
+};
+use smallvec::SmallVec;
 
-use crate::locked_segment::LockedSegment;
+use crate::locked_segment::{DropDataOutcome, LockedSegment};
 use crate::payload_index_schema::PayloadIndexSchema;
+use crate::segment_manifest::{NewSegmentToken, SegmentsManifest};
 
 pub type SegmentId = usize;
 
-/// Internal structure for deduplication of points. Used for BinaryHeap
-#[derive(Eq, PartialEq)]
-struct DedupPoint {
-    point_id: PointIdType,
-    segment_id: SegmentId,
+/// All occurrences of a point across segments: (segment_id, version, is_deferred).
+type PointOccurrences = SmallVec<[(SegmentId, SeqNumberType, bool); 2]>;
+
+/// Result of running a [`DeferredAction`].
+pub enum PostFlushOutcome {
+    /// The action completed and should be removed from the queue.
+    Done,
+    /// The action could not complete yet; keep it queued and retry on a later flush. Its ack pin
+    /// stays in effect until it completes.
+    Retry,
 }
 
-impl Ord for DedupPoint {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.point_id.cmp(&other.point_id).reverse()
-    }
+/// An action deferred until a flush proves the data it touches is durable.
+/// See [`SegmentHolder::register_post_flush_action`].
+struct DeferredAction {
+    /// Run the action once the durable waterline reaches this version.
+    ready_at: SeqNumberType,
+    /// Until the action completes, cap the WAL acknowledge at this version.
+    ack_pin: SeqNumberType,
+    /// Retryable: returns [`PostFlushOutcome::Retry`] (or `Err`) without finishing, and is called
+    /// again on a later flush. Must keep enough state to resume.
+    action: Box<dyn FnMut() -> OperationResult<PostFlushOutcome> + Send>,
 }
 
-impl PartialOrd for DedupPoint {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl std::fmt::Debug for DeferredAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            ready_at,
+            ack_pin,
+            action: _,
+        } = self;
+        f.debug_struct("DeferredAction")
+            .field("ready_at", ready_at)
+            .field("ack_pin", ack_pin)
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,12 +109,33 @@ pub struct SegmentHolder {
     /// so we can clear all dependencies after flushing up to certain operation.
     flush_dependency: Arc<Mutex<TopoSort<SegmentId, SeqNumberType>>>,
 
+    /// Actions deferred until a flush proves the data they touch is durable.
+    /// Each runs once the durable waterline reaches its `ready_at`, and pins the WAL
+    /// acknowledge at its `ack_pin` until then. See [`SegmentHolder::register_post_flush_action`].
+    post_flush_actions: Mutex<Vec<DeferredAction>>,
+
+    /// Ack-pin floor of the actions `run_ready_post_flush_actions` is currently running, while they
+    /// are briefly removed from `post_flush_actions`. Folded into `pending_post_flush_ack_cap` so a
+    /// concurrent flush cannot advance the WAL acknowledge past their pins during that window.
+    /// Guarded by the `post_flush_actions` lock (always taken first) to stay consistent with it.
+    in_flight_ack_floor: Mutex<Option<SeqNumberType>>,
+
     /// Holder for a thread, which does flushing of all segments sequentially.
     /// This is used to avoid multiple concurrent flushes.
     pub flush_thread: Mutex<Option<JoinHandle<OperationResult<()>>>>,
 
     /// The amount of currently running optimizations.
     pub running_optimizations: ProcessCounter,
+
+    /// On-disk manifest of this shard's segments, kept in sync with the live segment set so that
+    /// out-of-process readers can discover segments. `None` when the `write_segment_manifest`
+    /// feature flag is off (or before the holder has been wired up, e.g. during loading).
+    ///
+    /// The manifest is owned here, by the single source of truth for segment membership, precisely
+    /// so that no segment can be added or removed without the manifest following: every mutation
+    /// funnels through [`add_existing_locked`](Self::add_existing_locked) and
+    /// [`remove`](Self::remove), which reconcile it.
+    segment_manifest: Option<Arc<SaveOnDisk<SegmentsManifest>>>,
 }
 
 impl Drop for SegmentHolder {
@@ -94,6 +143,45 @@ impl Drop for SegmentHolder {
         if let Err(flushing_err) = self.lock_flushing() {
             log::error!("Failed to flush segments holder during drop: {flushing_err}");
         }
+    }
+}
+
+/// Builder for a [`SegmentHolder`] that guarantees its segment manifest is wired up.
+///
+/// The only way to get a finished [`SegmentHolder`] out is [`build`](Self::build), which initializes
+/// the manifest from the populated segment set — so a shard's holder can never be constructed
+/// without it (no separate, easy-to-forget init step). Populate it through the deref to
+/// [`SegmentHolder`] (e.g. [`add_new`](SegmentHolder::add_new)), then call `build`.
+#[must_use = "the segment holder is only created by calling `.build(shard_path)`"]
+pub struct SegmentHolderBuilder {
+    holder: SegmentHolder,
+}
+
+impl SegmentHolderBuilder {
+    fn new() -> Self {
+        Self {
+            holder: SegmentHolder::default(),
+        }
+    }
+
+    /// Finalize: initialize the segment manifest from the current segment set and return the holder.
+    pub fn build(mut self, shard_path: &Path) -> OperationResult<SegmentHolder> {
+        self.holder.init_segment_manifest(shard_path)?;
+        Ok(self.holder)
+    }
+}
+
+impl Deref for SegmentHolderBuilder {
+    type Target = SegmentHolder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.holder
+    }
+}
+
+impl DerefMut for SegmentHolderBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.holder
     }
 }
 
@@ -114,6 +202,66 @@ impl SegmentHolder {
             LockedSegment::Original(original) => Some((id, original)),
             LockedSegment::Proxy(_) => None,
         })
+    }
+
+    /// Start building a holder. The only way to obtain a finished [`SegmentHolder`] from the builder
+    /// is [`SegmentHolderBuilder::build`], which wires up the segment manifest — so a shard's holder
+    /// can never be constructed without it.
+    pub fn builder() -> SegmentHolderBuilder {
+        SegmentHolderBuilder::new()
+    }
+
+    /// Attach a pre-built segment manifest to this holder. Test-only escape hatch; production code
+    /// goes through [`SegmentHolder::builder`] so the manifest is always initialized.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_segment_manifest(&mut self, manifest: Option<Arc<SaveOnDisk<SegmentsManifest>>>) {
+        self.segment_manifest = manifest;
+    }
+
+    /// Initialize the segment manifest from the current segments and attach it to this holder, when
+    /// the `write_segment_manifest` feature flag is enabled. No-op when disabled.
+    ///
+    /// Private: only [`SegmentHolderBuilder::build`] calls this, right after the holder has been
+    /// populated, so the manifest reflects the initial segment set. From then on the holder keeps it
+    /// in sync.
+    fn init_segment_manifest(&mut self, shard_path: &Path) -> OperationResult<()> {
+        if !common::flags::feature_flags().write_segment_manifest {
+            return Ok(());
+        }
+
+        let manifest = SegmentsManifest::from_segment_holder(self);
+        let manifest = SaveOnDisk::new(crate::files::segment_manifest_path(shard_path), manifest)
+            .map_err(|err| {
+            OperationError::service_error(format!("failed to write segment manifest: {err}"))
+        })?;
+        self.segment_manifest = Some(Arc::new(manifest));
+        Ok(())
+    }
+
+    /// Register a newly built segment in the on-disk manifest, consuming its [`NewSegmentToken`].
+    ///
+    /// The token is produced when a segment is built (e.g. [`build_tmp_segment`](Self::build_tmp_segment));
+    /// its `#[must_use]` marker turns "built a segment but forgot to register it" into a compiler
+    /// warning. Reconciles the manifest with the current live segment set.
+    ///
+    /// No-op when no manifest is attached (feature flag off / not yet wired). Errors propagate so
+    /// callers that gate destructive work (deleting superseded segments from disk) on a fresh
+    /// manifest can abort instead of risking a stale manifest. Idempotent: only writes on change.
+    pub fn sync_segment_manifest(&self, token: Option<NewSegmentToken>) -> OperationResult<()> {
+        // Register the newly built segment ASAP: it exists on disk, so it must be in the manifest,
+        // even if it has not been added to the holder yet (passed as `extra_segment`).
+        SegmentsManifest::sync(self.segment_manifest.as_ref(), self, token.map(|t| t.id()))
+    }
+
+    /// Build the segment manifest (`segments_manifest.json`) describing the current live segments,
+    /// for inclusion in a shard snapshot.
+    ///
+    /// Returns `None` when no manifest is attached (the `write_segment_manifest` feature flag is
+    /// off), so the snapshot omits the file exactly when the running shard would not have one.
+    pub fn segment_manifest_for_snapshot(&self) -> Option<SegmentsManifest> {
+        self.segment_manifest
+            .as_ref()
+            .map(|_| SegmentsManifest::from_segment_holder(self))
     }
 
     pub fn len(&self) -> usize {
@@ -283,9 +431,248 @@ impl SegmentHolder {
         self.appendable_segments.keys().copied().collect()
     }
 
+    /// Whether `segment` is smaller than `max_segment_size_bytes`.
+    ///
+    /// A segment that cannot be measured right now counts as having capacity, the size cap is
+    /// best effort.
+    fn segment_has_capacity(segment: &LockedSegment, max_segment_size_bytes: NonZeroUsize) -> bool {
+        let segment_arc = segment.get();
+        let Some(segment) = segment_arc.try_read() else {
+            return true;
+        };
+        match segment.max_available_vectors_size_in_bytes() {
+            Ok(size) => size < max_segment_size_bytes.get(),
+            Err(err) => {
+                log::error!("Failed to get segment size, ignoring: {err}");
+                true
+            }
+        }
+    }
+
+    /// Return appendable segment IDs smaller than `max_segment_size_bytes`, sorted by IDs.
+    fn eligible_appendable_segments_ids(
+        &self,
+        max_segment_size_bytes: Option<NonZeroUsize>,
+    ) -> Vec<SegmentId> {
+        let Some(max_segment_size_bytes) = max_segment_size_bytes else {
+            return self.appendable_segments_ids();
+        };
+
+        self.appendable_segments
+            .iter()
+            .filter(|(_, segment)| Self::segment_has_capacity(segment, max_segment_size_bytes))
+            .map(|(segment_id, _)| *segment_id)
+            .collect()
+    }
+
+    /// Whether at least one appendable segment is smaller than `max_segment_size_bytes`.
+    /// Also `false` when there is no appendable segment at all.
+    pub fn has_appendable_segment_with_capacity(
+        &self,
+        max_segment_size_bytes: Option<NonZeroUsize>,
+    ) -> bool {
+        let Some(max_segment_size_bytes) = max_segment_size_bytes else {
+            return !self.appendable_segments.is_empty();
+        };
+
+        self.appendable_segments
+            .values()
+            .any(|segment| Self::segment_has_capacity(segment, max_segment_size_bytes))
+    }
+
+    /// Candidate destinations for copy-on-write moves, computed lazily on the first move and
+    /// kept in `cache` for the rest of the call.
+    ///
+    /// Falls back to all appendable segments when none is below the cap, a write must not fail
+    /// for lack of capacity.
+    fn cow_destination_candidates<'a>(
+        &self,
+        cache: &'a mut Option<Vec<SegmentId>>,
+        max_segment_size_bytes: Option<NonZeroUsize>,
+    ) -> &'a [SegmentId] {
+        cache.get_or_insert_with(|| {
+            let eligible = self.eligible_appendable_segments_ids(max_segment_size_bytes);
+            if eligible.is_empty() {
+                self.appendable_segments_ids()
+            } else {
+                eligible
+            }
+        })
+    }
+
     /// Return non-appendable segment IDs sorted by IDs
     pub fn non_appendable_segments_ids(&self) -> Vec<SegmentId> {
         self.non_appendable_segments.keys().copied().collect()
+    }
+
+    /// Register an action to run once a future flush proves its data durable, i.e. the durable
+    /// waterline (the version every segment is persisted up to) has reached `ready_at`. Until it
+    /// runs, the version returned by [`flush_all`](Self::flush_all), and thus the WAL acknowledge,
+    /// is capped at `ack_pin`, so any operation the not-yet-cleaned data contradicts stays
+    /// replayable across a restart.
+    ///
+    /// Optimizations use this to defer destroying a swapped-out source segment. Points are
+    /// copy-on-write moved out of it in memory, and WAL replay can re-derive such a move only
+    /// while the source's on-disk pre-image survives; the moved copies may still sit unflushed in
+    /// appendable segments, so destroying the source right at the swap would lose them on a
+    /// restart. Deferring the destruction to `ready_at` (the optimized segment's version) ensures
+    /// those copies are durable in their new home first; in the meantime a restart loads the old
+    /// files next to their replacement and load-time deduplication resolves the overlap.
+    ///
+    /// `ack_pin` is the version up to which the deferred files stay truthful (the source segment's
+    /// persisted version). Beyond it they contradict newer state living elsewhere, most importantly
+    /// deletions: the files keep a deleted point positively alive, and an absence in the
+    /// replacement segment cannot outvote it at load time. Capping the WAL acknowledge at `ack_pin`
+    /// keeps those operations replayable until the files are gone; the same pin the proxy imposed
+    /// while the optimization ran, extended until the action runs.
+    ///
+    /// `action` is retried on a later flush if it returns [`PostFlushOutcome::Retry`] or `Err`, so
+    /// the ack pin survives a transient failure (e.g. the data is briefly still in use); see
+    /// [`run_ready_post_flush_actions`](Self::run_ready_post_flush_actions).
+    pub fn register_post_flush_action(
+        &self,
+        ready_at: SeqNumberType,
+        ack_pin: SeqNumberType,
+        action: impl FnMut() -> OperationResult<PostFlushOutcome> + Send + 'static,
+    ) {
+        self.post_flush_actions.lock().push(DeferredAction {
+            ready_at,
+            ack_pin,
+            action: Box::new(action),
+        });
+    }
+
+    /// Register a [post-flush action](Self::register_post_flush_action) that destroys `segment`'s
+    /// data once durable. If the segment is still in use when the action runs, it is handed back
+    /// and the destruction is retried on a later flush, keeping the `ack_pin` in effect until the
+    /// files are actually gone.
+    pub fn register_segment_drop(
+        &self,
+        ready_at: SeqNumberType,
+        ack_pin: SeqNumberType,
+        segment: LockedSegment,
+    ) {
+        let mut segment = Some(segment);
+        self.register_post_flush_action(ready_at, ack_pin, move || {
+            let to_drop = segment
+                .take()
+                .expect("post-flush segment drop retried after completion");
+            match to_drop.try_drop_data() {
+                Ok(()) => Ok(PostFlushOutcome::Done),
+                Err(DropDataOutcome::StillInUse(returned, err)) => {
+                    log::warn!(
+                        "Deferred segment data destruction not ready yet, will retry: {err}"
+                    );
+                    segment = Some(returned);
+                    Ok(PostFlushOutcome::Retry)
+                }
+                Err(DropDataOutcome::Failed(err)) => Err(err),
+            }
+        });
+    }
+
+    /// The WAL acknowledge cap imposed by pending post-flush actions, if any: the minimum `ack_pin`
+    /// across both the queued actions and any currently being run (briefly out of the queue, see
+    /// `in_flight_ack_floor`). See [`SegmentHolder::register_post_flush_action`].
+    pub(super) fn pending_post_flush_ack_cap(&self) -> Option<SeqNumberType> {
+        // Hold the actions lock across both reads so the result is consistent with
+        // `run_ready_post_flush_actions`, which moves actions between the queue and the floor under
+        // it. Lock order is always actions then floor.
+        let actions = self.post_flush_actions.lock();
+        let queued = actions.iter().map(|action| action.ack_pin).min();
+        let in_flight = *self.in_flight_ack_floor.lock();
+        drop(actions);
+
+        match (queued, in_flight) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (cap, None) | (None, cap) => cap,
+        }
+    }
+
+    /// Run every post-flush action whose `ready_at` is covered by the durable waterline
+    /// `persisted_version` (every segment's state up to that version is on disk, so the data each
+    /// action cleans up is durable in its new home and replay of any still-unacknowledged
+    /// operation on it is an idempotent no-op).
+    ///
+    /// Returns the remaining WAL acknowledge cap: the minimum `ack_pin` of the actions that did
+    /// not run, or `None` when none are pending. See [`SegmentHolder::register_post_flush_action`].
+    ///
+    /// Like the WAL acknowledge, the maturity waterline is capped by the first failed operation:
+    /// its effects are not in the segments, and recovering it may need the deferred pre-images.
+    ///
+    /// Perf note: the waterline is the minimum persisted version across all segments, so a freshly
+    /// created appendable segment (which reports `persistent_version() == 0` until its first flush)
+    /// holds the waterline near zero and keeps actions from running. Under heavy optimizer churn
+    /// this lets the action backlog and the capped WAL grow, slowing startup replay. A fresh
+    /// segment cannot hold any operation from before it existed, so it could report its creation
+    /// version as vacuously persisted (e.g. floor `Segment::persistent_version()` on a stamped
+    /// `initial_version`) and stop dragging the waterline down. Left out here to keep this change
+    /// surgical: it changes the segment durability contract for every caller and deserves its own
+    /// change.
+    fn run_ready_post_flush_actions(
+        &self,
+        persisted_version: SeqNumberType,
+    ) -> OperationResult<Option<SeqNumberType>> {
+        let waterline = match self.failed_operation.first() {
+            Some(failed) => persisted_version.min(*failed),
+            None => persisted_version,
+        };
+        let mut ready: Vec<_> = {
+            let mut actions = self.post_flush_actions.lock();
+            let (ready, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *actions)
+                .into_iter()
+                .partition(|action| action.ready_at <= waterline);
+            *actions = keep;
+            // Record the pins of the actions we are about to run while they are out of the queue, so
+            // a concurrent flush still accounts for them and cannot advance the WAL acknowledge past
+            // data their files still contradict. Set under the actions lock (see
+            // `pending_post_flush_ack_cap`).
+            *self.in_flight_ack_floor.lock() = ready.iter().map(|action| action.ack_pin).min();
+            ready
+        };
+        // Run in `ready_at` order: an action can release a resource a later action needs to take
+        // sole ownership of (a proxy keeps its shared write segment alive, and `drop_data` needs
+        // sole ownership; `ready_at` grows with each optimization). Once an action does not
+        // complete (`Retry` or `Err`), stop and re-queue the rest: a later action likely depends on
+        // the resource the blocked one still holds. Re-queued actions keep their ack pin in effect
+        // until they complete on a later flush, so a transient failure never advances the WAL
+        // acknowledge past data that is still on disk.
+        ready.sort_by_key(|action| action.ready_at);
+        let mut first_error = None;
+        let mut blocked = false;
+        ready.retain_mut(|action| {
+            if blocked {
+                return true;
+            }
+
+            match (action.action)() {
+                Ok(PostFlushOutcome::Done) => false,
+                Ok(PostFlushOutcome::Retry) => {
+                    blocked = true;
+                    true
+                }
+                // Hard failure: the action is dropped (its data is being destroyed and cannot be
+                // retried), the error is surfaced, and the rest is deferred to the next flush.
+                Err(err) => {
+                    first_error = Some(err);
+                    blocked = true;
+                    false
+                }
+            }
+        });
+
+        {
+            // Re-queue survivors and clear the in-flight floor together under the actions lock:
+            // survivors are back in the queue before the floor stops covering them, so the cap never
+            // dips. Lock order is always actions then floor.
+            let mut actions = self.post_flush_actions.lock();
+            actions.extend(ready);
+            *self.in_flight_ack_floor.lock() = None;
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(self.pending_post_flush_ack_cap())
     }
 
     /// Suggests a new maximum persisted segment version when calling `flush_all`. This can be used to make WAL acknowledge no-op operations,
@@ -357,11 +744,12 @@ impl SegmentHolder {
     /// Selects point ids, which is stored in this segment
     fn segment_points(
         ids: &[PointIdType],
-        segment: &dyn NonAppendableSegmentEntry,
+        segment: &dyn ReadSegmentEntry,
+        deferred_behavior: DeferredBehavior,
     ) -> Vec<PointIdType> {
         ids.iter()
             .cloned()
-            .filter(|id| segment.has_point(*id))
+            .filter(|id| segment.has_point(*id, deferred_behavior))
             .collect()
     }
 
@@ -372,6 +760,8 @@ impl SegmentHolder {
     /// This finds all point versions and groups them per segment. The newest point versions are
     /// selected to be updated, all older versions are marked to be deleted.
     ///
+    /// Deferred points are never deleted here — the optimizer handles their lifecycle.
+    ///
     /// Points that are already soft deleted are not included.
     fn find_points_to_update_and_delete(
         &self,
@@ -380,64 +770,72 @@ impl SegmentHolder {
         AHashMap<SegmentId, Vec<PointIdType>>,
         AHashMap<SegmentId, Vec<PointIdType>>,
     ) {
-        let mut to_delete: AHashMap<SegmentId, Vec<PointIdType>> = AHashMap::new();
+        // Two-pass approach for order-independent correctness.
+        //
+        // Rules:
+        // - Always update the latest version regardless of deferred status
+        // - Never delete deferred points — optimizer handles them
+        // - Delete older non-deferred copies only if the latest version has a non-deferred copy too
+        // - Keep older non-deferred copies when the latest is deferred
 
-        // Find in which segments latest point versions are located, mark older points for deletion
-        let mut latest_points: AHashMap<PointIdType, (SeqNumberType, SmallVec<[SegmentId; 1]>)> =
+        let segment_count = self.len().max(1);
+        let default_capacity = ids.len() / segment_count;
+
+        // Pass 1: collect all occurrences of each point across segments
+        let mut all_occurrences: AHashMap<PointIdType, PointOccurrences> =
             AHashMap::with_capacity(ids.len());
+
         for (segment_id, segment) in self.iter() {
             let segment_arc = segment.get();
             let segment_lock = segment_arc.read();
-            let segment_points = Self::segment_points(ids, segment_lock.deref());
+            let segment_points =
+                Self::segment_points(ids, segment_lock.deref(), DeferredBehavior::WithDeferred);
             for segment_point in segment_points {
                 let Some(point_version) = segment_lock.point_version(segment_point) else {
                     continue;
                 };
-
-                match latest_points.entry(segment_point) {
-                    // First time we see the point, add it
-                    Entry::Vacant(entry) => {
-                        entry.insert((point_version, smallvec![segment_id]));
-                    }
-                    // Point we have seen before is older, replace it and mark older for deletion
-                    Entry::Occupied(mut entry) if entry.get().0 < point_version => {
-                        let (old_version, old_segment_ids) =
-                            entry.insert((point_version, smallvec![segment_id]));
-
-                        // Mark other point for deletion if the version is older
-                        // TODO(timvisee): remove this check once deleting old points uses correct version
-                        if old_version < point_version {
-                            for old_segment_id in old_segment_ids {
-                                to_delete
-                                    .entry(old_segment_id)
-                                    .or_default()
-                                    .push(segment_point);
-                            }
-                        }
-                    }
-                    // Ignore points with the same version, only update one of them
-                    // TODO(timvisee): remove this branch once deleting old points uses correct version
-                    Entry::Occupied(mut entry) if entry.get().0 == point_version => {
-                        entry.get_mut().1.push(segment_id);
-                    }
-                    // Point we have seen before is newer, mark this point for deletion
-                    Entry::Occupied(_) => {
-                        to_delete.entry(segment_id).or_default().push(segment_point);
-                    }
-                }
+                let is_deferred = segment_lock.point_is_deferred(segment_point);
+                all_occurrences.entry(segment_point).or_default().push((
+                    segment_id,
+                    point_version,
+                    is_deferred,
+                ));
             }
         }
 
-        // Group points to update by segments
-        let segment_count = self.len();
-        let mut to_update = AHashMap::with_capacity(min(segment_count, latest_points.len()));
-        let default_capacity = ids.len() / max(segment_count / 2, 1);
-        for (point_id, (_point_version, segment_ids)) in latest_points {
-            for segment_id in segment_ids {
-                to_update
-                    .entry(segment_id)
-                    .or_insert_with(|| Vec::with_capacity(default_capacity))
-                    .push(point_id);
+        // Pass 2: for each point, determine what to update and what to delete
+        let mut to_update: AHashMap<SegmentId, Vec<PointIdType>> =
+            AHashMap::with_capacity(segment_count);
+        let mut to_delete: AHashMap<SegmentId, Vec<PointIdType>> = AHashMap::new();
+
+        for (point_id, occurrences) in all_occurrences {
+            let latest_version = occurrences
+                .iter()
+                .map(|(_, version, _)| *version)
+                .max()
+                .unwrap();
+
+            let latest_has_non_deferred = occurrences
+                .iter()
+                .any(|(_, version, is_deferred)| *version == latest_version && !*is_deferred);
+
+            for (segment_id, version, is_deferred) in occurrences {
+                if version == latest_version {
+                    // Latest version: always update
+                    to_update
+                        .entry(segment_id)
+                        .or_insert_with(|| Vec::with_capacity(default_capacity))
+                        .push(point_id);
+                } else if !is_deferred && latest_has_non_deferred {
+                    // Older non-deferred copy: safe to delete only if the latest
+                    // version also has a non-deferred copy
+                    to_delete
+                        .entry(segment_id)
+                        .or_insert_with(|| Vec::with_capacity(default_capacity))
+                        .push(point_id);
+                }
+                // Otherwise: deferred copies are never deleted (optimizer handles them),
+                // and older non-deferred copies are kept when the latest is deferred-only
             }
         }
 
@@ -459,29 +857,25 @@ impl SegmentHolder {
         (to_update, to_delete)
     }
 
-    pub fn for_each_segment<F>(&self, mut f: F) -> OperationResult<usize>
-    where
-        F: FnMut(
-            &RwLockReadGuard<dyn NonAppendableSegmentEntry + 'static>,
-        ) -> OperationResult<bool>,
-    {
-        let mut processed_segments = 0;
-        for (_id, segment) in self.iter() {
-            let is_applied = f(&segment.get_non_appendable().read())?;
-            processed_segments += usize::from(is_applied);
-        }
-        Ok(processed_segments)
-    }
-
     pub fn apply_segments<F>(&self, mut f: F) -> OperationResult<usize>
     where
         F: FnMut(
-            &mut RwLockUpgradableReadGuard<dyn NonAppendableSegmentEntry + 'static>,
+            &mut RwLockUpgradableReadGuard<dyn SegmentEntry + 'static>,
+        ) -> OperationResult<bool>,
+    {
+        self.apply_segments_with_id(|_id, segment| f(segment))
+    }
+
+    pub fn apply_segments_with_id<F>(&self, mut f: F) -> OperationResult<usize>
+    where
+        F: FnMut(
+            SegmentId,
+            &mut RwLockUpgradableReadGuard<dyn SegmentEntry + 'static>,
         ) -> OperationResult<bool>,
     {
         let mut processed_segments = 0;
-        for (_id, segment) in self.iter() {
-            let is_applied = f(&mut segment.get_non_appendable().upgradable_read())?;
+        for (id, segment) in self.iter() {
+            let is_applied = f(id, &mut segment.get().upgradable_read())?;
             processed_segments += usize::from(is_applied);
         }
         Ok(processed_segments)
@@ -524,6 +918,7 @@ impl SegmentHolder {
     pub fn apply_points<F>(
         &self,
         ids: &[PointIdType],
+        hw_counter: &HardwareCounterCell,
         mut point_operation: F,
     ) -> OperationResult<usize>
     where
@@ -536,21 +931,7 @@ impl SegmentHolder {
         let (to_update, to_delete) = self.find_points_to_update_and_delete(ids);
 
         // Delete old points first, because we want to handle copy-on-write in multiple proxy segments properly
-        for (segment_id, points) in to_delete {
-            let segment = self.get(segment_id).unwrap();
-            let segment_arc = segment.get();
-            let mut write_segment = segment_arc.write();
-
-            for point_id in points {
-                if let Some(version) = write_segment.point_version(point_id) {
-                    write_segment.delete_point(
-                        version,
-                        point_id,
-                        &HardwareCounterCell::disposable(), // Internal operation: no need to measure.
-                    )?;
-                }
-            }
-        }
+        self.delete_points_from_segments(to_delete, hw_counter)?;
 
         // Apply point operations to selected segments
         let mut applied_points = 0;
@@ -568,11 +949,42 @@ impl SegmentHolder {
         Ok(applied_points)
     }
 
+    pub fn delete_points_from_segments(
+        &self,
+        to_delete: AHashMap<SegmentId, Vec<PointIdType>>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        for (segment_id, points) in to_delete {
+            let segment = self.get(segment_id).unwrap();
+            let segment_arc = segment.get();
+            let mut write_segment = segment_arc.write();
+
+            for point_id in points {
+                if let Some(version) = write_segment.point_version(point_id) {
+                    write_segment.delete_point(version, point_id, hw_counter)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// This operation deduplicates subset of points across all segments.
+    /// It scans all segments for presence of the points, detects points with the highest version,
+    /// and removes all other versions of the points from all segments.
+    pub fn deduplicate_points(
+        &self,
+        points: &[PointIdType],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let (_to_keep, to_delete) = self.find_points_to_update_and_delete(points);
+        self.delete_points_from_segments(to_delete, hw_counter)
+    }
+
     /// Try to acquire read lock over the given segment with increasing wait time.
     /// Should prevent deadlock in case if multiple threads tries to lock segments sequentially.
     fn aloha_lock_segment_read(
-        segment: &'_ RwLock<dyn NonAppendableSegmentEntry>,
-    ) -> RwLockReadGuard<'_, dyn NonAppendableSegmentEntry> {
+        segment: &'_ RwLock<dyn StorageSegmentEntry>,
+    ) -> RwLockReadGuard<'_, dyn StorageSegmentEntry> {
         let mut interval = Duration::from_nanos(100);
         loop {
             if let Some(guard) = segment.try_read_for(interval) {
@@ -636,6 +1048,14 @@ impl SegmentHolder {
     ///
     /// Returns set of point ids which were successfully (already) applied to segments.
     ///
+    /// `point_cow_operation` receives the moved point's vectors twice: as
+    /// storage-native bytes (as read from the source; remove a named vector by
+    /// `retain`ing on the list) and as an initially empty decoded overlay
+    /// (insert fresh vectors there to overwrite names; entries may borrow from
+    /// the operation data via `'op`). Untouched names travel to the
+    /// destination as verbatim bytes, which keeps requantizing storages
+    /// (TurboQuant-as-datatype) lossless across moves.
+    ///
     /// # Warning
     ///
     /// This function must not be used to apply point deletions, and [`apply_points`] must be used
@@ -644,24 +1064,30 @@ impl SegmentHolder {
     /// 1. moving a point first and deleting it after is unnecessary overhead.
     /// 2. this leaves older point versions in place, which may accidentally be revived by some
     ///    other operation later.
-    pub fn apply_points_with_conditional_move<F, G>(
+    pub fn apply_points_with_conditional_move<'op, F, G>(
         &self,
         op_num: SeqNumberType,
         ids: &[PointIdType],
         mut point_operation: F,
         mut point_cow_operation: G,
+        max_segment_size_bytes: Option<NonZeroUsize>,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<AHashSet<PointIdType>>
     where
         F: FnMut(PointIdType, &mut RwLockWriteGuard<dyn SegmentEntry>) -> OperationResult<bool>,
-        for<'n, 'o, 'p> G: FnMut(PointIdType, &'n mut NamedVectors<'o>, &'p mut Payload),
+        G: FnMut(
+            PointIdType,
+            &mut SmallVec<[(VectorNameBuf, Vec<u8>); 1]>,
+            &mut NamedVectors<'op>,
+            &mut Payload,
+        ),
     {
-        // Choose random appendable segment from this
-        let appendable_segments = self.appendable_segments_ids();
+        let mut destination_cache: Option<Vec<SegmentId>> = None;
 
         let mut applied_points: AHashSet<PointIdType> = Default::default();
+        let stopped = AtomicBool::new(false);
 
-        let _applied_points_count = self.apply_points(ids, |point_id, idx, write_segment| {
+        let _ = self.apply_points(ids, hw_counter, |point_id, idx, write_segment| {
             if let Some(point_version) = write_segment.point_version(point_id)
                 && point_version >= op_num
             {
@@ -675,7 +1101,10 @@ impl SegmentHolder {
                 point_operation(point_id, write_segment)?
             } else {
                 self.aloha_random_write(
-                    &appendable_segments,
+                    self.cow_destination_candidates(
+                        &mut destination_cache,
+                        max_segment_size_bytes,
+                    ),
                     |appendable_idx, appendable_write_segment| {
                         // If we are moving point from one segment to another,
                         // we must guarantee, that data in new segment will be persisted before
@@ -685,21 +1114,96 @@ impl SegmentHolder {
                             .lock()
                             .add_dependency(idx, appendable_idx, op_num);
 
-                        let mut all_vectors = write_segment.all_vectors(point_id, hw_counter)?;
-                        let mut payload = write_segment.payload(point_id, hw_counter)?;
+                        // Read the latest head of the point, including a
+                        // deferred head that is invisible to ordinary
+                        // (`VisibleOnly`) reads. A deferred source point would
+                        // otherwise yield no record, surfacing as a spurious
+                        // "No point with id ... found" on a plain upsert that
+                        // races a `prevent_unoptimized` optimization.
+                        //
+                        // Vectors are read as storage-native bytes: names the
+                        // operation does not touch travel verbatim, avoiding
+                        // the lossy dequantize→requantize round-trip of
+                        // TurboQuant-as-datatype storages.
+                        let mut record = write_segment
+                            .retrieve_raw(
+                                &[point_id],
+                                &WithVector::Bool(true),
+                                hw_counter,
+                                &stopped,
+                                DeferredBehavior::WithDeferred,
+                            )?
+                            .remove(&point_id)
+                            .ok_or(OperationError::PointIdError {
+                                missed_point_id: point_id,
+                            })?;
 
-                        point_cow_operation(point_id, &mut all_vectors, &mut payload);
+                        let mut raw_vectors = record.vectors.take().unwrap_or_default();
+                        // The `SetPayload` callback below merges into the parsed
+                        // payload, so a stored blob is decoded here.
+                        let mut payload = record
+                            .payload
+                            .as_ref()
+                            .map(RawPayload::decode)
+                            .transpose()?
+                            .unwrap_or_default();
+                        let mut updated_vectors = NamedVectors::default();
 
-                        appendable_write_segment.upsert_point(
+                        point_cow_operation(
+                            point_id,
+                            &mut raw_vectors,
+                            &mut updated_vectors,
+                            &mut payload,
+                        );
+
+                        // Names overlaid with fresh data don't travel as bytes.
+                        raw_vectors
+                            .retain(|(name, _)| updated_vectors.get(name).is_none());
+
+                        // Byte portability requires encoding-compatible vector
+                        // configs on both sides (size, distance, datatype,
+                        // multivector config). Segment-role fields — storage
+                        // type, index, quantization — legitimately differ
+                        // between an optimized source and an appendable
+                        // destination; `check_compatible` ignores them.
+                        debug_assert!(
+                            raw_vectors.iter().all(|(name, _)| {
+                                let src = write_segment.config();
+                                let dst = appendable_write_segment.config();
+                                let dense = (src.vector_data.get(name), dst.vector_data.get(name));
+                                let sparse = (
+                                    src.sparse_vector_data.get(name),
+                                    dst.sparse_vector_data.get(name),
+                                );
+                                match (dense, sparse) {
+                                    ((Some(src), Some(dst)), (None, None)) => {
+                                        src.check_compatible(dst).is_ok()
+                                    }
+                                    ((None, None), (Some(src), Some(dst))) => {
+                                        src.check_compatible(dst).is_ok()
+                                    }
+                                    _ => false,
+                                }
+                            }),
+                            "CoW raw move requires encoding-compatible vector configs on source and destination",
+                        );
+
+                        // One fused write: issuing raw vectors, updated vectors and
+                        // payload as separate operations would clone the point once
+                        // per step on append-only destinations.
+                        appendable_write_segment.upsert_moved_point(
                             op_num,
                             point_id,
-                            all_vectors,
+                            &raw_vectors,
+                            updated_vectors,
+                            &payload,
                             hw_counter,
                         )?;
-                        appendable_write_segment
-                            .set_full_payload(op_num, point_id, &payload, hw_counter)?;
 
-                        write_segment.delete_point(op_num, point_id, hw_counter)?;
+                        // Keep the source of the CoW operation as the deferred point is invisible until indexing.
+                        if !appendable_write_segment.point_is_deferred(point_id) {
+                            write_segment.delete_point(op_num, point_id, hw_counter)?;
+                        }
 
                         Ok(true)
                     },
@@ -731,7 +1235,7 @@ impl SegmentHolder {
 
             // Partition remaining IDs: found ones go to existing_points, rest stay in remaining
             remaining_ids.retain(|&id| {
-                if segment_guard.has_point(id) {
+                if segment_guard.has_point(id, DeferredBehavior::WithDeferred) {
                     existing_points.insert(id);
                     false // Remove from remaining
                 } else {
@@ -756,13 +1260,18 @@ impl SegmentHolder {
         segments_path: &Path,
         segment_config: SegmentConfig,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+        deferred_internal_id: Option<PointOffsetType>,
     ) -> OperationResult<LockedSegment> {
-        let segment = self.build_tmp_segment(
+        let (segment, token) = self.build_tmp_segment(
             segments_path,
             Some(segment_config),
             payload_index_schema,
+            deferred_internal_id,
             true,
         )?;
+        // Register the new segment ASAP — it exists on disk, so it must be in the manifest. No-op
+        // when no manifest is attached yet (e.g. during shard load).
+        self.sync_segment_manifest(Some(token))?;
         self.add_new_locked(segment.clone());
         Ok(segment)
     }
@@ -789,8 +1298,9 @@ impl SegmentHolder {
         segments_path: &Path,
         segment_config: Option<SegmentConfig>,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+        deferred_internal_id: Option<PointOffsetType>,
         save_version: bool,
-    ) -> OperationResult<LockedSegment> {
+    ) -> OperationResult<(LockedSegment, NewSegmentToken)> {
         let config = match segment_config {
             // Base config on collection params
             Some(config) => config,
@@ -809,7 +1319,8 @@ impl SegmentHolder {
                 .clone(),
         };
 
-        let mut segment = build_segment(segments_path, &config, save_version)?;
+        let (mut segment, token) =
+            build_segment(segments_path, &config, deferred_internal_id, save_version)?;
 
         // Internal operation.
         let hw_counter = HardwareCounterCell::disposable();
@@ -819,7 +1330,7 @@ impl SegmentHolder {
             segment.create_field_index(0, key, Some(schema), &hw_counter)?;
         }
 
-        Ok(LockedSegment::new(segment))
+        Ok((LockedSegment::new(segment), token))
     }
 
     /// Method tries to remove the segment with the given ID under the following conditions:
@@ -904,86 +1415,103 @@ impl SegmentHolder {
             .collect::<Vec<_>>()
     }
 
-    fn find_duplicated_points(&self) -> AHashMap<SegmentId, Vec<PointIdType>> {
+    pub fn find_duplicated_points(&self) -> AHashMap<SegmentId, Vec<PointIdType>> {
+        struct DedupPoint {
+            segment_id: SegmentId,
+            point_id: PointIdType,
+            version: Option<SeqNumberType>,
+            is_deferred: bool,
+        }
+
+        // Dedup needs to enumerate all points in every segment, which is only
+        // available on a concrete `Segment`. Proxy segments cannot be enumerated
+        // this way (their internals span a wrapped read segment plus an
+        // in-memory write segment), so we panic if one shows up here — matching
+        // the pre-existing behavior when `iter_points` was a trait method that
+        // `unimplemented!()`'d for proxies.
         let segments = self
             .iter()
-            .map(|(segment_id, locked_segment)| (segment_id, locked_segment.get()))
+            .map(|(segment_id, locked_segment)| match locked_segment {
+                LockedSegment::Original(segment) => (segment_id, segment.as_ref()),
+                LockedSegment::Proxy(_) => panic!(
+                    "deduplicate_points cannot enumerate points of proxy segment {segment_id}",
+                ),
+            })
             .collect::<Vec<_>>();
         let locked_segments = segments
             .iter()
-            .map(|(segment_id, locked_segment)| (*segment_id, locked_segment.read()))
-            .collect::<BTreeMap<_, _>>();
-        let mut iterators = locked_segments
-            .iter()
-            .map(|(segment_id, locked_segment)| (*segment_id, locked_segment.iter_points()))
+            .map(|(segment_id, segment)| (*segment_id, segment.read()))
             .collect::<BTreeMap<_, _>>();
 
-        // heap contains the current iterable point id from each segment
-        let mut heap = iterators
-            .iter_mut()
-            .filter_map(|(&segment_id, iter)| {
-                iter.next().map(|point_id| DedupPoint {
-                    point_id,
+        // Iterator produces groups of points by point ID
+        let point_group_iter = locked_segments
+            .iter()
+            .map(|(&segment_id, segment)| {
+                segment.iter_points().map(move |point_id| DedupPoint {
                     segment_id,
+                    point_id,
+                    version: None,
+                    is_deferred: false,
                 })
             })
-            .collect::<BinaryHeap<_>>();
+            .kmerge_by(|a, b| a.point_id < b.point_id)
+            .chunk_by(|entry| entry.point_id);
 
-        let mut last_point_id_opt = None;
-        let mut last_segment_id_opt = None;
-        let mut last_point_version_opt = None;
-        let mut points_to_remove: AHashMap<SegmentId, Vec<PointIdType>> = Default::default();
+        let mut points = Vec::new();
+        let mut points_to_remove: AHashMap<SegmentId, Vec<PointIdType>> = AHashMap::new();
 
-        while let Some(entry) = heap.pop() {
-            let point_id = entry.point_id;
-            let segment_id = entry.segment_id;
-            if let Some(next_point_id) = iterators.get_mut(&segment_id).and_then(|i| i.next()) {
-                heap.push(DedupPoint {
-                    segment_id,
-                    point_id: next_point_id,
-                });
+        for (point_id, group_iter) in &point_group_iter {
+            // Fill buffer with points of current chunk, need at least 2 points to deduplicate
+            points.clear();
+            points.extend(group_iter);
+            if points.len() < 2 {
+                continue;
             }
 
-            if last_point_id_opt == Some(point_id) {
-                let last_segment_id = last_segment_id_opt.unwrap();
+            // Enrich with point version and deferred status
+            for dedup_point in &mut points {
+                let segment = &locked_segments[&dedup_point.segment_id];
+                dedup_point.version = segment.point_version(point_id);
+                dedup_point.is_deferred = segment.point_is_deferred(point_id);
+            }
 
-                let point_version = locked_segments[&segment_id].point_version(point_id);
-                let last_point_version = if let Some(last_point_version) = last_point_version_opt {
-                    last_point_version
+            // Sort points from highest to lowest version
+            // If versions are equal, sort by segment ID to make the order deterministic.
+            points.sort_unstable_by_key(|p| (Reverse(p.version), p.segment_id));
+
+            let latest_version = points[0].version;
+
+            // Check if the latest version has a non-deferred copy
+            let latest_has_non_deferred = points
+                .iter()
+                .any(|p| p.version == latest_version && !p.is_deferred);
+
+            // Decide which copies to remove:
+            // - Deferred: keep the first, remove duplicates
+            // - Non-deferred with latest version: keep the first (the winner)
+            // - Older non-deferred: remove only if the latest has a non-deferred copy
+            //   (otherwise keep visible until the deferred point is indexed)
+            let mut kept_deferred = false;
+            let mut kept_non_deferred = false;
+
+            for dedup_point in &points {
+                let should_remove = if dedup_point.is_deferred {
+                    let duplicate = kept_deferred;
+                    kept_deferred = true;
+                    duplicate
+                } else if dedup_point.version == latest_version && !kept_non_deferred {
+                    kept_non_deferred = true;
+                    false
                 } else {
-                    let version = locked_segments[&last_segment_id].point_version(point_id);
-                    last_point_version_opt = Some(version);
-                    version
+                    latest_has_non_deferred
                 };
 
-                // choose newer version between point_id and last_point_id
-                if point_version < last_point_version {
-                    log::trace!(
-                        "Selected point {point_id} in segment {segment_id} for deduplication (version {point_version:?} versus {last_point_version:?} in segment {last_segment_id})",
-                    );
-
+                if should_remove {
                     points_to_remove
-                        .entry(segment_id)
+                        .entry(dedup_point.segment_id)
                         .or_default()
-                        .push(point_id);
-                } else {
-                    log::trace!(
-                        "Selected point {point_id} in segment {last_segment_id} for deduplication (version {last_point_version:?} versus {point_version:?} in segment {segment_id})",
-                    );
-
-                    points_to_remove
-                        .entry(last_segment_id)
-                        .or_default()
-                        .push(point_id);
-
-                    last_point_id_opt = Some(point_id);
-                    last_segment_id_opt = Some(segment_id);
-                    last_point_version_opt = Some(point_version);
+                        .push(dedup_point.point_id);
                 }
-            } else {
-                last_point_id_opt = Some(point_id);
-                last_segment_id_opt = Some(segment_id);
-                last_point_version_opt = None;
             }
         }
 

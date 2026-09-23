@@ -1,18 +1,18 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
-use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-use bitvec::prelude::BitVec;
-use common::ext::BitSliceExt;
+use bitvec::vec::BitVec;
+use common::bitvec::BitSliceExt;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::fs::{atomic_save, atomic_save_bin};
 use common::types::{PointOffsetType, ScoredPointOffset};
+use common::universal_io::MmapFs;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rand::Rng;
 use rand::distr::Uniform;
+use rand::{Rng, RngExt};
 
 use super::HnswM;
 use super::graph_layers::GraphLayerData;
@@ -23,7 +23,7 @@ use crate::index::hnsw_index::entry_points::EntryPoints;
 #[cfg(test)]
 use crate::index::hnsw_index::graph_layers::SearchAlgorithm;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase};
-use crate::index::hnsw_index::graph_links::serialize_graph_links;
+use crate::index::hnsw_index::graph_links::{GraphLinksResidency, serialize_graph_links};
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 
@@ -107,7 +107,12 @@ impl GraphLayersBuilder {
     ///  - Return the fraction of reachable nodes to the total number of nodes in the sub-graph.
     ///
     /// Coin probability `q` is a parameter of this function. By default, it is 0.5.
-    pub fn subgraph_connectivity(&self, points: &[PointOffsetType], q: f32) -> f32 {
+    pub fn subgraph_connectivity<R: Rng + ?Sized>(
+        &self,
+        rng: &mut R,
+        points: &[PointOffsetType],
+        q: f32,
+    ) -> f32 {
         if points.is_empty() {
             return 1.0;
         }
@@ -121,14 +126,12 @@ impl GraphLayersBuilder {
             point_selection.set(*point_id as usize, true);
         }
 
-        let mut rnd = rand::rng();
-
         // Try to get entry point from the entry points list
         // If not found, select the point with the highest level
         let entry_point = self
             .entry_points
             .lock()
-            .get_random_entry_point(&mut rnd, |point_id| {
+            .get_random_entry_point(rng, |point_id| {
                 point_selection.get_bit(point_id as usize).unwrap_or(false)
             })
             .map(|ep| ep.point_id);
@@ -153,6 +156,7 @@ impl GraphLayersBuilder {
 
         // Retry loop, in case some budget is left.
         loop {
+            let budget_before_iteration = spent_budget;
             visited.set(entry_point as usize, true);
 
             // Points visited in the previous layer (Get used as entry point in the iteration over the next layer)
@@ -171,7 +175,7 @@ impl GraphLayersBuilder {
                         spent_budget += 1;
 
                         // Flip a coin to decide if the edge is removed or not
-                        let coin_flip = rnd.random_range(0.0..1.0);
+                        let coin_flip = rng.random_range(0.0..1.0);
                         if coin_flip < q {
                             continue;
                         }
@@ -189,8 +193,12 @@ impl GraphLayersBuilder {
                 }
             }
 
-            // Budget exhausted, don't retry.
-            if spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET {
+            // Budget exhausted, don't retry. Also stop if this iteration made no
+            // progress: BFS traversed zero edges, so retrying cannot discover more
+            // (the graph is immutable and coin flips only gate enumerated links).
+            if spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET
+                || spent_budget == budget_before_iteration
+            {
                 break;
             }
 
@@ -211,18 +219,21 @@ impl GraphLayersBuilder {
         let links_path = GraphLayers::get_links_path(path, format_param.as_format());
 
         let edges = Self::links_layers_to_edges(self.links_layers);
-        let links;
-        if on_disk {
-            // Save memory by serializing directly to disk, then re-loading as mmap.
-            atomic_save(&links_path, |writer| {
-                serialize_graph_links(edges, format_param, self.hnsw_m, writer)
-            })?;
-            links = GraphLinks::load_from_file(&links_path, true, format_param.as_format())?;
+        // Save memory by serializing directly to disk, then re-loading as mmap.
+        atomic_save(&links_path, |writer| {
+            serialize_graph_links(edges, format_param, self.hnsw_m, writer)
+        })?;
+        // Keep the links cold (lazily on disk) when configured so; otherwise
+        // pre-populate the page cache (cheap: the pages were just written).
+        // Never pin the links in heap here, so that the just-built index has
+        // the same, single-copy residency as one loaded from disk.
+        let residency = if on_disk {
+            GraphLinksResidency::Cold
         } else {
-            // Since we'll keep it in the RAM anyway, we can afford to build in the RAM too.
-            links = GraphLinks::new_from_edges(edges, format_param, self.hnsw_m)?;
-            atomic_save(&links_path, |writer| writer.write_all(links.as_bytes()))?;
-        }
+            GraphLinksResidency::Cached
+        };
+        let links =
+            GraphLinks::load_universal(&MmapFs, &links_path, format_param.as_format(), residency)?;
 
         let entry_points = self.entry_points.into_inner();
 
@@ -380,8 +391,18 @@ impl GraphLayersBuilder {
     {
         let distribution = Uniform::new(0.0, 1.0).unwrap();
         let sample: f64 = rng.sample(distribution);
-        let picked_level = -sample.ln() * self.level_factor;
-        picked_level.round() as usize
+        Self::level_from_sample(sample, self.level_factor)
+    }
+
+    /// Map a uniform `[0, 1)` sample to a geometric level.
+    ///
+    /// `Uniform::new(0.0, 1.0)` is half-open, so `sample` can be exactly `0.0`.
+    /// `ln(0.0)` is `-inf`, and `(-(-inf) * factor).round() as usize` saturates
+    /// to `usize::MAX`, which then makes `set_levels` allocate unboundedly.
+    /// Clamp to the smallest positive `f64` so the level stays bounded.
+    fn level_from_sample(sample: f64, level_factor: f64) -> usize {
+        let sample = sample.max(f64::MIN_POSITIVE);
+        (-sample.ln() * level_factor).round() as usize
     }
 
     pub(crate) fn get_point_level(&self, point_id: PointOffsetType) -> usize {
@@ -576,7 +597,7 @@ impl GraphLayersBuilder {
     pub fn get_average_connectivity_on_level(&self, level: usize) -> f32 {
         let mut sum = 0;
         let mut count = 0;
-        for links in self.links_layers.iter() {
+        for links in &self.links_layers {
             if links.len() > level {
                 sum += links[level].read().links().len();
                 count += 1;
@@ -595,7 +616,7 @@ mod tests {
     use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
     use itertools::Itertools;
     use rand::SeedableRng;
-    use rand::prelude::StdRng;
+    use rand::prelude::SmallRng;
     use rstest::rstest;
 
     use super::*;
@@ -603,9 +624,23 @@ mod tests {
     use crate::index::hnsw_index::graph_links::{GraphLinksFormat, normalize_links};
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::types::Distance;
-    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage as _};
+    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorageRead as _};
 
     const M: usize = 8;
+
+    #[test]
+    fn get_random_layer_handles_zero_sample() {
+        // A zero uniform sample used to make ln(0) = -inf and saturate the
+        // level to usize::MAX; the clamp must keep it bounded.
+        let level_factor = 1.0 / (M as f64).ln();
+        let level = GraphLayersBuilder::level_from_sample(0.0, level_factor);
+        assert!(
+            level < 1024,
+            "zero sample produced an unbounded level: {level}"
+        );
+        // A normal mid-range sample still yields a small level.
+        assert!(GraphLayersBuilder::level_from_sample(0.5, level_factor) < 1024);
+    }
 
     #[cfg(not(windows))]
     fn parallel_graph_build<R>(
@@ -705,7 +740,7 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         // let (vector_holder, graph_layers_builder) =
         //     create_graph_layer::<M, _>(num_vectors, dim, false, &mut rng);
@@ -761,15 +796,15 @@ mod tests {
             format.with_param_for_tests(vector_holder.graph_links_vectors().as_ref()),
         );
 
-        let scorer = vector_holder.scorer(query);
+        let mut scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
             .search(
                 top,
                 ef,
                 SearchAlgorithm::Hnsw,
-                scorer,
-                None,
+                &mut scorer,
+                graph.unfiltered_entry_point(),
                 &DEFAULT_STOPPED,
             )
             .unwrap();
@@ -786,8 +821,8 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut rng2 = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng2 = SmallRng::seed_from_u64(42);
 
         let (vector_holder, graph_layers_builder) = create_graph_layer(
             num_vectors,
@@ -874,15 +909,15 @@ mod tests {
             format.with_param_for_tests(vector_holder.graph_links_vectors().as_ref()),
         );
 
-        let scorer = vector_holder.scorer(query);
+        let mut scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
             .search(
                 top,
                 ef,
                 SearchAlgorithm::Hnsw,
-                scorer,
-                None,
+                &mut scorer,
+                graph.unfiltered_entry_point(),
                 &DEFAULT_STOPPED,
             )
             .unwrap();
@@ -900,7 +935,7 @@ mod tests {
         const EF_CONSTRUCT: usize = 64;
         const USE_HEURISTIC: bool = true;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         let vector_holder = TestRawScorerProducer::new(
             DIM,
@@ -941,5 +976,54 @@ mod tests {
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
         eprintln!("avg_connectivity = {avg_connectivity:#?}");
+    }
+
+    /// Regression test: `subgraph_connectivity` must not hang when the chosen
+    /// entry point has no outgoing links on any of its layers. In that case the
+    /// inner BFS iterates zero edges, so `spent_budget` stays at 0 and the
+    /// retry `loop` never observes `spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET`.
+    ///
+    /// The state is reachable through normal graph construction: the very first
+    /// point inserted via `link_new_point` has no pre-existing neighbors, so it
+    /// is registered in `EntryPoints` with empty `links_layers` on every layer.
+    #[test]
+    fn test_subgraph_connectivity_isolated_entry_point_does_not_hang() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const DIM: usize = 4;
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        // Build a one-point graph the normal way. `link_new_point` sees an
+        // empty entry-points list, takes the "new empty entry" branch, and
+        // registers point 0 with no outgoing links on any of its layers.
+        let vector_holder = TestRawScorerProducer::new(DIM, Distance::Cosine, 1, false, &mut rng);
+        let mut builder = GraphLayersBuilder::new(1, HnswM::new2(M), 16, 10, false);
+        let level = builder.get_random_layer(&mut rng);
+        builder.set_levels(0, level);
+        builder.link_new_point(0, vector_holder.internal_scorer(0));
+        let builder = Arc::new(builder);
+
+        // Run on a background thread so the test can bound wall-clock time
+        // rather than hanging the whole test runner.
+        let builder_clone = Arc::clone(&builder);
+        let handle = thread::spawn(move || {
+            let mut rng = rand::rng();
+            builder_clone.subgraph_connectivity(&mut rng, &[0], 0.5)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            handle.is_finished(),
+            "subgraph_connectivity hung on an isolated entry point",
+        );
+        handle
+            .join()
+            .expect("subgraph_connectivity thread panicked");
     }
 }

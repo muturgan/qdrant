@@ -103,6 +103,21 @@ impl CompressedVersions {
             )
         })
     }
+
+    /// Approximate RAM usage in bytes.
+    pub fn ram_usage_bytes(&self) -> usize {
+        let Self {
+            lower_bytes,
+            upper_bytes,
+        } = self;
+
+        let lower = lower_bytes.capacity() * std::mem::size_of::<u32>();
+        // AHashMap per-entry overhead: key + value + hash (u64) + metadata pointer
+        let hashmap_entry_overhead = std::mem::size_of::<u64>() + std::mem::size_of::<usize>();
+        let upper = upper_bytes.capacity()
+            * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + hashmap_entry_overhead);
+        lower + upper
+    }
 }
 
 #[cfg(test)]
@@ -110,7 +125,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use proptest::prelude::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     use super::*;
     use crate::types::SeqNumberType;

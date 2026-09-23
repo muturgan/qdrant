@@ -73,8 +73,9 @@ where
 
 impl<T: ?Sized> fmt::Debug for MmapTypeReadOnly<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { mmap, r#type: _ } = self;
         f.debug_struct("MmapTypeReadOnly")
-            .field("mmap", &self.mmap)
+            .field("mmap", mmap)
             .finish_non_exhaustive()
     }
 }
@@ -149,6 +150,13 @@ where
 
     pub fn populate(&self) -> std::io::Result<()> {
         self.mmap.populate();
+        Ok(())
+    }
+
+    /// Hint to the OS that pages backing this mmap can be reclaimed.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        let Self { r#type: _, mmap } = self;
+        mmap.clear_cache();
         Ok(())
     }
 }
@@ -292,9 +300,10 @@ where
 
 impl<T> fmt::Debug for MmapSliceReadOnly<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { mmap } = self;
         f.debug_struct("MmapSliceReadOnly")
-            .field("mmap", &self.mmap)
-            .finish_non_exhaustive()
+            .field("mmap", mmap)
+            .finish()
     }
 }
 
@@ -343,12 +352,25 @@ impl<T> MmapSliceReadOnly<T> {
         self.mmap.populate()?;
         Ok(())
     }
+
+    /// Hint to the OS that pages backing this mmap can be reclaimed.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        let Self { mmap } = self;
+        mmap.clear_cache()?;
+        Ok(())
+    }
 }
 
 impl<T> Deref for MmapSliceReadOnly<T> {
     type Target = MmapTypeReadOnly<[T]>;
 
     fn deref(&self) -> &Self::Target {
+        &self.mmap
+    }
+}
+
+impl<T: 'static> AsRef<[T]> for MmapSliceReadOnly<T> {
+    fn as_ref(&self) -> &[T] {
         &self.mmap
     }
 }

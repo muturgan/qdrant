@@ -2,6 +2,7 @@ syntax = "proto3";
 
 import "points.proto";
 import "qdrant_common.proto";
+import "json_with_int.proto";
 
 package qdrant;
 option csharp_namespace = "Qdrant.Client.Grpc";
@@ -26,6 +27,12 @@ service PointsInternal {
       returns (PointsOperationResponseInternal) {}
   rpc DeleteFieldIndex(DeleteFieldIndexCollectionInternal)
       returns (PointsOperationResponseInternal) {}
+
+  rpc CreateVectorName(CreateVectorNameInternal)
+      returns (PointsOperationResponseInternal) {}
+  rpc DeleteVectorName(DeleteVectorNameInternal)
+      returns (PointsOperationResponseInternal) {}
+
   rpc UpdateBatch(UpdateBatchInternal)
       returns (PointsOperationResponseInternal) {}
   rpc CoreSearchBatch(CoreSearchBatchPointsInternal)
@@ -37,6 +44,28 @@ service PointsInternal {
   rpc QueryBatch(QueryBatchPointsInternal)
       returns (QueryBatchResponseInternal) {}
   rpc Facet(FacetCountsInternal) returns (FacetResponseInternal) {}
+}
+
+message PointStructRaw {
+  PointId id = 1;
+  map<string, bytes> vectors = 2;
+  map<string, Value> payload = 3;
+  // Byte-encoded payload blob.
+  optional RawPayload raw_payload = 4;
+}
+
+// Encoding of `RawPayload.payload_bytes`.
+enum RawPayloadEncoding {
+  // serde_json encoding of the whole payload object, uncompressed,
+  // exactly as stored in gridstore.
+  JsonBytes = 0;
+}
+
+// The whole payload object of a point as a single encoded blob.
+message RawPayload {
+  // The encoded payload object, see `encoding` for the format.
+  bytes payload_bytes = 1;
+  RawPayloadEncoding encoding = 2;
 }
 
 message SyncPoints {
@@ -52,66 +81,114 @@ message SyncPoints {
   optional WriteOrdering ordering = 6;
   // Timeout for the request in seconds
   optional uint64 timeout = 7;
+  // Points with storage-native (raw bytes) vectors
+  repeated PointStructRaw raw_points = 8;
 }
 
 message SyncPointsInternal {
   SyncPoints sync_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message UpsertPointsInternal {
   UpsertPoints upsert_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
+  // Points with storage-native (raw bytes) vectors
+  repeated PointStructRaw raw_points = 5;
 }
 
 message DeletePointsInternal {
   DeletePoints delete_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message UpdateVectorsInternal {
   UpdatePointVectors update_vectors = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message DeleteVectorsInternal {
   DeletePointVectors delete_vectors = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message SetPayloadPointsInternal {
   SetPayloadPoints set_payload_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message DeletePayloadPointsInternal {
   DeletePayloadPoints delete_payload_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message ClearPayloadPointsInternal {
   ClearPayloadPoints clear_payload_points = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message CreateFieldIndexCollectionInternal {
   CreateFieldIndexCollection create_field_index_collection = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
 }
 
 message DeleteFieldIndexCollectionInternal {
   DeleteFieldIndexCollection delete_field_index_collection = 1;
   optional uint32 shard_id = 2;
   optional ClockTag clock_tag = 3;
+  // When present, overrides the `wait` parameter of the wrapped public message.
+  // When absent, falls back to `wait` (backward compatible with older nodes).
+  optional WaitUntil wait_override = 4;
+}
+
+message CreateVectorNameInternal {
+  CreateVectorNameRequest create_vector_name = 1;
+  optional uint32 shard_id = 2;
+  optional ClockTag clock_tag = 3;
+  optional WaitUntil wait_override = 4;
+}
+
+message DeleteVectorNameInternal {
+  DeleteVectorNameRequest delete_vector_name = 1;
+  optional uint32 shard_id = 2;
+  optional ClockTag clock_tag = 3;
+  optional WaitUntil wait_override = 4;
 }
 
 message UpdateOperation {
@@ -127,11 +204,16 @@ message UpdateOperation {
     ClearPayloadPointsInternal clear_payload = 9;
     CreateFieldIndexCollectionInternal create_field_index = 10;
     DeleteFieldIndexCollectionInternal delete_field_index = 11;
+    CreateVectorNameInternal create_vector_name = 12;
+    DeleteVectorNameInternal delete_vector_name = 13;
   }
 }
 
 message UpdateBatchInternal {
   repeated UpdateOperation operations = 1;
+  // When present, overrides the `wait` parameter for all operations in the batch.
+  // Propagated to individual operations if not already set.
+  optional WaitUntil wait_override = 2;
 }
 
 // Has to be backward compatible with `PointsOperationResponse`!
@@ -159,6 +241,19 @@ message ClockTag {
   uint64 token = 4;
   bool force = 5;
 }
+
+// Controls how an update operation waits for completion.
+// When present, fully overrides the `wait` boolean from the wrapped public message.
+// When absent, the `wait` boolean is used (backward compatible with older nodes).
+enum WaitUntil {
+  // Wait until the operation is written in WAL (equivalent to wait=false).
+  Wal = 0;
+  // Wait until the operation is written in a segment (but not necessarily visible).
+  Segment = 1;
+  // Wait until the operation is visible in search results (equivalent to wait=true).
+  Visible = 2;
+}
+
 
 message SearchPointsInternal {
   SearchPoints search_points = 1;

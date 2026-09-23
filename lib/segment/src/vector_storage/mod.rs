@@ -1,20 +1,19 @@
-#[cfg(target_os = "linux")]
-mod async_io;
-mod async_io_mock;
-#[cfg(target_os = "linux")]
-pub mod async_raw_scorer;
-mod bitvec;
-mod chunked_mmap_vectors;
-pub mod chunked_vectors;
+mod chunked_vectors;
 pub mod common;
 pub mod dense;
+mod memory_reporter;
 pub mod multi_dense;
+mod prefill_deleted;
 pub mod quantized;
 pub mod query;
 pub mod query_scorer;
 pub mod raw_scorer;
+pub mod read_only;
 pub mod sparse;
+pub mod turbo;
+pub mod update_only;
 mod vector_storage_base;
+pub mod volatile_chunked_vectors;
 
 #[cfg(test)]
 mod tests;

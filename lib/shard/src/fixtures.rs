@@ -2,9 +2,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::ThreadRng;
 use segment::data_types::vectors::only_default_vector;
+use segment::entry::ReadSegmentEntry;
 use segment::entry::entry_point::SegmentEntry;
 use segment::payload_json;
 use segment::segment::Segment;
@@ -158,4 +159,142 @@ pub fn build_segment_2(path: &Path) -> Segment {
         .unwrap();
 
     segment2
+}
+
+/// Build an empty appendable segment with a deferred internal ID.
+///
+/// Points with internal ID >= `deferred_internal_id` will be deferred.
+pub fn empty_segment_with_deferred(path: &Path, deferred_internal_id: u32) -> Segment {
+    use std::collections::HashMap;
+
+    use segment::segment_constructor::build_segment;
+    use segment::types::{Indexes, VectorDataConfig, VectorStorageType};
+
+    build_segment(
+        path,
+        &segment::types::SegmentConfig {
+            vector_data: HashMap::from([(
+                segment::data_types::vectors::DEFAULT_VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: 4,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::default(),
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type: Default::default(),
+        },
+        Some(deferred_internal_id),
+        true,
+    )
+    .unwrap()
+    .0
+}
+
+/// Builds a segment with a deferred threshold that causes points 4 and 5 to be deferred, while points 1, 2, and 3 are not deferred.
+/// This allows testing of deferred point behavior in the segment.
+pub fn build_segment_with_deferred_1(path: &Path) -> Segment {
+    use std::collections::HashMap;
+
+    use segment::segment_constructor::build_segment;
+    use segment::types::{Distance, Indexes, VectorDataConfig, VectorStorageType};
+
+    let dim = 4;
+    let deferred_internal_id = 3;
+    let hw_counter = HardwareCounterCell::new();
+
+    // Build segment with deferred threshold
+    let (mut segment, _) = build_segment(
+        path,
+        &segment::types::SegmentConfig {
+            vector_data: HashMap::from([(
+                segment::data_types::vectors::DEFAULT_VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: dim,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::default(),
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type: Default::default(),
+        },
+        Some(deferred_internal_id),
+        true,
+    )
+    .unwrap();
+
+    let vec1 = vec![1.0, 0.0, 1.0, 1.0];
+    let vec2 = vec![1.0, 0.0, 1.0, 0.0];
+    let vec3 = vec![1.0, 1.0, 1.0, 1.0];
+    let vec4 = vec![1.0, 1.0, 0.0, 1.0];
+    let vec5 = vec![1.0, 0.0, 0.0, 0.0];
+
+    segment
+        .upsert_point(1, 1.into(), only_default_vector(&vec1), &hw_counter)
+        .unwrap();
+    segment
+        .upsert_point(2, 2.into(), only_default_vector(&vec2), &hw_counter)
+        .unwrap();
+    segment
+        .upsert_point(3, 3.into(), only_default_vector(&vec3), &hw_counter)
+        .unwrap();
+    segment
+        .upsert_point(4, 4.into(), only_default_vector(&vec4), &hw_counter)
+        .unwrap();
+    segment
+        .upsert_point(5, 5.into(), only_default_vector(&vec5), &hw_counter)
+        .unwrap();
+
+    let payload_key = "color";
+    let payload_option1 = payload_json! {payload_key: vec!["red".to_owned()]};
+    let payload_option2 = payload_json! {payload_key: vec!["red".to_owned(), "blue".to_owned()]};
+    let payload_option3 = payload_json! {payload_key: vec!["blue".to_owned()]};
+
+    segment
+        .set_payload(6, 1.into(), &payload_option1, &None, &hw_counter)
+        .unwrap();
+    segment
+        .set_payload(6, 2.into(), &payload_option1, &None, &hw_counter)
+        .unwrap();
+    segment
+        .set_payload(6, 3.into(), &payload_option3, &None, &hw_counter)
+        .unwrap();
+    segment
+        .set_payload(6, 4.into(), &payload_option2, &None, &hw_counter)
+        .unwrap();
+    segment
+        .set_payload(6, 5.into(), &payload_option2, &None, &hw_counter)
+        .unwrap();
+
+    // Validate which points are deferred
+    assert!(
+        !segment.point_is_deferred(1.into()),
+        "Point 1 should not be deferred"
+    );
+    assert!(
+        !segment.point_is_deferred(2.into()),
+        "Point 2 should not be deferred"
+    );
+    assert!(
+        !segment.point_is_deferred(3.into()),
+        "Point 3 should not be deferred"
+    );
+    assert!(
+        segment.point_is_deferred(4.into()),
+        "Point 4 should be deferred"
+    );
+    assert!(
+        segment.point_is_deferred(5.into()),
+        "Point 5 should be deferred"
+    );
+
+    segment
 }

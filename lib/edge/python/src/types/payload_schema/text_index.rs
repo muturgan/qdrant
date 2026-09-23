@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -17,6 +21,37 @@ pub struct PyTextIndexParams(pub TextIndexParams);
 #[pyclass_repr]
 #[pymethods]
 impl PyTextIndexParams {
+    #[expect(clippy::too_many_arguments)]
+    #[new]
+    #[pyo3(signature = (tokenizer = None, min_token_len = None, max_token_len = None, lowercase = None, ascii_folding = None, phrase_matching = None, stopwords = None, on_disk = None, stemmer = None, enable_hnsw = None))]
+    pub fn new(
+        tokenizer: Option<PyTokenizerType>,
+        min_token_len: Option<usize>,
+        max_token_len: Option<usize>,
+        lowercase: Option<bool>,
+        ascii_folding: Option<bool>,
+        phrase_matching: Option<bool>,
+        stopwords: Option<PyStopwords>,
+        on_disk: Option<bool>,
+        stemmer: Option<PyStemmingAlgorithm>,
+        enable_hnsw: Option<bool>,
+    ) -> Self {
+        Self(TextIndexParams {
+            r#type: Default::default(),
+            tokenizer: tokenizer.map(TokenizerType::from).unwrap_or_default(),
+            min_token_len,
+            max_token_len,
+            lowercase,
+            ascii_folding,
+            phrase_matching,
+            stopwords: stopwords.map(StopwordsInterface::from),
+            on_disk,
+            memory: None,
+            stemmer: stemmer.map(StemmingAlgorithm::from),
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn tokenizer(&self) -> PyTokenizerType {
         PyTokenizerType::from(self.0.tokenizer)
@@ -79,6 +114,7 @@ impl PyTextIndexParams {
             lowercase: _,
             ascii_folding: _,
             phrase_matching: _,
+            memory: _,
             stopwords: _,
             on_disk: _,
             stemmer: _,
@@ -349,12 +385,21 @@ pub struct PyStopwordsSet(StopwordsSet);
 #[pyclass_repr]
 #[pymethods]
 impl PyStopwordsSet {
+    #[new]
+    #[pyo3(signature = (languages = None, custom = None))]
+    pub fn new(languages: Option<BTreeSet<PyLanguage>>, custom: Option<BTreeSet<String>>) -> Self {
+        Self(StopwordsSet {
+            languages: languages.map(|langs| langs.into_iter().map(Language::from).collect()),
+            custom,
+        })
+    }
+
     #[getter]
     pub fn languages(&self) -> Option<BTreeSet<PyLanguage>> {
         self.0
             .languages
             .as_ref()
-            .map(|langs| langs.iter().cloned().map(PyLanguage::from).collect())
+            .map(|langs| langs.iter().copied().map(PyLanguage::from).collect())
     }
 
     #[getter]
@@ -394,16 +439,19 @@ impl FromPyObject<'_, '_> for PyStemmingAlgorithm {
         #[derive(FromPyObject)]
         enum Helper {
             Snowball(PySnowballParams),
+            Disabled(PyDisabledStemmer),
         }
 
         fn _variants(algo: StemmingAlgorithm) {
             match algo {
                 StemmingAlgorithm::Snowball(_) => {}
+                StemmingAlgorithm::Disabled(_) => {}
             }
         }
 
         let algo = match algo.extract()? {
             Helper::Snowball(snowball) => StemmingAlgorithm::Snowball(snowball.into()),
+            Helper::Disabled(disabled) => StemmingAlgorithm::Disabled(disabled.into()),
         };
 
         Ok(Self(algo))
@@ -419,6 +467,9 @@ impl<'py> IntoPyObject<'py> for PyStemmingAlgorithm {
         match self.0 {
             StemmingAlgorithm::Snowball(snowball) => {
                 PySnowballParams(snowball).into_bound_py_any(py)
+            }
+            StemmingAlgorithm::Disabled(disabled) => {
+                PyDisabledStemmer(disabled).into_bound_py_any(py)
             }
         }
     }
@@ -438,6 +489,7 @@ impl Repr for PyStemmingAlgorithm {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.0 {
             StemmingAlgorithm::Snowball(snowball) => PySnowballParams::wrap_ref(snowball).fmt(f),
+            StemmingAlgorithm::Disabled(disabled) => PyDisabledStemmer::wrap_ref(disabled).fmt(f),
         }
     }
 }
@@ -450,6 +502,14 @@ pub struct PySnowballParams(SnowballParams);
 #[pyclass_repr]
 #[pymethods]
 impl PySnowballParams {
+    #[new]
+    pub fn new(language: PySnowballLanguage) -> Self {
+        Self(SnowballParams {
+            r#type: Default::default(),
+            language: SnowballLanguage::from(language),
+        })
+    }
+
     #[getter]
     pub fn language(&self) -> PySnowballLanguage {
         PySnowballLanguage::from(self.0.language)
@@ -462,6 +522,38 @@ impl PySnowballParams {
         let SnowballParams {
             r#type: _, // not relevant for Qdrant Edge
             language: _,
+        } = self.0;
+    }
+}
+
+/// Explicitly disable stemming, overriding the language default.
+#[pyclass(name = "DisabledStemmer", from_py_object)]
+#[derive(Clone, Debug, Into, TransparentWrapper)]
+#[repr(transparent)]
+pub struct PyDisabledStemmer(DisabledStemmerParams);
+
+#[pyclass_repr]
+#[pymethods]
+impl PyDisabledStemmer {
+    #[new]
+    pub fn new() -> Self {
+        Self(DisabledStemmerParams {
+            r#type: NoStemmer::None,
+        })
+    }
+}
+
+impl Default for PyDisabledStemmer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PyDisabledStemmer {
+    fn _getters(self) {
+        // Every field should have a getter method
+        let DisabledStemmerParams {
+            r#type: _, // not relevant for Qdrant Edge
         } = self.0;
     }
 }

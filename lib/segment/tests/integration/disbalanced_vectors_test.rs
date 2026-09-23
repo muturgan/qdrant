@@ -5,13 +5,13 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::entry::entry_point::{NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry};
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::segment_constructor::simple_segment_constructor::{
-    VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment,
+    VECTOR1_NAME, VECTOR2_NAME, build_segment_with_two_named_vecs,
 };
 use segment::types::{Distance, HnswGlobalConfig};
-use segment::vector_storage::VectorStorage;
+use segment::vector_storage::VectorStorageRead;
 use tempfile::Builder;
 
 #[test]
@@ -21,8 +21,8 @@ fn test_rebuild_with_removed_vectors() {
 
     let stopped = AtomicBool::new(false);
 
-    let mut segment1 = build_multivec_segment(dir.path(), 4, 6, Distance::Dot).unwrap();
-    let mut segment2 = build_multivec_segment(dir.path(), 4, 6, Distance::Dot).unwrap();
+    let mut segment1 = build_segment_with_two_named_vecs(dir.path(), 4, 6, Distance::Dot).unwrap();
+    let mut segment2 = build_segment_with_two_named_vecs(dir.path(), 4, 6, Distance::Dot).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -94,9 +94,11 @@ fn test_rebuild_with_removed_vectors() {
     )
     .unwrap();
 
-    builder.update(&[&segment1, &segment2], &stopped).unwrap();
-
     let hw_counter = HardwareCounterCell::new();
+
+    builder
+        .update(&[&segment1, &segment2], &stopped, &hw_counter)
+        .unwrap();
 
     let merged_segment = builder.build_for_test(dir.path());
 

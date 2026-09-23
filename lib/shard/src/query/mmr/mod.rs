@@ -15,7 +15,9 @@ use segment::types::{Distance, MultiVectorConfig, ScoredPoint};
 use segment::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
 use segment::vector_storage::multi_dense::volatile_multi_dense_vector_storage::new_volatile_multi_dense_vector_storage;
 use segment::vector_storage::sparse::volatile_sparse_vector_storage::new_volatile_sparse_vector_storage;
-use segment::vector_storage::{VectorStorage as _, VectorStorageEnum, new_raw_scorer};
+use segment::vector_storage::{
+    VectorStorage as _, VectorStorageEnum, VectorStorageRead as _, new_raw_scorer,
+};
 
 use self::lazy_matrix::LazyMatrix;
 use super::MmrInternal;
@@ -26,12 +28,11 @@ use super::MmrInternal;
 ///
 /// # Arguments
 ///
-/// * `collection_params` - The parameters of the collection. Used to determine the right distance metric, or multivec config.
 /// * `points_with_vector` - The points with vectors.
 /// * `mmr` - The MMR parameters.
+/// * `distance` - The distance metric of the collection.
+/// * `multivector_config` - The multivector configuration of the collection, if any.
 /// * `limit` - The maximum number of points to return.
-/// * `search_runtime_handle` - The runtime handle for searching.
-/// * `timeout` - The timeout for the operation.
 /// * `hw_measurement_acc` - The hardware measurement accumulator.
 ///
 /// # Returns

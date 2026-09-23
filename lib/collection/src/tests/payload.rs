@@ -15,9 +15,10 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 use crate::collection::payload_index_schema::{self, PayloadIndexSchema};
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::{create_collection_config, upsert_operation};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -28,7 +29,8 @@ async fn test_payload_missing_index_check() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let search_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -42,8 +44,8 @@ async fn test_payload_missing_index_check() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema.clone(),
-        current_runtime.clone(),
-        current_runtime.clone(),
+        update_runtime.clone(),
+        search_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
@@ -53,7 +55,12 @@ async fn test_payload_missing_index_check() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, None, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
@@ -146,7 +153,7 @@ async fn test_payload_missing_index_check() {
     );
 }
 
-async fn create_index(
+pub async fn create_index(
     shard: &LocalShard,
     payload_index_schema: &Arc<SaveOnDisk<PayloadIndexSchema>>,
     name: &str,
@@ -167,7 +174,12 @@ async fn create_index(
         }),
     );
     shard
-        .update(create_index.into(), true, None, HwMeasurementAcc::new())
+        .update(
+            create_index.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 }

@@ -1,4 +1,9 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::backtrace::Backtrace;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error as _;
 use std::fmt::{Debug, Write as _};
@@ -12,12 +17,11 @@ use api::rest::{
     SearchRequestInternal, ShardKeySelector, VectorStructOutput,
 };
 use common::ext::OptionExt;
-use common::fs::FileStorageError;
-use common::progress_tracker::ProgressTree;
 use common::rate_limiting::{RateLimitError, RetryError};
 use common::types::ScoreType;
 use common::validation::validate_range_generic;
 use common::{defaults, save_on_disk};
+use http::uri::InvalidUri;
 use issues::IssueRecord;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
@@ -26,14 +30,13 @@ use segment::data_types::groups::GroupId;
 use segment::data_types::modifier::Modifier;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, DenseVector};
 use segment::types::{
-    Distance, Filter, HnswConfig, MultiVectorConfig, Payload, PayloadIndexInfo, PayloadKeyType,
-    PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
+    Distance, Filter, HnswConfig, Memory, MultiVectorConfig, Payload, PayloadIndexInfo,
+    PayloadKeyType, PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
     SparseVectorStorageType, StrictModeConfigOutput, VectorName, VectorNameBuf,
     VectorStorageDatatype, WithPayloadInterface, WithVector,
 };
 use semver::Version;
-use serde;
-use serde::{Deserialize, Serialize};
+use serde::{self, Deserialize, Serialize};
 use serde_json::{Error as JsonError, Map, Value};
 pub use shard::count::CountRequestInternal;
 use shard::payload_index_schema::PayloadIndexSchema;
@@ -46,12 +49,10 @@ use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::error::RecvError as OneshotRecvError;
 use tokio::task::JoinError;
-use tonic::codegen::http::uri::InvalidUri;
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use super::ClockTag;
-use crate::collection_manager::optimizers::TrackerStatus;
 use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::config_diff::{HnswConfigDiff, QuantizationConfigDiff};
@@ -141,9 +142,15 @@ pub struct ShardUpdateQueueInfo {
     /// Number of elements in the queue
     #[anonymize(false)]
     pub length: usize,
+
     /// last operation number processed
     #[anonymize(false)]
     pub op_num: Option<usize>,
+
+    /// Number of points that are deferred (i.e hidden from search as they're not yet optimized).
+    #[anonymize(false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_points: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, Default, Anonymize)]
@@ -151,6 +158,11 @@ pub struct UpdateQueueInfo {
     /// Number of elements in the queue
     #[anonymize(false)]
     pub length: usize,
+
+    /// Number of points that are deferred (i.e hidden from search as they're not yet optimized).
+    #[anonymize(false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_points: Option<usize>,
 }
 
 // Version of the collection config we can present to the user
@@ -279,8 +291,15 @@ impl From<ShardInfoInternal> for CollectionInfo {
 impl From<ShardUpdateQueueInfo> for UpdateQueueInfo {
     fn from(value: ShardUpdateQueueInfo) -> Self {
         // ignore field `op_num`, no sane way to aggregate across shards
-        let ShardUpdateQueueInfo { length, op_num: _ } = value;
-        UpdateQueueInfo { length }
+        let ShardUpdateQueueInfo {
+            length,
+            op_num: _,
+            deferred_points,
+        } = value;
+        UpdateQueueInfo {
+            length,
+            deferred_points,
+        }
     }
 }
 
@@ -326,122 +345,6 @@ pub struct CollectionClusterInfo {
     // TODO(resharding): remove this skip when releasing resharding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resharding_operations: Option<Vec<ReshardingInfo>>,
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct OptimizationsRequestOptions {
-    /// `?with=queued`
-    pub queued: bool,
-    /// `?with=completed` and `?completed_limit=N`
-    pub completed_limit: Option<usize>,
-    /// `?with=idle_segments`
-    pub idle_segments: bool,
-}
-
-/// Optimizations progress for the collection
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
-pub struct OptimizationsResponse {
-    pub summary: OptimizationsSummary,
-    /// Currently running optimizations.
-    pub running: Vec<Optimization>,
-    /// An estimated queue of pending optimizations.
-    /// Requires `?with=queued`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queued: Option<Vec<PendingOptimization>>,
-    /// Completed optimizations.
-    /// Requires `?with=completed`. Limited by `?completed_limit=N`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed: Option<Vec<Optimization>>,
-    /// Segments that don't require optimization.
-    /// Requires `?with=idle_segments`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_segments: Option<Vec<OptimizationSegmentInfo>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
-pub struct OptimizationsSummary {
-    /// Number of pending optimizations in the queue.
-    /// Each optimization will take one or more unoptimized segments and produce
-    /// one optimized segment.
-    pub queued_optimizations: usize,
-    /// Number of unoptimized segments in the queue.
-    pub queued_segments: usize,
-    /// Number of points in unoptimized segments in the queue.
-    pub queued_points: usize,
-    /// Number of segments that don't require optimization.
-    pub idle_segments: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Optimization {
-    /// Unique identifier of the optimization process.
-    ///
-    /// After the optimization is complete, a new segment will be created with
-    /// this UUID.
-    pub uuid: Uuid,
-    /// Name of the optimizer that performed this optimization.
-    pub optimizer: String,
-    pub status: TrackerStatus,
-    /// Segments being optimized.
-    ///
-    /// After the optimization is complete, these segments will be replaced
-    /// by the new optimized segment.
-    pub segments: Vec<OptimizationSegmentInfo>,
-    pub progress: ProgressTree,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PendingOptimization {
-    /// Name of the optimizer that scheduled this optimization.
-    pub optimizer: String,
-    /// Segments that will be optimized.
-    pub segments: Vec<OptimizationSegmentInfo>,
-}
-
-impl OptimizationsResponse {
-    /// Merge another `OptimizationsResponse` into this one.
-    pub fn merge(&mut self, other: OptimizationsResponse) {
-        let OptimizationsResponse {
-            summary:
-                OptimizationsSummary {
-                    queued_optimizations,
-                    queued_segments,
-                    queued_points,
-                    idle_segments: idle_segments_count,
-                },
-            running,
-            queued,
-            completed,
-            idle_segments,
-        } = other;
-
-        self.running.extend(running);
-        self.summary.queued_optimizations += queued_optimizations;
-        self.summary.queued_segments += queued_segments;
-        self.summary.queued_points += queued_points;
-        self.summary.idle_segments += idle_segments_count;
-        merge_optional_vec(&mut self.completed, completed);
-        merge_optional_vec(&mut self.queued, queued);
-        merge_optional_vec(&mut self.idle_segments, idle_segments);
-    }
-}
-
-/// Merge two `Option<Vec<T>>` values: if either side has data, the result has data.
-fn merge_optional_vec<T>(target: &mut Option<Vec<T>>, source: Option<Vec<T>>) {
-    match (target.as_mut(), source) {
-        (Some(target), Some(source)) => target.extend(source),
-        (None, source @ Some(_)) => *target = source,
-        (Some(_) | None, None) => {}
-    }
-}
-
-// See also [`segment::types::SegmentInfo`] which is used in telemetry.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct OptimizationSegmentInfo {
-    /// Unique identifier of the segment.
-    pub uuid: Uuid,
-    /// Number of non-deleted points in the segment.
-    pub points_count: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
@@ -693,7 +596,7 @@ impl RecommendExample {
     pub fn as_point_id(&self) -> Option<PointIdType> {
         match self {
             RecommendExample::PointId(id) => Some(*id),
-            _ => None,
+            RecommendExample::Dense(_) | RecommendExample::Sparse(_) => None,
         }
     }
 }
@@ -1018,8 +921,6 @@ pub enum CollectionError {
     BadRequest { description: String },
     #[error("Operation Cancelled: {description}")]
     Cancelled { description: String },
-    #[error("Bad shard selection: {description}")]
-    BadShardSelection { description: String },
     #[error(
         "{shards_failed} out of {shards_total} shards failed to apply operation. First error captured: {first_err}"
     )]
@@ -1049,6 +950,20 @@ pub enum CollectionError {
     },
     #[error("Shard temporarily unavailable: {description}")]
     ShardUnavailable { description: String },
+    /// A node has reached its resource quota and cannot take on more data.
+    ///
+    /// Deliberately transient: it describes the node, not the request, so it
+    /// clears on its own once space is freed — the same shape as a peer being
+    /// unreachable, and handled the same way by the replica set.
+    #[error("Insufficient storage: {description}")]
+    InsufficientStorage { description: String },
+}
+
+/// Which rate limiter rejected an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateLimiterKind {
+    Read,
+    Write,
 }
 
 impl CollectionError {
@@ -1090,10 +1005,6 @@ impl CollectionError {
         }
     }
 
-    pub fn bad_shard_selection(description: String) -> Self {
-        Self::BadShardSelection { description }
-    }
-
     pub fn object_storage_error(what: impl Into<String>) -> Self {
         Self::ObjectStoreError { what: what.into() }
     }
@@ -1106,20 +1017,10 @@ impl CollectionError {
     }
 
     pub fn remote_peer_id(&self) -> Option<PeerId> {
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         match self {
             Self::ForwardProxyError { peer_id, .. } => Some(*peer_id),
             _ => None,
-        }
-    }
-
-    pub fn shard_key_not_found(shard_key: &Option<ShardKey>) -> Self {
-        match shard_key {
-            Some(shard_key) => Self::NotFound {
-                what: format!("Shard key {shard_key} not found"),
-            },
-            None => Self::NotFound {
-                what: "Shard expected, but not provided".to_string(),
-            },
         }
     }
 
@@ -1137,9 +1038,12 @@ impl CollectionError {
     pub fn rate_limit_error(
         rate_limit_error: RateLimitError,
         cost: usize,
-        write_limit_type: bool, // false = read rate limit; true = write rate limit.
+        rate_limiter_kind: RateLimiterKind,
     ) -> Self {
-        let rate_limiter_type = if write_limit_type { "Write" } else { "Read" };
+        let rate_limiter_type = match rate_limiter_kind {
+            RateLimiterKind::Read => "Read",
+            RateLimiterKind::Write => "Write",
+        };
         let (description, retry_after) = match rate_limit_error {
             RateLimitError::AlwaysOverBudget(msg) => {
                 let description = format!("{rate_limiter_type} rate limit exceeded, {msg}",);
@@ -1181,12 +1085,15 @@ impl CollectionError {
             Self::OutOfMemory { .. } => true,
             Self::PreConditionFailed { .. } => true,
             Self::ShardUnavailable { .. } => true,
+            // A node over its quota is a node that cannot take writes right now,
+            // which is the same situation as one that is offline: the replica
+            // set deactivates it and carries on with the rest.
+            Self::InsufficientStorage { .. } => true,
             // Not transient
             Self::BadInput { .. } => false,
             Self::NotFound { .. } => false,
             Self::PointNotFound { .. } => false,
             Self::BadRequest { .. } => false,
-            Self::BadShardSelection { .. } => false,
             Self::InconsistentShardFailure { .. } => false,
             Self::ForwardProxyError { .. } => false,
             Self::ObjectStoreError { .. } => false,
@@ -1201,6 +1108,7 @@ impl CollectionError {
     }
 
     pub fn is_missing_point(&self) -> bool {
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         match self {
             Self::NotFound { what } => what.contains("No point with id"),
             Self::PointNotFound { .. } => true,
@@ -1210,20 +1118,14 @@ impl CollectionError {
 }
 
 impl From<SystemTimeError> for CollectionError {
-    fn from(error: SystemTimeError) -> CollectionError {
-        CollectionError::ServiceError {
-            error: format!("System time error: {error}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+    fn from(error: SystemTimeError) -> Self {
+        Self::service_error(format!("System time error: {error}"))
     }
 }
 
 impl From<String> for CollectionError {
-    fn from(error: String) -> CollectionError {
-        CollectionError::ServiceError {
-            error,
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+    fn from(error: String) -> Self {
+        Self::service_error(error)
     }
 }
 
@@ -1231,10 +1133,16 @@ impl From<OperationError> for CollectionError {
     fn from(err: OperationError) -> Self {
         match err {
             OperationError::WrongVectorDimension { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
+            },
+            OperationError::MalformedVectorBlob { .. } => Self::BadInput {
+                description: err.to_string(),
+            },
+            OperationError::MalformedPayloadBlob { .. } => Self::BadInput {
+                description: err.to_string(),
             },
             OperationError::VectorNameNotExists { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::PointIdError { missed_point_id } => {
                 Self::PointNotFound { missed_point_id }
@@ -1247,22 +1155,28 @@ impl From<OperationError> for CollectionError {
                 backtrace,
             },
             OperationError::TypeError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::Cancelled { description } => Self::Cancelled { description },
             OperationError::TypeInferenceError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::OutOfMemory { description, free } => {
                 Self::OutOfMemory { description, free }
             }
             OperationError::Timeout { description } => Self::Timeout { description },
             OperationError::InconsistentStorage { .. } => Self::ServiceError {
-                error: format!("{err}"),
+                error: err.to_string(),
+                backtrace: None,
+            },
+            // Internal classification for read-only followers (live-reload vs manifest);
+            // externally it stays a service error.
+            OperationError::FileNotFound { .. } => Self::ServiceError {
+                error: err.to_string(),
                 backtrace: None,
             },
             OperationError::ValidationError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::WrongSparse => Self::BadInput {
                 description: "Conversion between sparse and regular vectors failed".to_string(),
@@ -1270,12 +1184,14 @@ impl From<OperationError> for CollectionError {
             OperationError::WrongMulti => Self::BadInput {
                 description: "Conversion between multi and regular vectors failed".to_string(),
             },
-            OperationError::MissingRangeIndexForOrderBy { .. } => Self::bad_input(format!("{err}")),
-            OperationError::MissingMapIndexForFacet { .. } => Self::bad_input(format!("{err}")),
-            OperationError::VariableTypeError { .. } => Self::bad_input(format!("{err}")),
-            OperationError::NonFiniteNumber { .. } => Self::bad_input(format!("{err}")),
-            OperationError::RocksDbColumnFamilyNotFound { .. } => Self::ServiceError {
-                error: format!("{err}"),
+            OperationError::MissingRangeIndexForOrderBy { .. } => Self::bad_input(err.to_string()),
+            OperationError::MissingMapIndexForFacet { .. } => Self::bad_input(err.to_string()),
+            OperationError::VariableTypeError { .. } => Self::bad_input(err.to_string()),
+            OperationError::NonFiniteNumber { .. } => Self::bad_input(err.to_string()),
+            // Normally handled by segment provisioning before reaching this conversion; if it
+            // leaks, stay transient so failed-operation recovery re-applies the operation.
+            OperationError::OutOfAppendableCapacity { .. } => Self::ServiceError {
+                error: err.to_string(),
                 backtrace: None,
             },
         }
@@ -1290,101 +1206,94 @@ impl From<CancelledError> for CollectionError {
 
 impl From<OneshotRecvError> for CollectionError {
     fn from(err: OneshotRecvError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<JoinError> for CollectionError {
     fn from(err: JoinError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<WalError> for CollectionError {
     fn from(err: WalError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
+        Self::service_error(err.to_string())
+    }
+}
+
+impl From<shard::quota::QuotaError> for CollectionError {
+    fn from(err: shard::quota::QuotaError) -> Self {
+        use shard::quota::QuotaError;
+
+        match err {
+            QuotaError::LimitReached(description) => Self::InsufficientStorage { description },
+            QuotaError::InvalidConfig(description) => Self::BadRequest { description },
+            QuotaError::Io(description) => Self::service_error(description),
         }
     }
 }
 
 impl<T> From<SendError<T>> for CollectionError {
     fn from(err: SendError<T>) -> Self {
-        Self::ServiceError {
-            error: format!("Can't reach one of the workers: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Can't reach one of the workers: {err}"))
     }
 }
 
 impl From<JsonError> for CollectionError {
     fn from(err: JsonError) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Json error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Json error: {err}"))
     }
 }
 
 impl From<std::io::Error> for CollectionError {
     fn from(err: std::io::Error) -> Self {
-        CollectionError::ServiceError {
-            error: format!("File IO error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("File IO error: {err}"))
     }
 }
 
 impl From<tonic::transport::Error> for CollectionError {
     fn from(err: tonic::transport::Error) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Tonic transport error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Tonic transport error: {err}"))
     }
 }
 
 impl From<InvalidUri> for CollectionError {
     fn from(err: InvalidUri) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Invalid URI error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Invalid URI error: {err}"))
     }
 }
+
+/// Marks a `ResourceExhausted` status as a quota rejection rather than rate
+/// limiting.
+///
+/// gRPC spends one code on both ("a per-user quota, or the entire file system is
+/// out of space"), but they are not interchangeable here: one asks the caller to
+/// retry later, the other says a replica is out of room and has to be taken out
+/// of the set. Set on the way out, read on the way back in.
+pub const INSUFFICIENT_STORAGE_METADATA_KEY: &str = "qdrant-insufficient-storage";
 
 impl From<tonic::Status> for CollectionError {
     fn from(err: tonic::Status) -> Self {
         match err.code() {
-            tonic::Code::InvalidArgument => CollectionError::BadInput {
-                description: format!("InvalidArgument: {err}"),
-            },
-            tonic::Code::AlreadyExists => CollectionError::BadInput {
-                description: format!("AlreadyExists: {err}"),
-            },
-            tonic::Code::NotFound => CollectionError::NotFound {
-                what: format!("{err}"),
-            },
-            tonic::Code::Internal => CollectionError::ServiceError {
-                error: format!("Internal error: {err}"),
-                backtrace: Some(Backtrace::force_capture().to_string()),
-            },
-            tonic::Code::DeadlineExceeded => CollectionError::Timeout {
+            tonic::Code::InvalidArgument => Self::bad_input(format!("InvalidArgument: {err}")),
+            tonic::Code::AlreadyExists => Self::bad_input(format!("AlreadyExists: {err}")),
+            tonic::Code::NotFound => Self::not_found(err.to_string()),
+            tonic::Code::Internal => Self::service_error(format!("Internal error: {err}")),
+            tonic::Code::DeadlineExceeded => Self::Timeout {
                 description: format!("Deadline Exceeded: {err}"),
             },
-            tonic::Code::Cancelled => CollectionError::Cancelled {
-                description: format!("{err}"),
-            },
-            tonic::Code::FailedPrecondition => CollectionError::PreConditionFailed {
-                description: format!("{err}"),
-            },
+            tonic::Code::Cancelled => Self::cancelled(err.to_string()),
+            tonic::Code::FailedPrecondition => Self::pre_condition_failed(err.to_string()),
+            tonic::Code::ResourceExhausted
+                if err
+                    .metadata()
+                    .contains_key(INSUFFICIENT_STORAGE_METADATA_KEY) =>
+            {
+                Self::InsufficientStorage {
+                    description: err.message().to_string(),
+                }
+            }
             tonic::Code::ResourceExhausted => {
                 // extract retry-after from metadata
                 // the value is passed as a String containing an integer number of seconds
@@ -1401,8 +1310,8 @@ impl From<tonic::Status> for CollectionError {
                         })
                         .map(Duration::from_secs)
                 });
-                CollectionError::RateLimitExceeded {
-                    description: format!("{err}"),
+                Self::RateLimitExceeded {
+                    description: err.to_string(),
                     retry_after,
                 }
             }
@@ -1414,26 +1323,16 @@ impl From<tonic::Status> for CollectionError {
             | tonic::Code::Unimplemented
             | tonic::Code::Unavailable
             | tonic::Code::DataLoss
-            | tonic::Code::Unauthenticated => CollectionError::ServiceError {
-                error: format!("Tonic status error: {err}"),
-                backtrace: Some(Backtrace::force_capture().to_string()),
-            },
+            | tonic::Code::Unauthenticated => {
+                Self::service_error(format!("Tonic status error: {err}"))
+            }
         }
     }
 }
 
 impl<Guard> From<std::sync::PoisonError<Guard>> for CollectionError {
     fn from(err: std::sync::PoisonError<Guard>) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Mutex lock poisoned: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
-    }
-}
-
-impl From<FileStorageError> for CollectionError {
-    fn from(err: FileStorageError) -> Self {
-        Self::service_error(err.to_string())
+        Self::service_error(format!("Mutex lock poisoned: {err}"))
     }
 }
 
@@ -1454,18 +1353,13 @@ impl From<RequestError<tonic::Status>> for CollectionError {
 
 impl From<save_on_disk::Error> for CollectionError {
     fn from(err: save_on_disk::Error) -> Self {
-        CollectionError::ServiceError {
-            error: err.to_string(),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<validator::ValidationErrors> for CollectionError {
     fn from(err: validator::ValidationErrors) -> Self {
-        CollectionError::BadInput {
-            description: format!("{err}"),
-        }
+        Self::bad_input(err.to_string())
     }
 }
 
@@ -1473,9 +1367,7 @@ impl From<cancel::Error> for CollectionError {
     fn from(err: cancel::Error) -> Self {
         match err {
             cancel::Error::Join(err) => err.into(),
-            cancel::Error::Cancelled => Self::Cancelled {
-                description: err.to_string(),
-            },
+            cancel::Error::Cancelled => Self::cancelled(err.to_string()),
         }
     }
 }
@@ -1501,6 +1393,7 @@ pub enum Datatype {
     Float32,
     Uint8,
     Float16,
+    Turbo4,
 }
 
 impl From<Datatype> for VectorStorageDatatype {
@@ -1509,6 +1402,7 @@ impl From<Datatype> for VectorStorageDatatype {
             Datatype::Float32 => VectorStorageDatatype::Float32,
             Datatype::Uint8 => VectorStorageDatatype::Uint8,
             Datatype::Float16 => VectorStorageDatatype::Float16,
+            Datatype::Turbo4 => VectorStorageDatatype::Turbo4,
         }
     }
 }
@@ -1521,6 +1415,7 @@ impl From<Datatype> for VectorStorageDatatype {
 #[anonymize(false)]
 pub struct VectorParams {
     /// Size of a vectors used
+    #[schemars(range(min = 1, max = 65536))]
     #[validate(custom(function = "validate_nonzerou64_range_min_1_max_65536"))]
     pub size: NonZeroU64,
     /// Type of distance function used for measuring distance between vectors
@@ -1537,10 +1432,19 @@ pub struct VectorParams {
     )]
     #[validate(nested)]
     pub quantization_config: Option<QuantizationConfig>,
+    /// Deprecated: use `memory` instead.
     /// If true, vectors are served from disk, improving RAM usage at the cost of latency
     /// Default: false
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[deprecated(since = "1.19.0", note = "Use `memory` instead")]
     pub on_disk: Option<bool>,
+
+    /// Memory placement of the original vector storage. Overrides the deprecated `on_disk`
+    /// flag if both are set. `pinned` is not supported for dense vector storage.
+    /// Default: `cached` (`cold` if `on_disk` is set to true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_dense_vector_memory"))]
+    pub memory: Option<Memory>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Defines which datatype should be used to represent vectors in the storage.
@@ -1552,6 +1456,8 @@ pub struct VectorParams {
     ///   2 bytes.
     /// - For `uint8` datatype - vectors are stored as unsigned 8-bit integers, 1 byte.
     ///   It expects vector elements to be in range `[0, 255]`.
+    /// - For `turbo4` datatype - vectors are quantized to 4 bits per element using the
+    ///   TurboQuant algorithm.
     pub datatype: Option<Datatype>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1563,6 +1469,30 @@ pub fn validate_nonzerou64_range_min_1_max_65536(
     value: &NonZeroU64,
 ) -> Result<(), ValidationError> {
     validate_range_generic(value.get(), Some(1), Some(65536))
+}
+
+/// Reject the `Turbo4` datatype on sparse vector configs.
+/// `validator` unwraps `Option<Datatype>` before calling, so we receive `&Datatype`.
+fn validate_sparse_datatype(datatype: &Datatype) -> Result<(), ValidationError> {
+    if matches!(datatype, Datatype::Turbo4) {
+        return Err(common::validation::sparse_turbo4_unsupported_error());
+    }
+    Ok(())
+}
+
+/// Reject memory placements not supported by dense vector storage.
+/// `validator` unwraps `Option<Memory>` before calling, so we receive `&Memory`.
+fn validate_dense_vector_memory(memory: &Memory) -> Result<(), ValidationError> {
+    match memory {
+        Memory::Cold | Memory::Cached => Ok(()),
+        Memory::Pinned => {
+            let mut error = ValidationError::new("unsupported_memory_placement");
+            error.message = Some(Cow::from(
+                "`pinned` memory placement is not supported for dense vector storage",
+            ));
+            Err(error)
+        }
+    }
 }
 
 /// Is considered empty if `None` or if diff has no field specified
@@ -1578,6 +1508,7 @@ fn is_hnsw_diff_empty(hnsw_config: &Option<HnswConfigDiff>) -> bool {
 pub struct SparseVectorParams {
     /// Custom params for index. If none - values from collection configuration are used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
     pub index: Option<SparseIndexParams>,
 
     /// Configures addition value modifications for sparse vectors.
@@ -1594,7 +1525,18 @@ impl SparseVectorParams {
 
 /// Configuration for sparse inverted index.
 #[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Anonymize, Copy, Clone, PartialEq, Eq, Default,
+    Debug,
+    Hash,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    Validate,
+    Anonymize,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
 )]
 #[serde(rename_all = "snake_case")]
 pub struct SparseIndexParams {
@@ -1604,9 +1546,15 @@ pub struct SparseIndexParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[anonymize(false)]
     pub full_scan_threshold: Option<usize>,
+    /// Deprecated: use `memory` instead.
     /// Store index on disk. If set to false, the index will be stored in RAM. Default: false
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(since = "1.19.0", note = "Use `memory` instead")]
     pub on_disk: Option<bool>,
+    /// Memory placement of the index. Overrides the deprecated `on_disk` flag if both are set.
+    /// Default: `pinned` (`cold` if `on_disk` is set to true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
     /// Defines which datatype should be used for the index.
     /// Choosing different datatypes allows to optimize memory usage and performance vs accuracy.
     ///
@@ -1618,6 +1566,7 @@ pub struct SparseIndexParams {
     ///   Quantization to fit byte range `[0, 255]` happens during indexing automatically, so the
     ///   actual vector data does not need to conform to this range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_sparse_datatype"))]
     pub datatype: Option<Datatype>,
 }
 
@@ -1626,12 +1575,14 @@ impl SparseIndexParams {
         let SparseIndexParams {
             full_scan_threshold,
             on_disk,
+            memory,
             datatype,
         } = other;
 
         self.full_scan_threshold
             .replace_if_some(full_scan_threshold);
         self.on_disk.replace_if_some(on_disk);
+        self.memory.replace_if_some(memory);
         self.datatype.replace_if_some(datatype);
     }
 }
@@ -1681,6 +1632,38 @@ impl VectorsConfig {
         }
     }
 
+    /// Insert or replace a named vector. Converts `Single` to `Multi` if needed.
+    pub fn insert(&mut self, name: VectorNameBuf, params: VectorParams) {
+        match self {
+            VectorsConfig::Single(_) => {
+                let mut multi = BTreeMap::new();
+                if let VectorsConfig::Single(existing) =
+                    std::mem::replace(self, VectorsConfig::empty())
+                {
+                    multi.insert(DEFAULT_VECTOR_NAME.to_owned(), existing);
+                }
+                multi.insert(name, params);
+                *self = VectorsConfig::Multi(multi);
+            }
+            VectorsConfig::Multi(vectors) => {
+                vectors.insert(name, params);
+            }
+        }
+    }
+
+    /// Remove a named vector. Converts `Single` to empty `Multi` if name matches.
+    pub fn remove(&mut self, name: &VectorName) {
+        match self {
+            VectorsConfig::Single(_) if name == DEFAULT_VECTOR_NAME => {
+                *self = VectorsConfig::Multi(Default::default());
+            }
+            VectorsConfig::Single(_) => {}
+            VectorsConfig::Multi(vectors) => {
+                vectors.remove(name);
+            }
+        }
+    }
+
     pub fn get_params_mut(&mut self, name: &VectorName) -> Option<&mut VectorParams> {
         match self {
             VectorsConfig::Single(params) => (name == DEFAULT_VECTOR_NAME).then_some(params),
@@ -1700,30 +1683,6 @@ impl VectorsConfig {
         }
     }
 
-    // TODO: Further unify `check_compatible` and `check_compatible_with_segment_config`?
-    pub fn check_compatible(&self, other: &Self) -> CollectionResult<()> {
-        match (self, other) {
-            (Self::Single(_), Self::Single(_)) | (Self::Multi(_), Self::Multi(_)) => (),
-            _ => {
-                return Err(incompatible_vectors_error(
-                    self.params_iter().map(|(name, _)| name),
-                    other.params_iter().map(|(name, _)| name),
-                ));
-            }
-        };
-
-        for (vector_name, this) in self.params_iter() {
-            let Some(other) = other.get_params(vector_name) else {
-                return Err(missing_vector_error(vector_name));
-            };
-
-            VectorParamsBase::from(this).check_compatibility(&other.into(), vector_name)?;
-        }
-
-        Ok(())
-    }
-
-    // TODO: Further unify `check_compatible` and `check_compatible_with_segment_config`?
     pub fn check_compatible_with_segment_config(
         &self,
         other: &HashMap<VectorNameBuf, segment::types::VectorDataConfig>,
@@ -1748,27 +1707,6 @@ impl VectorsConfig {
     }
 }
 
-pub fn check_sparse_compatible_with_segment_config(
-    self_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-    other: &HashMap<VectorNameBuf, segment::types::SparseVectorDataConfig>,
-    exact: bool,
-) -> CollectionResult<()> {
-    if exact && self_config.len() != other.len() {
-        return Err(incompatible_vectors_error(
-            self_config.keys().map(AsRef::as_ref),
-            other.keys().map(AsRef::as_ref),
-        ));
-    }
-
-    for (vector_name, _) in self_config.iter() {
-        if other.get(vector_name).is_none() {
-            return Err(missing_vector_error(vector_name));
-        };
-    }
-
-    Ok(())
-}
-
 fn incompatible_vectors_error<'a, 'b>(
     this: impl Iterator<Item = &'a VectorName>,
     other: impl Iterator<Item = &'b VectorName>,
@@ -1776,22 +1714,18 @@ fn incompatible_vectors_error<'a, 'b>(
     let this_vectors = this.collect::<Vec<_>>().join(", ");
     let other_vectors = other.collect::<Vec<_>>().join(", ");
 
-    CollectionError::BadInput {
-        description: format!(
-            "Vectors configuration is not compatible: \
+    CollectionError::bad_input(format!(
+        "Vectors configuration is not compatible: \
              origin collection have vectors [{this_vectors}], \
              while other vectors [{other_vectors}]"
-        ),
-    }
+    ))
 }
 
 fn missing_vector_error(vector_name: &VectorName) -> CollectionError {
-    CollectionError::BadInput {
-        description: format!(
-            "Vectors configuration is not compatible: \
+    CollectionError::bad_input(format!(
+        "Vectors configuration is not compatible: \
              origin collection have vector {vector_name}, while other collection does not"
-        ),
-    }
+    ))
 }
 
 impl Validate for VectorsConfig {
@@ -1820,23 +1754,19 @@ struct VectorParamsBase {
 impl VectorParamsBase {
     fn check_compatibility(&self, other: &Self, vector_name: &VectorName) -> CollectionResult<()> {
         if self.size != other.size {
-            return Err(CollectionError::BadInput {
-                description: format!(
-                    "Vectors configuration is not compatible: \
+            return Err(CollectionError::bad_input(format!(
+                "Vectors configuration is not compatible: \
                      origin vector {} size: {}, while other vector size: {}",
-                    vector_name, self.size, other.size
-                ),
-            });
+                vector_name, self.size, other.size
+            )));
         }
 
         if self.distance != other.distance {
-            return Err(CollectionError::BadInput {
-                description: format!(
-                    "Vectors configuration is not compatible: \
+            return Err(CollectionError::bad_input(format!(
+                "Vectors configuration is not compatible: \
                      origin vector {} distance: {:?}, while other vector distance: {:?}",
-                    vector_name, self.distance, other.distance
-                ),
-            });
+                vector_name, self.distance, other.distance
+            )));
         }
 
         Ok(())
@@ -1851,6 +1781,7 @@ impl From<&VectorParams> for VectorParamsBase {
             hnsw_config: _,
             quantization_config: _,
             on_disk: _,
+            memory: _,
             datatype: _,
             multivector_config: _,
         } = params;
@@ -1891,9 +1822,16 @@ pub struct VectorParamsDiff {
     )]
     #[validate(nested)]
     pub quantization_config: Option<QuantizationConfigDiff>,
+    /// Deprecated: use `memory` instead.
     /// If true, vectors are served from disk, improving RAM usage at the cost of latency
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[deprecated(since = "1.19.0", note = "Use `memory` instead")]
     pub on_disk: Option<bool>,
+    /// Memory placement of the original vector storage. Overrides the deprecated `on_disk`
+    /// flag if both are set. `pinned` is not supported for dense vector storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_dense_vector_memory"))]
+    pub memory: Option<Memory>,
 }
 
 /// Vector update params for multiple vectors
@@ -1916,9 +1854,7 @@ impl VectorsConfigDiff {
                 .vectors
                 .get_params(vector_name)
                 .map(|_| ())
-                .ok_or_else(|| OperationError::VectorNameNotExists {
-                    received_name: vector_name.clone(),
-                })?;
+                .ok_or_else(|| OperationError::vector_name_not_exists(vector_name.clone()))?;
         }
         Ok(())
     }
@@ -2008,6 +1944,12 @@ pub struct PeerMetadata {
 }
 
 impl PeerMetadata {
+    /// Metadata of a peer running `version`, to set up a state for a test
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new(version: Version) -> Self {
+        Self { version }
+    }
+
     pub fn current() -> Self {
         Self {
             version: defaults::QDRANT_VERSION.clone(),

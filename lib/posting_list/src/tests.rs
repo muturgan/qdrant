@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use common::types::PointOffsetType;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::{CHUNK_LEN, PostingBuilder, PostingList, PostingValue, UnsizedHandler, UnsizedValue};
 
@@ -154,7 +154,7 @@ where
 
     // Bounds check
     assert!(visitor.get_by_offset(postings_count as usize).is_none());
-    let out_of_range = (postings_count.next_multiple_of(CHUNK_LEN as u32)) as usize;
+    let out_of_range = postings_count.next_multiple_of(CHUNK_LEN as u32) as usize;
     assert!(visitor.get_by_offset(out_of_range).is_none());
 
     // There is no such id

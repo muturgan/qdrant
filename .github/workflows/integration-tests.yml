@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ '**' ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   UV_VERSION: 0.9.17
@@ -17,16 +20,16 @@ jobs:
 
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v6
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/setup-python@v6
+          # Only save the cache on dev; feature-branch caches would just get evicted under the 10 GB budget
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install dependencies
@@ -37,7 +40,7 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check rocksdb staging" --locked
+        run: cargo build --features "service_debug data-consistency-check staging" --locked
       - name: Run integration tests
         run: uv --project tests run bash ./tests/integration-tests.sh
         shell: bash
@@ -47,18 +50,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v6
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: integration-tests
+          # integration-tests is the broadest build in this group and owns saving the cache
+          save-if: "false"
       - name: Install dependencies
         run: sudo apt-get install clang
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install uv and Python dependencies
@@ -68,15 +71,15 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check rocksdb staging" --locked
+        run: cargo build --features "service_debug data-consistency-check staging" --locked
       - name: Run integration tests - 1 peer
         run: uv --project tests run bash ./tests/integration-tests.sh distributed
         shell: bash
       - name: Run integration tests - multiple peers - pytest
-        run: uv --project tests run pytest tests/consensus_tests --durations=10
+        run: uv --project tests run pytest -n auto --dist=loadfile -v tests/consensus_tests --durations=10
         timeout-minutes: 60
       - name: upload logs
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           path: consensus_test_logs
@@ -88,8 +91,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install uv and Python dependencies
@@ -99,16 +102,14 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Docker build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           tags: qdrant_consensus
-          cache-from: |
-            type=gha,scope=${{ github.ref }}
-            type=gha,scope=${{ github.base_ref }}
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}
+          cache-from: type=gha,scope=docker-integration-tests
+          cache-to: ${{ github.event_name == 'push' && github.ref_name == 'dev' && 'type=gha,mode=max,scope=docker-integration-tests' || '' }}
           load: true
           build-args: |
             PROFILE=ci
@@ -123,32 +124,20 @@ jobs:
 
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: integration-tests
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Install dependencies
         run: sudo apt-get install -y clang jq
       - name: Docker build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: tools/schema2openapi
           tags: schema2openapi
-          cache-from: |
-            type=gha,scope=${{ github.ref }}-schema2openapi
-            type=gha,scope=${{ github.base_ref }}-schema2openapi
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}-schema2openapi
           load: true
-          build-args: |
-            PROFILE=ci
-            FEATURES=staging
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/setup-protoc
       - name: gRPC file consistency check
         run: ./tests/grpc_consistency_check.sh
       - name: OpenAPI file consistency check
@@ -173,42 +162,32 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/checkout@v6
+          # integration-tests is the broadest build in this group and owns saving the cache
+          save-if: "false"
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/setup-protoc
       - name: Install dependencies
         run: sudo apt-get install clang jq
       - name: Build
-        run: cargo build --bin qdrant --features "rocksdb staging" --locked
+        run: cargo build --bin qdrant --features "staging" --locked
       - name: Run Shard Snapshot API Tests (local)
-        shell: bash
-        run: |
-          cargo run --features "rocksdb staging" &
-          trap 'kill $(jobs -p) &>/dev/null || :' EXIT
-          sleep 10
-
-          ./tests/shard-snapshot-api.sh test-all
+        timeout-minutes: 15
+        run: ./tests/shard-snapshot-api-tests.sh
       - name: Run Shard Snapshot API Tests (s3)
-        shell: bash
-        run: |
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__SNAPSHOTS_STORAGE=s3
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__BUCKET=test-bucket
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__REGION=us-east-1
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__ACCESS_KEY=minioadmin
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__SECRET_KEY=minioadmin
-          export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__ENDPOINT_URL=http://127.0.0.1:9000
-
-          cargo run --features "rocksdb staging" &
-          trap 'kill $(jobs -p) &>/dev/null || :' EXIT
-          sleep 10
-
-          ./tests/shard-snapshot-api.sh test-all
+        timeout-minutes: 15
+        env:
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__SNAPSHOTS_STORAGE: s3
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__BUCKET: test-bucket
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__REGION: us-east-1
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__ACCESS_KEY: minioadmin
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__SECRET_KEY: minioadmin
+          QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__ENDPOINT_URL: http://127.0.0.1:9000
+        run: ./tests/shard-snapshot-api-tests.sh
 
   e2e-tests:
     runs-on: ubuntu-latest
@@ -231,14 +210,14 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: true  # Fetch LFS files automatically
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Install uv and Python dependencies
         run: |
           curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
@@ -246,18 +225,16 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Build Qdrant Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           tags: qdrant/qdrant:e2e-tests
-          cache-from: |
-            type=gha,scope=${{ github.ref }}-e2e
-            type=gha,scope=${{ github.base_ref }}-e2e
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}-e2e
+          cache-from: type=gha,scope=docker-e2e-tests
+          cache-to: ${{ github.event_name == 'push' && github.ref_name == 'dev' && 'type=gha,mode=max,scope=docker-e2e-tests' || '' }}
           load: true
           build-args: |
             PROFILE=ci
-            FEATURES=data-consistency-check,rocksdb,staging
+            FEATURES=data-consistency-check,staging
       - name: Verify Docker image
         run: docker images | grep qdrant
       - name: Run e2e tests
@@ -265,7 +242,7 @@ jobs:
         shell: bash
         timeout-minutes: 20
       - name: Upload test logs on failure
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: e2e-test-logs

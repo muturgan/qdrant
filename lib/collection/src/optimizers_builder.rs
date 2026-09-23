@@ -1,34 +1,47 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
+use common::types::PointOffsetType;
 use fs_err as fs;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::types::{HnswConfig, HnswGlobalConfig, QuantizationConfig};
+use segment::types::{HnswConfig, HnswGlobalConfig, QuantizationConfig, VectorStorageDatatype};
 use serde::{Deserialize, Serialize};
+use shard::files::SEGMENTS_PATH;
+use shard::operations::optimization::OptimizerThresholds;
+use shard::optimizers::config::{
+    DEFAULT_DELETED_THRESHOLD, DEFAULT_VACUUM_MIN_VECTOR_NUMBER, DenseVectorOptimizerConfig,
+    LiveVectorNamesProvider, SegmentOptimizerConfig, SparseVectorOptimizerConfig,
+    TEMP_SEGMENTS_PATH, get_deferred_points_threshold_bytes, get_indexing_threshold_kb,
+    get_max_segment_size_kb, get_number_segments,
+};
+use shard::optimizers::segment_optimizer::max_num_indexing_threads;
+use tokio::sync::RwLock as TokioRwLock;
 use validator::Validate;
 
 use crate::collection_manager::optimizers::config_mismatch_optimizer::ConfigMismatchOptimizer;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
 use crate::collection_manager::optimizers::merge_optimizer::MergeOptimizer;
-use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::collection_manager::optimizers::vacuum_optimizer::VacuumOptimizer;
-use crate::config::CollectionParams;
+use crate::config::{CollectionConfigInternal, CollectionParams};
+use crate::operations::config_diff::DiffConfig;
+use crate::operations::types::{SparseVectorParams, VectorParams};
 use crate::update_handler::Optimizer;
-
-const DEFAULT_MAX_SEGMENT_PER_CPU_KB: usize = 256_000;
-pub const DEFAULT_INDEXING_THRESHOLD_KB: usize = 10_000;
-const SEGMENTS_PATH: &str = "segments";
-const TEMP_SEGMENTS_PATH: &str = "temp_segments";
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq)]
 #[anonymize(false)]
 pub struct OptimizersConfig {
     /// The minimal fraction of deleted vectors in a segment, required to perform segment optimization
+    #[serde(default = "default_deleted_threshold")]
     #[validate(range(min = 0.0, max = 1.0))]
     pub deleted_threshold: f64,
     /// The minimal number of vectors in a segment, required to perform segment optimization
+    #[serde(default = "default_vacuum_min_vector_number")]
     #[validate(range(min = 100))]
     pub vacuum_min_vector_number: usize,
     /// Target amount of segments optimizer will try to keep.
@@ -83,13 +96,25 @@ pub struct OptimizersConfig {
     #[serde(default)]
     pub max_optimization_threads: Option<usize>,
 
-    /// If this option is set, service will try to prevent creation of large unoptimized segments.
-    /// When enabled, updates may be blocked at request level if there are unoptimized segments larger than indexing threshold.
-    /// Updates will be resumed when optimization is completed and segments are optimized below the threshold.
-    /// Using this option may lead to increased delay between submitting an update and its application.
+    /// If enabled, the service will try to prevent the creation of large unoptimized segments.
+    /// When enabled, new points written to segments larger than the indexing threshold are stored
+    /// as "deferred points": they are persisted in the WAL and segments, but excluded from
+    /// read/search results until the corresponding segments are optimized (e.g. indexed,
+    /// quantized, or moved to mmap storage).
+    /// Update requests with `wait=true` will only return after the deferred points become visible,
+    /// which may significantly increase the perceived latency between submitting an update and its
+    /// completion. Update requests with `wait=false` are not affected.
     /// Default is disabled.
     #[serde(default)]
     pub prevent_unoptimized: Option<bool>,
+}
+
+fn default_deleted_threshold() -> f64 {
+    DEFAULT_DELETED_THRESHOLD
+}
+
+fn default_vacuum_min_vector_number() -> usize {
+    DEFAULT_VACUUM_MIN_VECTOR_NUMBER
 }
 
 impl OptimizersConfig {
@@ -110,28 +135,18 @@ impl OptimizersConfig {
     }
 
     pub fn get_number_segments(&self) -> usize {
-        if self.default_segment_number == 0 {
-            let num_cpus = common::cpu::get_num_cpus();
-            // Configure 1 segment per 2 CPUs, as a middle ground between
-            // latency and RPS.
-            let expected_segments = num_cpus / 2;
-            // Do not configure less than 2 and more than 8 segments
-            // until it is not explicitly requested
-            expected_segments.clamp(2, 8)
-        } else {
-            self.default_segment_number
-        }
+        get_number_segments(self.default_segment_number)
     }
 
     pub fn get_indexing_threshold_kb(&self) -> usize {
-        match self.indexing_threshold {
-            None => DEFAULT_INDEXING_THRESHOLD_KB, // default value
-            Some(0) => usize::MAX,                 // disable vector index
-            Some(custom) => custom,
-        }
+        get_indexing_threshold_kb(self.indexing_threshold)
     }
 
-    pub fn optimizer_thresholds(&self, num_indexing_threads: usize) -> OptimizerThresholds {
+    pub fn optimizer_thresholds(
+        &self,
+        num_indexing_threads: usize,
+        deferred_internal_id: Option<PointOffsetType>,
+    ) -> OptimizerThresholds {
         let indexing_threshold_kb = self.get_indexing_threshold_kb();
 
         #[expect(deprecated)]
@@ -143,16 +158,20 @@ impl OptimizersConfig {
         OptimizerThresholds {
             memmap_threshold_kb,
             indexing_threshold_kb,
-            max_segment_size_kb: self.get_max_segment_size_in_kilobytes(num_indexing_threads),
+            max_segment_size_kb: get_max_segment_size_kb(
+                self.max_segment_size,
+                num_indexing_threads,
+            ),
+            deferred_internal_id,
         }
     }
 
-    pub fn get_max_segment_size_in_kilobytes(&self, num_indexing_threads: usize) -> usize {
-        if let Some(max_segment_size) = self.max_segment_size {
-            max_segment_size
-        } else {
-            num_indexing_threads.saturating_mul(DEFAULT_MAX_SEGMENT_PER_CPU_KB)
-        }
+    pub fn get_deferred_points_threshold_bytes(&self) -> Option<NonZeroUsize> {
+        get_deferred_points_threshold_bytes(
+            self.prevent_unoptimized,
+            self.get_indexing_threshold_kb(),
+            self.max_segment_size,
+        )
     }
 }
 
@@ -168,18 +187,113 @@ pub fn clear_temp_segments(shard_path: &Path) {
     }
 }
 
+pub fn build_segment_optimizer_config(
+    collection_params: &CollectionParams,
+    global_hnsw_config: &HnswConfig,
+    global_quantization_config: &Option<QuantizationConfig>,
+) -> SegmentOptimizerConfig {
+    let dense_vectors = collection_params
+        .vectors
+        .params_iter()
+        .map(|(name, params)| {
+            let VectorParams {
+                size,
+                distance,
+                hnsw_config,
+                quantization_config,
+                on_disk,
+                memory,
+                datatype,
+                multivector_config,
+            } = params;
+
+            (
+                name.into(),
+                DenseVectorOptimizerConfig {
+                    size: size.get() as usize,
+                    distance: *distance,
+                    on_disk: *on_disk,
+                    memory: *memory,
+                    hnsw_config: global_hnsw_config.update_opt(hnsw_config.as_ref()),
+                    quantization_config: quantization_config
+                        .as_ref()
+                        .or(global_quantization_config.as_ref())
+                        .cloned(),
+                    multivector_config: *multivector_config,
+                    datatype: datatype.map(VectorStorageDatatype::from),
+                },
+            )
+        })
+        .collect();
+
+    let sparse_vectors = collection_params
+        .sparse_vectors
+        .as_ref()
+        .map(|config| {
+            config
+                .iter()
+                .map(|(name, params)| {
+                    let SparseVectorParams { index, modifier } = params;
+
+                    (
+                        name.clone(),
+                        SparseVectorOptimizerConfig {
+                            on_disk: index.and_then(|index| index.on_disk),
+                            memory: index.and_then(|index| index.memory),
+                            full_scan_threshold: index.and_then(|index| index.full_scan_threshold),
+                            index_datatype: index
+                                .and_then(|index| index.datatype)
+                                .map(VectorStorageDatatype::from),
+                            storage_type: params.storage_type(),
+                            modifier: *modifier,
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    SegmentOptimizerConfig {
+        payload_storage_type: collection_params.payload_storage_type(),
+        dense_vectors,
+        sparse_vectors,
+        live_vector_names: None,
+    }
+}
+
+/// Build a [`LiveVectorNamesProvider`] that reads the collection's current vector names.
+///
+/// The provider is invoked from the optimization worker (a `spawn_blocking` thread), so the
+/// synchronous `blocking_read` is safe there. Optimizers use it to tell a deleted vector (to prune)
+/// from the CreateVectorName race (to cancel); see [`SegmentBuilder::set_live_vector_names`].
+fn live_vector_names_provider(
+    collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
+) -> LiveVectorNamesProvider {
+    LiveVectorNamesProvider::new(move || collection_config.blocking_read().params.vector_names())
+}
+
 pub fn build_optimizers(
     shard_path: &Path,
+    collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
     collection_params: &CollectionParams,
     optimizers_config: &OptimizersConfig,
     hnsw_config: &HnswConfig,
     hnsw_global_config: &HnswGlobalConfig,
     quantization_config: &Option<QuantizationConfig>,
 ) -> Arc<Vec<Arc<Optimizer>>> {
-    let num_indexing_threads = num_rayon_threads(hnsw_config.max_indexing_threads);
     let segments_path = shard_path.join(SEGMENTS_PATH);
     let temp_segments_path = shard_path.join(TEMP_SEGMENTS_PATH);
-    let threshold_config = optimizers_config.optimizer_thresholds(num_indexing_threads);
+    let segment_config =
+        build_segment_optimizer_config(collection_params, hnsw_config, quantization_config)
+            .with_live_vector_names(live_vector_names_provider(collection_config));
+    let num_indexing_threads = max_num_indexing_threads(&segment_config);
+    let threshold_config = optimizers_config.optimizer_thresholds(
+        num_indexing_threads,
+        collection_params.get_deferred_point_id(
+            hnsw_config,
+            optimizers_config.get_deferred_points_threshold_bytes(),
+        ),
+    );
 
     Arc::new(vec![
         Arc::new(MergeOptimizer::new(
@@ -187,20 +301,16 @@ pub fn build_optimizers(
             threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
-            collection_params.clone(),
-            *hnsw_config,
+            segment_config.clone(),
             hnsw_global_config.clone(),
-            quantization_config.clone(),
         )),
         Arc::new(IndexingOptimizer::new(
             optimizers_config.get_number_segments(),
             threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
-            collection_params.clone(),
-            *hnsw_config,
+            segment_config.clone(),
             hnsw_global_config.clone(),
-            quantization_config.clone(),
         )),
         Arc::new(VacuumOptimizer::new(
             optimizers_config.deleted_threshold,
@@ -208,19 +318,59 @@ pub fn build_optimizers(
             threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
-            collection_params.clone(),
-            *hnsw_config,
+            segment_config.clone(),
             hnsw_global_config.clone(),
-            quantization_config.clone(),
         )),
         Arc::new(ConfigMismatchOptimizer::new(
             threshold_config,
             segments_path,
             temp_segments_path,
-            collection_params.clone(),
+            segment_config,
             *hnsw_config,
             hnsw_global_config.clone(),
-            quantization_config.clone(),
         )),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use segment::types::Distance;
+
+    use super::*;
+    use crate::operations::types::{SparseVectorParams, VectorsConfig};
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+
+    #[test]
+    fn live_vector_names_include_dense_and_sparse() {
+        // A segment's `vector_data` holds dense and sparse vectors together, so the live set the
+        // optimizer consults must enumerate both. A dense-only set would make a freshly-created
+        // sparse vector look deleted and get wrongly pruned during the optimizer race.
+        let params = CollectionParams {
+            vectors: VectorsConfig::Multi(BTreeMap::from([(
+                "dense".to_owned(),
+                VectorParamsBuilder::new(4, Distance::Dot).build(),
+            )])),
+            sparse_vectors: Some(BTreeMap::from([(
+                "sparse".to_owned(),
+                SparseVectorParams {
+                    index: None,
+                    modifier: None,
+                },
+            )])),
+            ..CollectionParams::empty()
+        };
+
+        let names = params.vector_names();
+
+        assert!(
+            names.contains("dense"),
+            "dense vector name missing: {names:?}"
+        );
+        assert!(
+            names.contains("sparse"),
+            "sparse vector name missing: {names:?}",
+        );
+    }
 }

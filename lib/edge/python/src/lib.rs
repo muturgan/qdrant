@@ -1,3 +1,4 @@
+pub mod bm25;
 pub mod config;
 pub mod count;
 pub mod facet;
@@ -14,6 +15,7 @@ pub mod utils;
 use std::path::PathBuf;
 
 use bytemuck::TransparentWrapperAlloc as _;
+use edge::EdgeConfig;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use segment::common::operation_error::OperationError;
@@ -34,23 +36,23 @@ mod qdrant_edge {
     #[pymodule_export]
     use super::PyEdgeShard;
     #[pymodule_export]
+    use super::bm25::{PyBm25, PyBm25Config};
+    #[pymodule_export]
     use super::config::quantization::{
         PyBinaryQuantizationConfig, PyBinaryQuantizationEncoding,
         PyBinaryQuantizationQueryEncoding, PyCompressionRatio, PyProductQuantizationConfig,
-        PyScalarQuantizationConfig, PyScalarType,
+        PyScalarQuantizationConfig, PyScalarType, PyTurboQuantBitSize,
+        PyTurboQuantQuantizationConfig,
     };
     #[pymodule_export]
-    use super::config::sparse_vector_data::{
-        PyModifier, PySparseIndexConfig, PySparseIndexType, PySparseVectorDataConfig,
-        PySparseVectorStorageType,
-    };
+    use super::config::sparse_vector_data::{PyEdgeSparseVectorParams, PyModifier};
     #[pymodule_export]
     use super::config::vector_data::{
-        PyDistance, PyHnswIndexConfig, PyMultiVectorComparator, PyMultiVectorConfig,
-        PyPlainIndexConfig, PyVectorDataConfig, PyVectorStorageDatatype, PyVectorStorageType,
+        PyDistance, PyEdgeVectorParams, PyHnswIndexConfig, PyMultiVectorComparator,
+        PyMultiVectorConfig, PyPlainIndexConfig, PyVectorStorageDatatype,
     };
     #[pymodule_export]
-    use super::config::{PyEdgeConfig, PyPayloadStorageType};
+    use super::config::{PyEdgeConfig, PyEdgeOptimizersConfig};
     #[pymodule_export]
     use super::count::PyCountRequest;
     #[pymodule_export]
@@ -63,17 +65,26 @@ mod qdrant_edge {
     use super::scroll::PyScrollRequest;
     #[pymodule_export]
     use super::search::{
-        PyAcornSearchParams, PyQuantizationSearchParams, PySearchParams, PySearchRequest,
+        PyAcornSearchParams, PyIdfParams, PyQuantizationSearchParams, PySearchParams,
+        PySearchRequest,
     };
     #[pymodule_export]
     use super::types::filter::{
         PyFieldCondition, PyFilter, PyGeoBoundingBox, PyGeoPoint, PyGeoPolygon, PyGeoRadius,
         PyHasIdCondition, PyHasVectorCondition, PyIsEmptyCondition, PyIsNullCondition, PyMatchAny,
-        PyMatchExcept, PyMatchPhrase, PyMatchText, PyMatchTextAny, PyMatchValue, PyMinShould,
-        PyNestedCondition, PyRangeDateTime, PyRangeFloat, PyValuesCount,
+        PyMatchExcept, PyMatchPhrase, PyMatchPrefix, PyMatchText, PyMatchTextAny, PyMatchValue,
+        PyMinShould, PyNestedCondition, PyRangeDateTime, PyRangeFloat, PySliceCondition,
+        PyValuesCount,
     };
     #[pymodule_export]
     use super::types::formula::{PyDecayKind, PyExpressionInterface, PyFormula};
+    #[pymodule_export]
+    use super::types::payload_schema::{
+        PyBoolIndexParams, PyDatetimeIndexParams, PyDisabledStemmer, PyFloatIndexParams,
+        PyGeoIndexParams, PyIntegerIndexParams, PyKeywordIndexParams, PyLanguage,
+        PyPayloadSchemaType, PySnowballLanguage, PySnowballParams, PyStopwordsSet,
+        PyTextIndexParams, PyTokenizerType, PyUuidIndexParams,
+    };
     #[pymodule_export]
     use super::types::query::{
         PyContextPair, PyContextQuery, PyDiscoverQuery, PyFeedbackItem, PyFeedbackNaiveQuery,
@@ -92,16 +103,31 @@ pub struct PyEdgeShard(Option<edge::EdgeShard>);
 
 #[pymethods]
 impl PyEdgeShard {
-    #[new]
+    /// Load an edge shard from existing files at `path`.
+    /// Optional `config`: if provided, compatibility is checked and config is overwritten on disk.
+    #[staticmethod]
     #[pyo3(signature = (path, config = None))]
     pub fn load(path: PathBuf, config: Option<PyEdgeConfig>) -> Result<Self> {
-        let shard = edge::EdgeShard::load(&path, config.map(SegmentConfig::from))?;
+        let shard = edge::EdgeShard::load(&path, config.map(EdgeConfig::from))?;
+        Ok(Self(Some(shard)))
+    }
+
+    /// Create a new edge shard at `path` with the given configuration.
+    /// Fails if the path already contains segment data.
+    #[staticmethod]
+    pub fn create(path: PathBuf, config: PyEdgeConfig) -> Result<Self> {
+        let shard = edge::EdgeShard::new(&path, config.0)?;
         Ok(Self(Some(shard)))
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.get_shard()?.flush();
+        self.get_shard()?.flush()?;
         Ok(())
+    }
+
+    pub fn optimize(&self) -> Result<bool> {
+        let optimized = self.get_shard()?.optimize()?;
+        Ok(optimized)
     }
 
     pub fn close(&mut self) {
@@ -117,6 +143,16 @@ impl PyEdgeShard {
         let points = self.get_shard()?.query(query.into())?;
         let points = PyScoredPoint::wrap_vec(points);
         Ok(points)
+    }
+
+    /// Execute several queries as one planned batch.
+    ///
+    /// Cheaper than one `query` per request: the batch shares a single pass over the segments.
+    /// Returns one result list per request, in the same order as `queries`.
+    pub fn query_batch(&self, queries: Vec<PyQueryRequest>) -> Result<Vec<Vec<PyScoredPoint>>> {
+        let requests = queries.into_iter().map(Into::into).collect();
+        let batches = self.get_shard()?.query_batch(requests)?;
+        Ok(batches.into_iter().map(PyScoredPoint::wrap_vec).collect())
     }
 
     pub fn search(&self, search: PySearchRequest) -> Result<Vec<PyScoredPoint>> {
@@ -147,18 +183,18 @@ impl PyEdgeShard {
         with_payload: Option<PyWithPayload>,
         with_vector: Option<PyWithVector>,
     ) -> Result<Vec<PyRecord>> {
-        let point_ids = PyPointId::peel_vec(point_ids);
-        let points = self.get_shard()?.retrieve(
-            &point_ids,
-            with_payload.map(WithPayloadInterface::from),
-            with_vector.map(WithVector::from),
-        )?;
+        let request = edge::RetrieveRequest {
+            point_ids: PyPointId::peel_vec(point_ids),
+            with_payload: with_payload.map(WithPayloadInterface::from),
+            with_vector: with_vector.map(WithVector::from),
+        };
+        let points = self.get_shard()?.retrieve(request)?;
         let points = PyRecord::wrap_vec(points);
         Ok(points)
     }
 
     pub fn info(&self) -> Result<PyShardInfo> {
-        let info = self.get_shard()?.info();
+        let info = self.get_shard()?.info()?;
         let info = PyShardInfo(info);
         Ok(info)
     }

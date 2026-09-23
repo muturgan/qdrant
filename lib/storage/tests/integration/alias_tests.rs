@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -16,12 +20,11 @@ use storage::content_manager::collection_meta_ops::{
 use storage::content_manager::consensus::operation_sender::OperationSender;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements, Auth, AuthType};
+use storage::rbac::{Access, AccessRequirements, Auth};
 use storage::types::{PerformanceConfig, StorageConfig};
 use tempfile::Builder;
-use tokio::runtime::Runtime;
 
-const FULL_ACCESS: Auth = Auth::new(Access::full("For test"), None, None, AuthType::Internal);
+const FULL_ACCESS: Auth = Auth::new_internal(Access::full("For test"));
 
 #[test]
 fn test_alias_operation() {
@@ -33,6 +36,7 @@ fn test_alias_operation() {
         snapshots_config: Default::default(),
         temp_path: None,
         on_disk_payload: false,
+        payload: None,
         optimizers: OptimizersConfig {
             deleted_threshold: 0.5,
             vacuum_min_vector_number: 100,
@@ -57,11 +61,13 @@ fn test_alias_operation() {
             incoming_shard_transfers_limit: Some(1),
             outgoing_shard_transfers_limit: Some(1),
             async_scorer: None,
+            io_uring: None,
             load_concurrency: LoadConcurrencyConfig::default(),
         },
         hnsw_index: Default::default(),
         hnsw_global_config: Default::default(),
         mmap_advice: mmap::Advice::Random,
+        low_memory_mode: Default::default(),
         node_type: Default::default(),
         update_queue_size: Default::default(),
         handle_collection_load_errors: false,
@@ -71,28 +77,23 @@ fn test_alias_operation() {
         shard_transfer_method: None,
         collection: None,
         max_collections: None,
+        quotas: Default::default(),
     };
-
-    let search_runtime = Runtime::new().unwrap();
-    let handle = search_runtime.handle().clone();
-
-    let update_runtime = Runtime::new().unwrap();
-
-    let general_runtime = Runtime::new().unwrap();
 
     let (propose_sender, _propose_receiver) = std::sync::mpsc::channel();
     let propose_operation_sender = OperationSender::new(propose_sender);
 
-    let toc = Arc::new(TableOfContent::new(
-        &config,
-        search_runtime,
-        update_runtime,
-        general_runtime,
-        ResourceBudget::default(),
-        ChannelService::new(6333, false, None, None),
-        0,
-        Some(propose_operation_sender),
-    ));
+    let toc = Arc::new(
+        TableOfContent::new(
+            &config,
+            ResourceBudget::default(),
+            ChannelService::new(6333, false, None, None),
+            0,
+            Some(propose_operation_sender),
+        )
+        .unwrap(),
+    );
+    let handle = toc.general_runtime_handle().clone();
     let dispatcher = Dispatcher::new(toc);
 
     handle
@@ -111,6 +112,7 @@ fn test_alias_operation() {
                             optimizers_config: None,
                             shard_number: Some(1),
                             on_disk_payload: None,
+                            payload: None,
                             replication_factor: None,
                             write_consistency_factor: None,
                             quantization_config: None,

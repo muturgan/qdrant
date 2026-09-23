@@ -28,6 +28,7 @@ use crate::shards::local_shard::LocalShardClocks;
 use crate::shards::update_tracker::UpdateTracker;
 use crate::update_workers::UpdateWorkers;
 use crate::update_workers::applied_seq::AppliedSeqHandler;
+use crate::update_workers::internal_update_result::InternalUpdateResult;
 use crate::wal_delta::LockedWal;
 
 pub type Optimizer = dyn SegmentOptimizer + Sync + Send;
@@ -40,14 +41,16 @@ pub struct OperationData {
     /// Operation. If None, then the operation data is read from WAL
     pub operation: Option<Box<CollectionUpdateOperations>>,
     /// Callback notification channel
-    pub sender: Option<oneshot::Sender<CollectionResult<usize>>>,
+    pub sender: Option<oneshot::Sender<CollectionResult<InternalUpdateResult>>>,
+    /// Whether to wait for deferred points to be optimized before sending feedback.
+    /// Only relevant when `sender` is `Some`.
+    pub wait_for_deferred: bool,
     /// Hardware measurement for the operation
     pub hw_measurements: HwMeasurementAcc,
 }
 
 /// Signal, used to inform Updater process
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum UpdateSignal {
     /// Requested operation to perform
     Operation(OperationData),
@@ -110,10 +113,8 @@ pub struct UpdateHandler {
     /// This parameter depends on the optimizer config and should be updated accordingly.
     pub max_optimization_threads: Option<usize>,
 
-    /// If specified, this threshold (in kilobytes) configures a max size of unoptimized segment
-    /// which can still be updated. If there are unoptimized segments larger than this threshold,
-    /// updates will be blocked until those segments are optimized.
-    pub prevent_unoptimized_threshold_kb: Option<usize>,
+    /// If enabled, use deferred points to skip them from read/search while they are not optimized.
+    pub prevent_unoptimized: bool,
 
     /// Highest and cutoff clocks for the shard WAL.
     clocks: LocalShardClocks,
@@ -150,7 +151,7 @@ impl UpdateHandler {
         wal: LockedWal,
         flush_interval_sec: u64,
         max_optimization_threads: Option<usize>,
-        prevent_unoptimized_threshold_kb: Option<usize>,
+        prevent_unoptimized: bool,
         clocks: LocalShardClocks,
         shard_path: PathBuf,
         scroll_read_lock: Arc<tokio::sync::RwLock<()>>,
@@ -177,7 +178,7 @@ impl UpdateHandler {
             flush_interval_sec,
             optimization_handles: Arc::new(TokioMutex::new(vec![])),
             max_optimization_threads,
-            prevent_unoptimized_threshold_kb,
+            prevent_unoptimized,
             clocks,
             shard_path,
             has_triggered_optimizers: Default::default(),
@@ -220,7 +221,8 @@ impl UpdateHandler {
         let collection_name = self.collection_name.clone();
         let applied_seq_handler = self.applied_seq_handler.clone();
 
-        // Create a new cancellation token for this worker
+        // Cancel the old update worker and create a new cancellation token
+        self.update_worker_cancel.cancel();
         self.update_worker_cancel = CancellationToken::new();
         let cancel = self.update_worker_cancel.clone();
 
@@ -232,8 +234,9 @@ impl UpdateHandler {
             segments,
             scroll_read_lock,
             update_tracker,
-            self.prevent_unoptimized_threshold_kb,
-            self.optimization_handles.clone(),
+            self.prevent_unoptimized,
+            self.optimizers.clone(),
+            self.payload_index_schema.clone(),
             optimization_finished_receiver,
             applied_seq_handler,
             cancel,

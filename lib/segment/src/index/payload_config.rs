@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use common::fs::{atomic_save_json, read_json};
+use common::universal_io::{OkNotFound, UniversalReadFs, read_json_via};
 use serde::{Deserialize, Serialize};
 
 use crate::common::operation_error::OperationResult;
@@ -16,13 +17,6 @@ pub struct PayloadConfig {
     /// Mapping of payload index schemas and types
     #[serde(flatten)]
     pub indices: PayloadIndices,
-
-    /// If true, don't create/initialize RocksDB for payload index
-    /// This is required for migrating away from RocksDB in favor of the
-    /// custom storage engine
-    #[cfg(feature = "rocksdb")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_rocksdb: Option<bool>,
 }
 
 impl PayloadConfig {
@@ -32,6 +26,15 @@ impl PayloadConfig {
 
     pub fn load(path: &Path) -> OperationResult<Self> {
         Ok(read_json(path)?)
+    }
+
+    /// Read-only mirror of [`load`](Self::load) over the universal filesystem
+    /// `fs`. Returns `Ok(None)` when the config file is absent.
+    pub fn load_universal<Fs: UniversalReadFs>(
+        fs: &Fs,
+        path: &Path,
+    ) -> OperationResult<Option<Self>> {
+        Ok(read_json_via(fs, path).ok_not_found()?)
     }
 
     pub fn save(&self, path: &Path) -> OperationResult<()> {
@@ -49,26 +52,6 @@ pub struct PayloadIndices {
 }
 
 impl PayloadIndices {
-    /// Check if any payload field has no explicit types configured
-    ///
-    /// Returns false if empty.
-    pub fn any_has_no_type(&self) -> bool {
-        self.fields.values().any(|index| index.types.is_empty())
-    }
-
-    /// Check if any payload field used RocksDB
-    ///
-    /// Returns false if empty.
-    #[cfg(feature = "rocksdb")]
-    pub fn any_is_rocksdb(&self) -> bool {
-        self.fields.values().any(|index| {
-            index
-                .types
-                .iter()
-                .any(|t| t.storage_type == StorageType::RocksDb)
-        })
-    }
-
     pub fn to_schemas(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema> {
         self.fields
             .iter()
@@ -157,7 +140,7 @@ impl PayloadFieldSchemaWithIndexType {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadIndexType {
     IntIndex,
@@ -199,7 +182,6 @@ pub enum IndexMutability {
 #[serde(rename_all = "snake_case")]
 pub enum StorageType {
     Gridstore,
-    RocksDb,
     Mmap { is_on_disk: bool },
 }
 

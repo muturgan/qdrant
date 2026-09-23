@@ -3,36 +3,39 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use bitvec::prelude::BitSlice;
+use common::bitvec::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
+use common::universal_io::{MmapFile, MmapFs, Populate, UserData};
 use fs_err as fs;
 
 use crate::common::Flusher;
+use crate::common::flags::FlagsMode;
 use crate::common::flags::bitvec_flags::BitvecFlags;
-use crate::common::flags::dynamic_mmap_flags::DynamicMmapFlags;
 use crate::common::operation_error::{OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
-use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
+use crate::vector_storage::chunked_vectors::ChunkedVectors;
 use crate::vector_storage::{
-    AccessPattern, DenseVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
+    DenseVectorStorage, DenseVectorStorageRead, VectorOffsetType, VectorStorage, VectorStorageEnum,
+    VectorStorageRead,
 };
 
-const VECTORS_DIR_PATH: &str = "vectors";
-const DELETED_DIR_PATH: &str = "deleted";
+pub(crate) const VECTORS_DIR_PATH: &str = "vectors";
+pub(crate) const DELETED_DIR_PATH: &str = "deleted";
 
 #[derive(Debug)]
 pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement> {
-    vectors: ChunkedMmapVectors<T>,
+    vectors: ChunkedVectors<T, MmapFile>,
     /// Flags marking deleted vectors
     ///
     /// Structure grows dynamically, but may be smaller than actual number of vectors. Must not
     /// depend on its length.
-    deleted: BitvecFlags,
+    deleted: BitvecFlags<MmapFile>,
     distance: Distance,
     deleted_count: usize,
     _phantom: std::marker::PhantomData<T>,
@@ -75,23 +78,72 @@ impl<T: PrimitiveVectorElement> AppendableMmapDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for AppendableMmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement> DenseVectorStorageRead<T> for AppendableMmapDenseVectorStorage<T> {
     fn vector_dim(&self) -> usize {
         self.vectors.dim()
     }
 
-    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> &[T] {
+    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> Cow<'_, [T]> {
         self.vectors
             .get::<P>(key as VectorOffsetType)
             .expect("mmap vector not found")
     }
 
-    fn for_each_in_dense_batch<F: FnMut(usize, &[T])>(&self, keys: &[PointOffsetType], f: F) {
-        self.vectors.for_each_in_batch(keys, f);
+    fn for_each_in_dense_batch<F>(
+        &self,
+        keys: &[PointOffsetType],
+        callback: F,
+    ) -> OperationResult<()>
+    where
+        F: FnMut(usize, &[T]),
+    {
+        self.vectors.for_each_in_batch(keys, callback)
+    }
+
+    fn read_dense_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        let keys = keys
+            .into_iter()
+            .map(|(user_data, point_offset)| ((user_data, point_offset), point_offset, 1));
+
+        self.vectors
+            .for_each_vector::<P, _>(keys, |(user_data, point_offset), vector| {
+                callback(
+                    user_data,
+                    point_offset,
+                    bytemuck::cast_slice(vector.as_ref()).to_vec(),
+                );
+                Ok(())
+            })
     }
 }
 
-impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for AppendableMmapDenseVectorStorage<T> {
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &mut impl Iterator<Item = (Cow<'a, [T]>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        let start_index = self.vectors.len() as PointOffsetType;
+        let disposed_hw = HardwareCounterCell::disposable(); // This function is only used for internal operations.
+        for (other_vector, other_deleted) in other_vectors {
+            check_process_stopped(stopped)?;
+            let new_id = self.vectors.push(other_vector.as_ref(), &disposed_hw)?;
+            self.set_deleted(new_id as PointOffsetType, other_deleted);
+        }
+        let end_index = self.vectors.len() as PointOffsetType;
+        Ok(start_index..end_index)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorageRead for AppendableMmapDenseVectorStorage<T> {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
+    }
+
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -111,16 +163,56 @@ impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStora
     fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> CowVector<'_> {
         self.vectors
             .get::<P>(key as VectorOffsetType)
-            .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
+            .map(|slice| CowVector::from(T::slice_to_float_cow(slice)))
             .expect("Vector not found")
+    }
+
+    fn read_vectors<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, PointOffsetType, CowVector<'_>),
+    ) {
+        let keys = keys
+            .into_iter()
+            .map(|(user_data, point_offset)| ((user_data, point_offset), point_offset, 1));
+
+        self.vectors
+            .for_each_vector::<P, _>(keys, |(user_data, point_offset), vector| {
+                let vector = CowVector::from(T::slice_to_float_cow(vector));
+                callback(user_data, point_offset, vector);
+                Ok(())
+            })
+            .expect("read vectors");
     }
 
     fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<CowVector<'_>> {
         self.vectors
             .get::<P>(key as VectorOffsetType)
-            .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
+            .map(|slice| CowVector::from(T::slice_to_float_cow(slice)))
     }
 
+    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
+        self.deleted.get(key)
+    }
+
+    fn deleted_vector_count(&self) -> usize {
+        self.deleted_count
+    }
+
+    fn deleted_vector_bitslice(&self) -> &BitSlice {
+        self.deleted.get_bitslice()
+    }
+
+    fn read_vector_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        self.read_dense_bytes::<P, U>(keys, callback)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStorage<T> {
     fn insert_vector(
         &mut self,
         key: PointOffsetType,
@@ -133,24 +225,6 @@ impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStora
             .insert(key as VectorOffsetType, vector.as_ref(), hw_counter)?;
         self.set_deleted(key, false);
         Ok(())
-    }
-
-    fn update_from<'a>(
-        &mut self,
-        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Range<PointOffsetType>> {
-        let start_index = self.vectors.len() as PointOffsetType;
-        let disposed_hw = HardwareCounterCell::disposable(); // This function is only used for internal operations.
-        for (other_vector, other_deleted) in other_vectors {
-            check_process_stopped(stopped)?;
-            // Do not perform preprocessing - vectors should be already processed
-            let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            let new_id = self.vectors.push(other_vector.as_ref(), &disposed_hw)?;
-            self.set_deleted(new_id as PointOffsetType, other_deleted);
-        }
-        let end_index = self.vectors.len() as PointOffsetType;
-        Ok(start_index..end_index)
     }
 
     fn flusher(&self) -> Flusher {
@@ -176,19 +250,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStora
     }
 
     fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool> {
-        Ok(self.set_deleted(key, true))
-    }
-
-    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key)
-    }
-
-    fn deleted_vector_count(&self) -> usize {
-        self.deleted_count
-    }
-
-    fn deleted_vector_bitslice(&self) -> &BitSlice {
-        self.deleted.get_bitslice()
+        Ok(!self.set_deleted(key, true))
     }
 }
 
@@ -248,9 +310,20 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
     let vectors_path = path.join(VECTORS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
-    let vectors = ChunkedMmapVectors::<T>::open(&vectors_path, dim, madvise, Some(populate))?;
+    let vectors = ChunkedVectors::open(
+        MmapFs,
+        &vectors_path,
+        dim,
+        madvise,
+        Populate::from(populate),
+    )?;
 
-    let deleted = BitvecFlags::new(DynamicMmapFlags::open(&deleted_path, populate)?);
+    let deleted = BitvecFlags::open_or_create(
+        MmapFs,
+        &deleted_path,
+        FlagsMode::from_feature_flags(),
+        Populate::from(populate),
+    )?;
     let deleted_count = deleted.count_trues();
 
     Ok(AppendableMmapDenseVectorStorage {
@@ -263,7 +336,7 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
 }
 
 /// Find files related to this dense vector storage
-#[cfg(any(test, feature = "rocksdb"))]
+#[cfg(test)]
 pub(crate) fn find_storage_files(vector_storage_path: &Path) -> OperationResult<Vec<PathBuf>> {
     let vectors_path = vector_storage_path.join(VECTORS_DIR_PATH);
     let deleted_path = vector_storage_path.join(DELETED_DIR_PATH);
@@ -279,7 +352,7 @@ mod tests {
     use std::collections::HashSet;
 
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use tempfile::Builder;
 
     use super::*;

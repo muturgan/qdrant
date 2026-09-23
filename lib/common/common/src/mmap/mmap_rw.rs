@@ -27,11 +27,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{fmt, mem, slice};
 
-use bitvec::slice::BitSlice;
 use memmap2::MmapMut;
 
 use super::advice::{Advice, AdviceSetting, Madviseable};
 use super::ops;
+use crate::bitvec::BitSlice;
 
 /// Result for mmap errors.
 type Result<T> = std::result::Result<T, Error>;
@@ -78,8 +78,9 @@ where
 
 impl<T: ?Sized> fmt::Debug for MmapType<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { mmap, r#type: _ } = self;
         f.debug_struct("MmapType")
-            .field("mmap", &self.mmap)
+            .field("mmap", mmap)
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +188,13 @@ where
         self.mmap.populate();
         Ok(())
     }
+
+    /// Hint to the OS that pages backing this mmap can be reclaimed.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        let Self { r#type: _, mmap } = self;
+        mmap.clear_cache();
+        Ok(())
+    }
 }
 
 impl<T> Deref for MmapType<T>
@@ -229,9 +237,8 @@ where
 
 impl<T> fmt::Debug for MmapSlice<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MmapSlice")
-            .field("mmap", &self.mmap)
-            .finish_non_exhaustive()
+        let Self { mmap } = self;
+        f.debug_struct("MmapSlice").field("mmap", mmap).finish()
     }
 }
 
@@ -305,6 +312,13 @@ impl<T> MmapSlice<T> {
         self.mmap.populate()?;
         Ok(())
     }
+
+    /// Hint to the OS that pages backing this mmap can be reclaimed.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        let Self { mmap } = self;
+        mmap.clear_cache()?;
+        Ok(())
+    }
 }
 
 impl<T> Deref for MmapSlice<T> {
@@ -318,6 +332,12 @@ impl<T> Deref for MmapSlice<T> {
 impl<T> DerefMut for MmapSlice<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.mmap
+    }
+}
+
+impl<T: 'static> AsRef<[T]> for MmapSlice<T> {
+    fn as_ref(&self) -> &[T] {
+        &self.mmap
     }
 }
 
@@ -411,6 +431,13 @@ impl MmapBitSlice {
         self.mmap.populate()?;
         Ok(())
     }
+
+    /// Hint to the OS that pages backing this mmap can be reclaimed.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        let Self { mmap } = self;
+        mmap.clear_cache()?;
+        Ok(())
+    }
 }
 
 impl Deref for MmapBitSlice {
@@ -440,6 +467,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("File not found: {0}")]
     MissingFile(String),
+}
+
+impl crate::universal_io::IsNotFound for Error {
+    fn is_not_found(&self) -> bool {
+        match self {
+            Self::Io(err) => err.is_not_found(),
+            Self::MissingFile(_) => true,
+            Self::SizeExact(..) | Self::SizeLess(..) | Self::SizeMultiple(..) => false,
+        }
+    }
 }
 
 /// Get a second mutable reference for type `T` from the given mmap
@@ -575,7 +612,7 @@ mod tests {
     use std::iter;
 
     use rand::rngs::{SmallRng, StdRng};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use tempfile::{Builder, NamedTempFile};
 
     use super::*;

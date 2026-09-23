@@ -11,7 +11,8 @@ use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, VectorRef, VectorStructInternal, only_default_vector,
 };
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::entry::StorageSegmentEntry as _;
+use segment::entry::entry_point::{NonAppendableSegmentEntry as _, ReadSegmentEntry, SegmentEntry};
 use segment::fixtures::index_fixtures::random_vector;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::segment_constructor::{load_segment, normalize_segment_dir};
@@ -27,7 +28,7 @@ fn test_point_exclusion() {
 
     let segment = build_segment_1(dir.path());
 
-    assert!(segment.has_point(3.into()));
+    assert!(segment.has_point(3.into(), common::types::DeferredBehavior::WithDeferred));
 
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
 
@@ -80,7 +81,7 @@ fn test_named_vector_search() {
 
     let segment = build_segment_3(dir.path());
 
-    assert!(segment.has_point(3.into()));
+    assert!(segment.has_point(3.into(), common::types::DeferredBehavior::WithDeferred));
 
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
 
@@ -206,7 +207,7 @@ fn ordered_deletion_test() {
         segment.segment_path.clone()
     };
 
-    let segment = load_segment(&path, Uuid::nil(), &AtomicBool::new(false)).unwrap();
+    let segment = load_segment(&path, Uuid::nil(), None, &AtomicBool::new(false)).unwrap();
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
 
     let res = segment

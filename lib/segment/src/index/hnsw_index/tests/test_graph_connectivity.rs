@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -12,8 +16,8 @@ use tempfile::Builder;
 use crate::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
 use crate::entry::entry_point::SegmentEntry;
 use crate::fixtures::index_fixtures::random_vector;
+use crate::index::hnsw_index::get_num_indexing_threads;
 use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use crate::index::hnsw_index::num_rayon_threads;
 use crate::segment_constructor::VectorIndexBuildArgs;
 use crate::segment_constructor::simple_segment_constructor::build_simple_segment;
 use crate::types::{Distance, HnswConfig, HnswGlobalConfig, SeqNumberType};
@@ -54,6 +58,7 @@ fn test_graph_connectivity() {
     let payload_index_ptr = segment.payload_index.clone();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,
@@ -63,7 +68,7 @@ fn test_graph_connectivity() {
         inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let hnsw_index = HNSWIndex::build(

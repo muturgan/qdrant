@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{Distance, ExtendedPointId, WithPayloadInterface, WithVector};
 use shard::query::query_enum::QueryEnum;
@@ -31,6 +31,7 @@ use crate::shards::collection_shard_distribution::CollectionShardDistribution;
 use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_trait::WaitUntil;
 
 const DIM: u64 = 4;
 const PEER_ID: u64 = 1;
@@ -121,7 +122,7 @@ async fn fixture() -> Collection {
     collection
         .update_from_client(
             operation,
-            true,
+            WaitUntil::from(true),
             None,
             WriteOrdering::Weak,
             None,
@@ -165,6 +166,7 @@ async fn test_limit_offset_with_prefetch() {
                     with_vector: WithVector::Bool(false),
                     score_threshold: None,
                 },
+                None,
                 None,
                 ShardSelectorInternal::All,
                 None,
@@ -222,6 +224,7 @@ async fn test_limit_offset_with_prefetch() {
                     with_vector: WithVector::Bool(false),
                     score_threshold: None,
                 },
+                None,
                 None,
                 ShardSelectorInternal::All,
                 None,

@@ -1,12 +1,13 @@
+use std::path::Path;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use semver::Version;
 
 use crate::cpu;
 
 /// Current Qdrant version string
-pub const QDRANT_VERSION_STRING: &str = "1.17.0";
+pub const QDRANT_VERSION_STRING: &str = "1.19.1";
 
 /// Current Qdrant semver version
 pub static QDRANT_VERSION: LazyLock<Version> =
@@ -21,6 +22,28 @@ pub const CONSENSUS_CONFIRM_RETRIES: usize = 3;
 
 /// Default timeout for consensus meta operations.
 pub const CONSENSUS_META_OP_WAIT: Duration = Duration::from_secs(10);
+
+/// Log target for detailed storage-component load timing.
+/// Enable via log config, e.g. `log_level: "INFO,qdrant::load_timing=debug"`.
+pub const LOAD_TIMING_LOG_TARGET: &str = "qdrant::load_timing";
+
+/// Minimum duration for a load-timing entry to be logged.
+/// Sub-component loads faster than this are suppressed to reduce noise.
+/// Matches the `{:.2}s` display format: anything below 5ms rounds to "0.00s".
+pub const LOAD_TIMING_MIN_DURATION: Duration = Duration::from_millis(5);
+
+/// Log a sub-component load time, suppressing entries faster than [`LOAD_TIMING_MIN_DURATION`].
+pub fn log_load_timing(path: &Path, component: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= LOAD_TIMING_MIN_DURATION {
+        log::debug!(
+            target: LOAD_TIMING_LOG_TARGET,
+            "{} - {component} loaded in {:.2}s",
+            path.display(),
+            elapsed.as_secs_f64(),
+        );
+    }
+}
 
 /// Max number of pooled elements to preserve in memory.
 /// Scaled according to the number of logical CPU cores to account for concurrent operations.
@@ -70,16 +93,11 @@ pub fn search_thread_count(max_search_threads: usize) -> usize {
         return max_search_threads;
     }
 
-    // At least one thread, but not more than number of CPUs - 1 if there are more than 2 CPU
-    // Example:
-    // Num CPU = 1 -> 1 thread
-    // Num CPU = 2 -> 2 thread - if we use one thread with 2 cpus, its too much un-utilized resources
-    // Num CPU = 3 -> 2 thread
-    // Num CPU = 4 -> 3 thread
-    // Num CPU = 5 -> 4 thread
-    match cpu::get_num_cpus() {
-        0..=1 => 1,
-        2 => 2,
-        num_cpu @ 3.. => num_cpu - 1,
-    }
+    // For high-IO loads, it is beneficial to have more search threads than CPU cores,
+    // as they will often be waiting on IO.
+    // At the same time, the impact from thread context switching doesn't seem to be as big,
+    // so it should be safe to spawn more workers than CPUs.
+    const CPU_OVERCOMMIT_FACTOR: usize = 4;
+
+    cpu::get_num_cpus().max(1) * CPU_OVERCOMMIT_FACTOR
 }

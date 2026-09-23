@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::fmt;
 
 use bytemuck::TransparentWrapper;
@@ -21,6 +25,7 @@ impl FromPyObject<'_, '_> for PyQuantizationConfig {
             Scalar(PyScalarQuantizationConfig),
             Product(PyProductQuantizationConfig),
             Binary(PyBinaryQuantizationConfig),
+            Turbo(PyTurboQuantQuantizationConfig),
         }
 
         let conf = match conf.extract()? {
@@ -32,6 +37,9 @@ impl FromPyObject<'_, '_> for PyQuantizationConfig {
             }),
             Helper::Binary(binary) => QuantizationConfig::Binary(BinaryQuantization {
                 binary: BinaryQuantizationConfig::from(binary),
+            }),
+            Helper::Turbo(turbo) => QuantizationConfig::Turbo(TurboQuantization {
+                turbo: TurboQuantQuantizationConfig::from(turbo),
             }),
         };
 
@@ -55,6 +63,9 @@ impl<'py> IntoPyObject<'py> for PyQuantizationConfig {
             QuantizationConfig::Binary(BinaryQuantization { binary }) => {
                 PyBinaryQuantizationConfig(binary).into_bound_py_any(py)
             }
+            QuantizationConfig::Turbo(TurboQuantization { turbo }) => {
+                PyTurboQuantQuantizationConfig(turbo).into_bound_py_any(py)
+            }
         }
     }
 }
@@ -70,6 +81,9 @@ impl Repr for PyQuantizationConfig {
             }
             QuantizationConfig::Binary(binary) => {
                 PyBinaryQuantizationConfig::wrap_ref(&binary.binary).fmt(f)
+            }
+            QuantizationConfig::Turbo(turbo) => {
+                PyTurboQuantQuantizationConfig::wrap_ref(&turbo.turbo).fmt(f)
             }
         }
     }
@@ -90,6 +104,7 @@ impl PyScalarQuantizationConfig {
             r#type: ScalarType::from(r#type),
             quantile,
             always_ram,
+            memory: None,
         })
     }
 
@@ -120,6 +135,7 @@ impl PyScalarQuantizationConfig {
             r#type: _,
             quantile: _,
             always_ram: _,
+            memory: _,
         } = self.0;
     }
 }
@@ -177,6 +193,7 @@ impl PyProductQuantizationConfig {
         Self(ProductQuantizationConfig {
             compression: CompressionRatio::from(compression),
             always_ram,
+            memory: None,
         })
     }
 
@@ -201,6 +218,7 @@ impl PyProductQuantizationConfig {
         let ProductQuantizationConfig {
             compression: _,
             always_ram: _,
+            memory: _,
         } = self.0;
     }
 }
@@ -277,6 +295,7 @@ impl PyBinaryQuantizationConfig {
     ) -> Self {
         Self(BinaryQuantizationConfig {
             always_ram,
+            memory: None,
             encoding: encoding.map(BinaryQuantizationEncoding::from),
             query_encoding: query_encoding.map(BinaryQuantizationQueryEncoding::from),
         })
@@ -309,6 +328,7 @@ impl PyBinaryQuantizationConfig {
         // Every field should have a getter method
         let BinaryQuantizationConfig {
             always_ram: _,
+            memory: _,
             encoding: _,
             query_encoding: _,
         } = self.0;
@@ -421,6 +441,101 @@ impl From<PyBinaryQuantizationQueryEncoding> for BinaryQuantizationQueryEncoding
             PyBinaryQuantizationQueryEncoding::Scalar8Bits => {
                 BinaryQuantizationQueryEncoding::Scalar8Bits
             }
+        }
+    }
+}
+
+#[pyclass(name = "TurboQuantQuantizationConfig", from_py_object)]
+#[derive(Clone, Debug, Into, TransparentWrapper)]
+#[repr(transparent)]
+pub struct PyTurboQuantQuantizationConfig(TurboQuantQuantizationConfig);
+
+#[pyclass_repr]
+#[pymethods]
+impl PyTurboQuantQuantizationConfig {
+    #[new]
+    #[pyo3(signature = (always_ram = None, bits = None))]
+    pub fn new(always_ram: Option<bool>, bits: Option<PyTurboQuantBitSize>) -> Self {
+        Self(TurboQuantQuantizationConfig {
+            always_ram,
+            memory: None,
+            bits: bits.map(TurboQuantBitSize::from),
+        })
+    }
+
+    #[getter]
+    pub fn always_ram(&self) -> Option<bool> {
+        self.0.always_ram
+    }
+
+    #[getter]
+    pub fn bits(&self) -> Option<PyTurboQuantBitSize> {
+        self.0.bits.map(PyTurboQuantBitSize::from)
+    }
+
+    pub fn __repr__(&self) -> String {
+        self.repr()
+    }
+}
+
+impl PyTurboQuantQuantizationConfig {
+    fn _getters(self) {
+        // Every field should have a getter method
+        let TurboQuantQuantizationConfig {
+            always_ram: _,
+            memory: _,
+            bits: _,
+        } = self.0;
+    }
+}
+
+#[pyclass(name = "TurboQuantBitSize", from_py_object)]
+#[derive(Copy, Clone, Debug)]
+pub enum PyTurboQuantBitSize {
+    Bits1,
+    Bits1_5,
+    Bits2,
+    Bits4,
+}
+
+#[pymethods]
+impl PyTurboQuantBitSize {
+    pub fn __repr__(&self) -> String {
+        self.repr()
+    }
+}
+
+impl Repr for PyTurboQuantBitSize {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let repr = match self {
+            Self::Bits1 => "Bits1",
+            Self::Bits1_5 => "Bits1_5",
+            Self::Bits2 => "Bits2",
+            Self::Bits4 => "Bits4",
+        };
+
+        f.simple_enum::<Self>(repr)
+    }
+}
+
+impl From<TurboQuantBitSize> for PyTurboQuantBitSize {
+    fn from(bits: TurboQuantBitSize) -> Self {
+        match bits {
+            TurboQuantBitSize::Bits1 => PyTurboQuantBitSize::Bits1,
+            TurboQuantBitSize::Bits1_5 => PyTurboQuantBitSize::Bits1_5,
+            TurboQuantBitSize::Bits2 => PyTurboQuantBitSize::Bits2,
+            TurboQuantBitSize::Bits4 => PyTurboQuantBitSize::Bits4,
+        }
+    }
+}
+
+impl From<PyTurboQuantBitSize> for TurboQuantBitSize {
+    fn from(bits: PyTurboQuantBitSize) -> Self {
+        match bits {
+            PyTurboQuantBitSize::Bits1 => TurboQuantBitSize::Bits1,
+            PyTurboQuantBitSize::Bits1_5 => TurboQuantBitSize::Bits1_5,
+            PyTurboQuantBitSize::Bits2 => TurboQuantBitSize::Bits2,
+            PyTurboQuantBitSize::Bits4 => TurboQuantBitSize::Bits4,
         }
     }
 }

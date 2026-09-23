@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use bytemuck::Pod;
 use half::f16;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ where
     Self: Copy + Clone + Default + Send + Sync + 'static,
     Self: Serialize + for<'a> Deserialize<'a>,
     Self: FromBytes + Immutable + IntoBytes + KnownLayout,
+    Self: Pod,
 {
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]>;
 
@@ -23,7 +25,7 @@ where
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]>;
 
     fn datatype() -> VectorStorageDatatype;
@@ -49,9 +51,9 @@ impl PrimitiveVectorElement for VectorElementType {
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
-        Cow::Borrowed(vector)
+        vector
     }
 
     fn datatype() -> VectorStorageDatatype {
@@ -83,7 +85,7 @@ impl PrimitiveVectorElement for VectorElementTypeHalf {
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         Cow::Owned(vector.iter().map(|&x| f16::to_f32(x)).collect_vec())
     }
@@ -138,10 +140,10 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         if let QuantizationConfig::Binary(_) = quantization_config {
-            Cow::from(
+            Cow::Owned(
                 vector
                     .iter()
                     .map(|&x| VectorElementType::from(x) - 127.0)
@@ -152,7 +154,7 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
                 .iter()
                 .map(|&x| VectorElementType::from(x))
                 .collect_vec();
-            Cow::from(distance.preprocess_vector::<VectorElementType>(vector))
+            Cow::Owned(distance.preprocess_vector::<VectorElementType>(vector))
         }
     }
 

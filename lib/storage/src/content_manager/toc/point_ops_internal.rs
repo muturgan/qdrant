@@ -41,8 +41,19 @@ impl TableOfContent {
     ) -> StorageResult<FacetResponse> {
         let collection = self.get_collection_unchecked(collection_name).await?;
 
+        let peer_limit = request.limit;
+
         let res = collection
-            .facet(request, shard_selection, None, timeout, hw_measurement_acc)
+            .facet_internal(
+                request,
+                peer_limit,
+                shard_selection,
+                None,
+                // Internal node-to-node call: routing already resolved by the coordinator.
+                None,
+                timeout,
+                hw_measurement_acc,
+            )
             .await?;
 
         Ok(res)

@@ -148,7 +148,11 @@ def test_multi_vector_validation(collection_name):
         }
     )
     assert not response.ok
-    assert 'Wrong input' in response.json()["status"]["error"]
+    # `VectorStruct` is an untagged enum with `Single` listed before
+    # `MultiDense`, so `[]` deserializes as an empty single dense vector and is
+    # rejected at the validation boundary rather than by the dimension check
+    # during apply.
+    assert 'Validation error' in response.json()["status"]["error"]
 
     # fails because it uses an empty inner vector
     response = request_with_validation(
@@ -263,15 +267,15 @@ def test_upsert_legacy_api(collection_name):
     assert point['vector'] == [[0.19, 0.81, 0.75, 0.11]]
 
 
-# allow multivec search on legacy API by emulating a multivec input with a single dense vector
+# allow multivec search by emulating a multivec input with a single dense vector
 def test_search_legacy_api(collection_name):
     # validate input size
     response = request_with_validation(
-        api='/collections/{collection_name}/points/search',
+        api='/collections/{collection_name}/points/query',
         method="POST",
         path_params={'collection_name': collection_name},
         body={
-            "vector": [0.05, 0.61, 0.76],
+            "query": [0.05, 0.61, 0.76],
             "limit": 3
         }
     )
@@ -281,16 +285,16 @@ def test_search_legacy_api(collection_name):
 
     # search on empty collection
     response = request_with_validation(
-        api='/collections/{collection_name}/points/search',
+        api='/collections/{collection_name}/points/query',
         method="POST",
         path_params={'collection_name': collection_name},
         body={
-            "vector": [0.05, 0.61, 0.76, 0.74],
+            "query": [0.05, 0.61, 0.76, 0.74],
             "limit": 3
         }
     )
     assert response.ok
-    assert len(response.json()['result']) == 0
+    assert len(response.json()['result']['points']) == 0
 
     response = request_with_validation(
         api='/collections/{collection_name}/points',
@@ -329,13 +333,13 @@ def test_search_legacy_api(collection_name):
     assert response.ok
 
     response = request_with_validation(
-        api='/collections/{collection_name}/points/search',
+        api='/collections/{collection_name}/points/query',
         method="POST",
         path_params={'collection_name': collection_name},
         body={
-            "vector": [0.05, 0.61, 0.76, 0.74],
+            "query": [0.05, 0.61, 0.76, 0.74],
             "limit": 3
         }
     )
     assert response.ok
-    assert len(response.json()['result']) == 3
+    assert len(response.json()['result']['points']) == 3

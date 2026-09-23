@@ -1,19 +1,19 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use collection::operations::routing::RoutingToken;
 use futures::future::BoxFuture;
-use storage::audit::audit_trust_forwarded_headers;
+use storage::audit::{audit_trust_forwarded_headers, extract_tracing_id};
 use storage::rbac::Access;
 use tonic::Status;
-use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
 use super::forwarded;
-use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType};
+use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
 use crate::common::inference::api_keys::InferenceToken;
 
-type Request = tonic::codegen::http::Request<tonic::transport::Body>;
-type Response = tonic::codegen::http::Response<BoxBody>;
+type Request<Body> = http::Request<Body>;
+type Response<Body> = http::Response<Body>;
 
 #[derive(Clone)]
 pub struct AuthMiddleware<S> {
@@ -21,7 +21,13 @@ pub struct AuthMiddleware<S> {
     service: S,
 }
 
-async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, Status> {
+async fn check<Body>(
+    auth_keys: Arc<AuthKeys>,
+    mut req: Request<Body>,
+) -> Result<Request<Body>, Status>
+where
+    Body: Send + 'static,
+{
     // When the audit logger trusts forwarded headers, prefer the raw
     // `X-Forwarded-For` value so audit entries record the real client address
     // rather than the proxy address.  Fall back to the TCP peer address.
@@ -37,6 +43,13 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
             .map(|addr| addr.ip().to_string())
     });
 
+    let tracing_id = extract_tracing_id(|h| {
+        req.headers()
+            .get(h)
+            .and_then(|val| val.to_str().ok())
+            .map(str::to_string)
+    });
+
     // Allow health check endpoints to bypass authentication
     let path = req.uri().path();
     if path == "/qdrant.Qdrant/HealthCheck" || path == "/grpc.health.v1.Health/Check" {
@@ -46,6 +59,7 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
             None,
             remote,
             AuthType::None,
+            tracing_id,
         );
         let inference_token = InferenceToken(None);
 
@@ -55,19 +69,23 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
         return Ok(req);
     }
 
+    let headers = req.headers();
     let (access, inference_token, auth_type, subject) = auth_keys
         .validate_request(
-            |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+            move |key| headers.get(key).and_then(|val| val.to_str().ok()),
             Default::default(),
         )
         .await
-        .map_err(|e| match e {
-            AuthError::Unauthorized(e) => Status::unauthenticated(e),
-            AuthError::Forbidden(e) => Status::permission_denied(e),
-            AuthError::StorageError(e) => Status::from(e),
+        .map_err(|e| {
+            log_denied_auth(path, remote.clone(), tracing_id.clone(), &e);
+            match e {
+                AuthError::Unauthorized(e) => Status::unauthenticated(e),
+                AuthError::Forbidden(e) => Status::permission_denied(e),
+                AuthError::StorageError(e) => Status::from(e),
+            }
         })?;
 
-    let auth = Auth::new(access, subject, remote, auth_type);
+    let auth = Auth::new(access, subject, remote, auth_type, tracing_id).with_api(path.to_string());
 
     let previous = req.extensions_mut().insert(auth);
 
@@ -86,10 +104,12 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
     Ok(req)
 }
 
-impl<S> Service<Request> for AuthMiddleware<S>
+impl<S, ReqBody, RespBody> Service<Request<ReqBody>> for AuthMiddleware<S>
 where
-    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<RespBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RespBody: Default,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -99,14 +119,14 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request) -> Self::Future {
+    fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
         let auth_keys = self.auth_keys.clone();
         let mut service = self.service.clone();
 
         Box::pin(async move {
             match check(auth_keys, request).await {
                 Ok(req) => service.call(req).await,
-                Err(e) => Ok(e.to_http()),
+                Err(e) => Ok(e.into_http()),
             }
         })
     }
@@ -147,6 +167,59 @@ pub fn extract_auth<R>(req: &mut tonic::Request<R>) -> Auth {
             None,
             None,
             AuthType::None,
+            extract_tracing_id(|h| {
+                req.metadata()
+                    .get(h)
+                    .and_then(|val| val.to_str().ok())
+                    .map(str::to_string)
+            }),
         )
     })
+}
+
+/// Extract the optional read [`RoutingToken`] from a gRPC request's metadata.
+///
+/// Reads the same key as the REST `X-Qdrant-Routing-Token` header
+/// ([`api::HTTP_HEADER_ROUTING_TOKEN`]) from the request metadata. Read directly
+/// from metadata (not request extensions) so it works even when no auth layer is
+/// installed. Absent or empty metadata yields `None` (default routing).
+pub fn extract_routing_token<R>(req: &tonic::Request<R>) -> Option<RoutingToken> {
+    let token = req
+        .metadata()
+        .get(api::HTTP_HEADER_ROUTING_TOKEN)?
+        .to_str()
+        .ok()?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(RoutingToken::from_bytes(token.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_routing_token_from_metadata() {
+        let mut req = tonic::Request::new(());
+        req.metadata_mut()
+            .insert(api::HTTP_HEADER_ROUTING_TOKEN, "user-42".parse().unwrap());
+        assert_eq!(
+            extract_routing_token(&req),
+            Some(RoutingToken::from_bytes(b"user-42")),
+        );
+    }
+
+    #[test]
+    fn missing_metadata_yields_none() {
+        assert_eq!(extract_routing_token(&tonic::Request::new(())), None);
+    }
+
+    #[test]
+    fn empty_metadata_yields_none() {
+        let mut req = tonic::Request::new(());
+        req.metadata_mut()
+            .insert(api::HTTP_HEADER_ROUTING_TOKEN, "".parse().unwrap());
+        assert_eq!(extract_routing_token(&req), None);
+    }
 }

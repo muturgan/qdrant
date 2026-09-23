@@ -10,12 +10,38 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 use crate::rbac::AuthType;
 
+/// Maximum length for a tracing ID extracted from request headers.
+pub const MAX_TRACING_ID_LEN: usize = 256;
+
+/// Request headers checked (in priority order) to extract a tracing ID.
+pub const TRACING_ID_HEADERS: &[&str] = &["x-request-id", "x-tracing-id", "traceparent"];
+
+/// Extract a tracing ID from request headers, checking [`TRACING_ID_HEADERS`]
+/// in priority order.  The value is truncated to [`MAX_TRACING_ID_LEN`] bytes.
+pub fn extract_tracing_id(get_header: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let value = TRACING_ID_HEADERS.iter().find_map(|h| get_header(h))?;
+    if value.len() > MAX_TRACING_ID_LEN {
+        // Floor to a char boundary at or below MAX_TRACING_ID_LEN bytes so the
+        // cap is enforced in bytes (as documented) without splitting a code point.
+        let end = (0..=MAX_TRACING_ID_LEN)
+            .rev()
+            .find(|&i| value.is_char_boundary(i))
+            .unwrap_or(0);
+        Some(value[..end].to_string())
+    } else {
+        Some(value)
+    }
+}
+
 /// Global audit logger singleton.
 static AUDIT_LOGGER: OnceLock<AuditLogger> = OnceLock::new();
 
 /// Whether the audit logger trusts forwarded headers (`X-Forwarded-For`).
 /// Stored separately so it can be queried before/without an active logger.
 static TRUST_FORWARDED_HEADERS: OnceLock<bool> = OnceLock::new();
+
+/// Whether the audit logger should log the API method path.
+static LOG_API: OnceLock<bool> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -46,6 +72,11 @@ pub struct AuditConfig {
     /// Default: false
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+
+    /// If true, log the API method path (REST path or gRPC method) in addition
+    /// to the internal operation name.  Default: true.
+    #[serde(default = "default_log_api")]
+    pub log_api: bool,
 }
 
 fn default_audit_dir() -> PathBuf {
@@ -54,6 +85,10 @@ fn default_audit_dir() -> PathBuf {
 
 const fn default_max_log_files() -> usize {
     7
+}
+
+const fn default_log_api() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -68,28 +103,45 @@ pub enum AuditRotation {
 // Audit event
 // ---------------------------------------------------------------------------
 
+/// Whether the access check passed or was denied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditResult {
+    Ok,
+    Denied,
+}
+
 /// A single structured audit log entry.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// ISO‑8601 timestamp.
     pub timestamp: DateTime<Utc>,
-    /// The API method / handler name.
-    pub method: String,
+    /// The internal operation name (e.g. `upsert_points`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The API method path (REST path or gRPC method name).
+    /// Populated when the `log_api` audit config option is enabled,
+    /// or for denied authentication requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
     /// How the request was authenticated.
     pub auth_type: AuthType,
     /// The `subject` field from the JWT (if any).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// Remote IP address of the client.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
     /// Collection name, if the check was collection‑scoped.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection: Option<String>,
-    /// `"ok"` when the access check passed, `"denied"` otherwise.
-    pub result: &'static str,
+    /// Tracing ID extracted from request headers, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing_id: Option<String>,
+    /// Whether the access check passed or was denied.
+    pub result: AuditResult,
     /// Error message when the access check failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -103,9 +155,18 @@ struct AuditLogger {
 
 impl AuditLogger {
     fn new(config: &AuditConfig) -> anyhow::Result<(Self, WorkerGuard)> {
-        fs_err::create_dir_all(&config.dir)?;
+        let AuditConfig {
+            enabled: _,
+            dir,
+            rotation,
+            max_log_files,
+            trust_forwarded_headers: _,
+            log_api: _,
+        } = config;
 
-        let rotation = match config.rotation {
+        fs_err::create_dir_all(dir)?;
+
+        let rotation = match rotation {
             AuditRotation::Daily => Rotation::DAILY,
             AuditRotation::Hourly => Rotation::HOURLY,
         };
@@ -114,8 +175,8 @@ impl AuditLogger {
             .rotation(rotation)
             .filename_prefix("audit")
             .filename_suffix("log")
-            .max_log_files(config.max_log_files.max(1))
-            .build(&config.dir)
+            .max_log_files((*max_log_files).max(1))
+            .build(dir)
             .map_err(|err| anyhow::anyhow!("Failed to create audit log appender: {err}"))?;
 
         // Wrap the appender in a non-blocking writer.  The actual file I/O is
@@ -168,20 +229,30 @@ pub fn init_audit_logger(config: Option<&AuditConfig>) -> anyhow::Result<Option<
         return Ok(None);
     };
 
-    if !config.enabled {
+    let AuditConfig {
+        enabled,
+        dir,
+        rotation: _,
+        max_log_files: _,
+        trust_forwarded_headers,
+        log_api,
+    } = config;
+
+    if !enabled {
         return Ok(None);
     }
 
-    // Persist the forwarded-headers flag so it is available globally even
-    // outside the audit logger itself (e.g. in auth middleware).
-    let _ = TRUST_FORWARDED_HEADERS.set(config.trust_forwarded_headers);
+    // Persist flags so they are available globally even outside the audit
+    // logger itself (e.g. in auth middleware).
+    let _ = TRUST_FORWARDED_HEADERS.set(*trust_forwarded_headers);
+    let _ = LOG_API.set(*log_api);
 
     let (logger, guard) = AuditLogger::new(config)?;
     AUDIT_LOGGER
         .set(logger)
         .map_err(|_| anyhow::anyhow!("Audit logger already initialised"))?;
 
-    log::info!("Audit logging enabled, writing to {}", config.dir.display());
+    log::info!("Audit logging enabled, writing to {}", dir.display());
 
     Ok(Some(guard))
 }
@@ -203,4 +274,36 @@ pub fn is_audit_enabled() -> bool {
 /// headers (`X-Forwarded-For`) for determining the client address.
 pub fn audit_trust_forwarded_headers() -> bool {
     TRUST_FORWARDED_HEADERS.get().copied().unwrap_or(false)
+}
+
+/// Returns `true` if the audit logger is configured to log API method paths.
+pub fn audit_log_api() -> bool {
+    LOG_API.get().copied().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracing_id_is_capped_in_bytes_for_multibyte_input() {
+        // 300 four-byte chars ~= 1200 bytes. The old char-count truncation kept
+        // 256 chars (~1024 bytes), overshooting the documented byte cap.
+        let long = "😀".repeat(300);
+        let out = extract_tracing_id(|h| (h == TRACING_ID_HEADERS[0]).then(|| long.clone()))
+            .expect("header is present");
+        assert!(
+            out.len() <= MAX_TRACING_ID_LEN,
+            "tracing id not capped in bytes: {} bytes",
+            out.len()
+        );
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn tracing_id_below_cap_is_unchanged() {
+        let out =
+            extract_tracing_id(|h| (h == TRACING_ID_HEADERS[0]).then(|| "req-123".to_string()));
+        assert_eq!(out.as_deref(), Some("req-123"));
+    }
 }

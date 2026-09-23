@@ -17,11 +17,14 @@ use std::time::Duration;
 
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::rate_limiting::RateLimiter;
 use common::save_on_disk::SaveOnDisk;
+use common::types::DeferredBehavior;
 use replica_set_state::{ReplicaSetState, ReplicaState};
-use segment::types::{ExtendedPointId, Filter, SeqNumberType, ShardKey};
+use segment::types::{ExtendedPointId, Filter, SeqNumberType, ShardKey, StrictModeConfig};
 use serde::{Deserialize, Serialize};
+use shard::operations::optimization::{
+    OptimizationsRequestOptions, OptimizationsResponse, OptimizationsSummary,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::spawn_blocking;
@@ -34,14 +37,12 @@ use super::local_shard::{LocalShard, LocalShardOptimizations};
 use super::remote_shard::RemoteShard;
 use super::transfer::ShardTransfer;
 use crate::collection::payload_index_schema::PayloadIndexSchema;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::common::collection_size_stats::CollectionSizeStats;
 use crate::common::snapshots_manager::SnapshotStorageManager;
 use crate::config::CollectionConfigInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
-use crate::operations::types::{
-    CollectionError, CollectionResult, OptimizationsRequestOptions, OptimizationsResponse,
-    OptimizationsSummary, UpdateResult, UpdateStatus,
-};
+use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, UpdateStatus};
 use crate::operations::{CollectionUpdateOperations, OperationWithClockTag, point_ops};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
@@ -49,6 +50,7 @@ use crate::shards::dummy_shard::DummyShard;
 use crate::shards::replica_set::clock_set::ClockSet;
 use crate::shards::shard::{PeerId, Shard, ShardId};
 use crate::shards::shard_config::ShardConfig;
+use crate::shards::shard_trait::WaitUntil;
 
 //    │    Collection Created
 //    │
@@ -103,7 +105,10 @@ pub struct ShardReplicaSet {
     locally_disabled_peers: parking_lot::RwLock<locally_disabled_peers::Registry>,
     pub(crate) shard_path: PathBuf,
     pub(crate) shard_id: ShardId,
-    shard_key: Option<ShardKey>,
+    /// Optional shard key. Wrapped in `parking_lot::RwLock` so it can be
+    /// reassigned via `&self` (e.g. when applying snapshot state on a shard
+    /// that was already mounted).
+    shard_key: parking_lot::RwLock<Option<ShardKey>>,
     notify_peer_failure_cb: ChangePeerFromState,
     abort_shard_transfer_cb: AbortShardTransfer,
     channel_service: ChannelService,
@@ -113,14 +118,17 @@ pub struct ShardReplicaSet {
     pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     update_runtime: Handle,
-    search_runtime: Handle,
+    search_runtime: AdaptiveSearchHandle,
     optimizer_resource_budget: ResourceBudget,
     /// Lock to serialized write operations on the replicaset when a write ordering is used.
     write_ordering_lock: Mutex<()>,
     /// Local clock set, used to tag new operations on this shard.
     clock_set: Mutex<ClockSet>,
-    write_rate_limiter: Option<parking_lot::Mutex<RateLimiter>>,
     pub partial_snapshot_meta: PartialSnapshotMeta,
+    /// Serializes full snapshot recoveries of this shard.
+    ///
+    /// See [`ShardReplicaSet::take_snapshot_recovery_lock`].
+    snapshot_recovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
@@ -148,7 +156,7 @@ impl ShardReplicaSet {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         channel_service: ChannelService,
         update_runtime: Handle,
-        search_runtime: Handle,
+        search_runtime: AdaptiveSearchHandle,
         optimizer_resource_budget: ResourceBudget,
         init_state: Option<ReplicaState>,
     ) -> CollectionResult<Self> {
@@ -198,19 +206,9 @@ impl ShardReplicaSet {
         let replica_set_shard_config = ShardConfig::new_replica_set();
         replica_set_shard_config.save(&shard_path)?;
 
-        // Initialize the write rate limiter
-        let config = collection_config.read().await;
-        let write_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
-            strict_mode
-                .write_rate_limit
-                .map(RateLimiter::new_per_minute)
-                .map(parking_lot::Mutex::new)
-        });
-        drop(config);
-
         Ok(Self {
             shard_id,
-            shard_key,
+            shard_key: parking_lot::RwLock::new(shard_key),
             local: RwLock::new(local),
             remotes: RwLock::new(remote_shards),
             replica_state: replica_state.into(),
@@ -229,8 +227,8 @@ impl ShardReplicaSet {
             optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
-            write_rate_limiter,
             partial_snapshot_meta: PartialSnapshotMeta::default(),
+            snapshot_recovery_lock: Default::default(),
         })
     }
 
@@ -255,7 +253,7 @@ impl ShardReplicaSet {
         abort_shard_transfer: AbortShardTransfer,
         this_peer_id: PeerId,
         update_runtime: Handle,
-        search_runtime: Handle,
+        search_runtime: AdaptiveSearchHandle,
         optimizer_resource_budget: ResourceBudget,
     ) -> Self {
         let replica_state: SaveOnDisk<ReplicaSetState> =
@@ -339,19 +337,9 @@ impl ShardReplicaSet {
             None
         };
 
-        // Initialize the write rate limiter
-        let config = collection_config.read().await;
-        let write_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
-            strict_mode
-                .write_rate_limit
-                .map(RateLimiter::new_per_minute)
-                .map(parking_lot::Mutex::new)
-        });
-        drop(config);
-
         let replica_set = Self {
             shard_id,
-            shard_key,
+            shard_key: parking_lot::RwLock::new(shard_key),
             local: RwLock::new(local),
             remotes: RwLock::new(remote_shards),
             replica_state: replica_state.into(),
@@ -371,8 +359,8 @@ impl ShardReplicaSet {
             optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
-            write_rate_limiter,
             partial_snapshot_meta: PartialSnapshotMeta::default(),
+            snapshot_recovery_lock: Default::default(),
         };
 
         // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
@@ -386,14 +374,25 @@ impl ShardReplicaSet {
         replica_set
     }
 
-    pub async fn stop_gracefully(self) {
+    pub async fn stop_gracefully(&self) {
         if let Some(local) = self.local.write().await.take() {
             local.stop_gracefully().await;
         }
     }
 
-    pub fn shard_key(&self) -> Option<&ShardKey> {
-        self.shard_key.as_ref()
+    /// Synchronously flush every segment in the local shard. Test-only — `stop_gracefully`
+    /// signals the periodic flush worker to stop but never triggers a final flush, so
+    /// tests that need on-disk consistency without waiting for the periodic tick use this.
+    #[cfg(test)]
+    pub(crate) async fn force_flush_local_for_test(&self) {
+        use crate::shards::shard::Shard;
+        if let Some(Shard::Local(local)) = &*self.local.read().await {
+            local.full_flush();
+        }
+    }
+
+    pub fn shard_key(&self) -> Option<ShardKey> {
+        self.shard_key.read().clone()
     }
 
     pub fn this_peer_id(&self) -> PeerId {
@@ -835,7 +834,7 @@ impl ShardReplicaSet {
     }
 
     pub async fn apply_state(
-        &mut self,
+        &self,
         replicas: HashMap<PeerId, ReplicaState>,
         shard_key: Option<ShardKey>,
     ) -> CollectionResult<()> {
@@ -928,7 +927,7 @@ impl ShardReplicaSet {
         }
 
         // Apply shard key
-        self.shard_key = shard_key;
+        *self.shard_key.write() = shard_key;
 
         Ok(())
     }
@@ -946,53 +945,15 @@ impl ShardReplicaSet {
     }
 
     /// Apply shard's strict mode configuration update
-    /// - Update read and write rate limiters
-    pub(crate) async fn on_strict_mode_config_update(&mut self) -> CollectionResult<()> {
-        let mut read_local = self.local.write().await;
-        if let Some(shard) = read_local.as_mut() {
-            shard.on_strict_mode_config_update().await
-        }
-        drop(read_local);
-        let config = self.collection_config.read().await;
-        if let Some(strict_mode_config) = &config.strict_mode_config
-            && strict_mode_config.enabled == Some(true)
-        {
-            // update write rate limiter
-            if let Some(write_rate_limit_per_min) = strict_mode_config.write_rate_limit {
-                let new_write_rate_limiter = RateLimiter::new_per_minute(write_rate_limit_per_min);
-                self.write_rate_limiter
-                    .replace(parking_lot::Mutex::new(new_write_rate_limiter));
-                return Ok(());
-            }
-        }
-        // remove write rate limiter for all other situations
-        self.write_rate_limiter.take();
-        Ok(())
-    }
-
-    /// Check if the write rate limiter allows the operation to proceed
-    /// - hw_measurement_acc: the current hardware measurement accumulator
-    /// - cost_fn: the cost of the operation called lazily
     ///
-    /// Returns an error if the rate limit is exceeded.
-    async fn check_write_rate_limiter<F>(
+    /// The actual rate limiters live on `LocalShard`, so this just delegates
+    /// while we hold the local-shard write lock.
+    pub(crate) async fn on_strict_mode_config_update(
         &self,
-        hw_measurement_acc: &HwMeasurementAcc,
-        cost_fn: F,
-    ) -> CollectionResult<()>
-    where
-        F: AsyncFnOnce() -> usize,
-    {
-        // Do not rate limit internal operation tagged with disposable measurement
-        if hw_measurement_acc.is_disposable() {
-            return Ok(());
-        }
-        if let Some(rate_limiter) = &self.write_rate_limiter {
-            let cost = cost_fn().await;
-            rate_limiter
-                .lock()
-                .try_consume(cost as f64)
-                .map_err(|err| CollectionError::rate_limit_error(err, cost, true))?;
+        new_strict_mode: &StrictModeConfig,
+    ) -> CollectionResult<()> {
+        if let Some(shard) = self.local.write().await.as_mut() {
+            shard.on_strict_mode_config_update(new_strict_mode);
         }
         Ok(())
     }
@@ -1030,9 +991,10 @@ impl ShardReplicaSet {
         let remotes = self.remotes.read().await;
 
         let Some(remote) = remotes.iter().find(|remote| remote.peer_id == peer_id) else {
-            return Err(CollectionError::NotFound {
-                what: format!("{}/{}:{} shard", peer_id, self.collection_id, self.shard_id),
-            });
+            return Err(CollectionError::not_found(format!(
+                "{}/{}:{} shard",
+                peer_id, self.collection_id, self.shard_id
+            )));
         };
 
         remote.health_check().await?;
@@ -1045,13 +1007,16 @@ impl ShardReplicaSet {
         filter: Filter,
         hw_measurement_acc: HwMeasurementAcc,
         force: bool,
+        deferred_behavior: DeferredBehavior,
+        wait: WaitUntil,
     ) -> CollectionResult<UpdateResult> {
         let local_shard_guard = self.local.read().await;
 
         let Some(local_shard) = local_shard_guard.deref() else {
-            return Err(CollectionError::NotFound {
-                what: format!("local shard {}:{}", self.collection_id, self.shard_id),
-            });
+            return Err(CollectionError::not_found(format!(
+                "local shard {}:{}",
+                self.collection_id, self.shard_id
+            )));
         };
 
         let mut next_offset = Some(ExtendedPointId::NumId(0));
@@ -1071,6 +1036,7 @@ impl ShardReplicaSet {
                     &self.search_runtime,
                     None,
                     hw_measurement_acc.clone(),
+                    deferred_behavior,
                 )
                 .await?;
 
@@ -1100,7 +1066,7 @@ impl ShardReplicaSet {
 
         // TODO(resharding): Assign clock tag to the operation!? 🤔
         let result = self
-            .update_local(op.into(), true, None, hw_measurement_acc, force)
+            .update_local(op.into(), wait, None, hw_measurement_acc, force)
             .await?
             .ok_or_else(|| {
                 CollectionError::bad_request(format!(
@@ -1133,16 +1099,10 @@ impl ShardReplicaSet {
             .collect()
     }
 
-    /// Check whether a peer is registered as `active`.
-    /// Unknown peers are not active.
-    fn peer_is_active(&self, peer_id: PeerId) -> bool {
-        // This is used *exclusively* during `execute_*_read_operation`, and so it *should* consider
-        // `ReshardingScaleDown` replicas
-        let is_active = self
-            .peer_state(peer_id)
-            .is_some_and(ReplicaState::is_active);
-
-        is_active && !self.is_locally_disabled(peer_id)
+    /// Check if peer is suitable for rate limiting
+    fn peer_is_write_rate_limitable(&self, peer_id: PeerId) -> bool {
+        self.peer_state(peer_id)
+            .is_some_and(ReplicaState::is_write_rate_limitable)
     }
 
     fn peer_is_readable(&self, peer_id: PeerId) -> bool {
@@ -1279,9 +1239,7 @@ impl ShardReplicaSet {
     pub(crate) async fn shard_recovery_point(&self) -> CollectionResult<RecoveryPoint> {
         let local_shard = self.local.read().await;
         let Some(local_shard) = local_shard.as_ref() else {
-            return Err(CollectionError::NotFound {
-                what: "Peer does not have local shard".into(),
-            });
+            return Err(CollectionError::not_found("Peer does not have local shard"));
         };
 
         local_shard.shard_recovery_point().await
@@ -1294,9 +1252,7 @@ impl ShardReplicaSet {
     ) -> CollectionResult<()> {
         let local_shard = self.local.read().await;
         let Some(local_shard) = local_shard.as_ref() else {
-            return Err(CollectionError::NotFound {
-                what: "Peer does not have local shard".into(),
-            });
+            return Err(CollectionError::not_found("Peer does not have local shard"));
         };
 
         local_shard.update_cutoff(cutoff).await
@@ -1310,9 +1266,7 @@ impl ShardReplicaSet {
         let local = self.local.read().await;
 
         let Some(local) = local.as_ref() else {
-            return Err(CollectionError::NotFound {
-                what: "Peer does not have local shard".into(),
-            });
+            return Err(CollectionError::not_found("Peer does not have local shard"));
         };
 
         local.get_wal_entries(count).await
@@ -1427,6 +1381,49 @@ impl ShardReplicaSet {
         }
 
         Ok(response)
+    }
+
+    /// Get memory report from only the local shard.
+    ///
+    /// Used by the internal gRPC handler to return local data
+    /// without querying remote shards (which would cause recursion).
+    pub async fn local_memory_report(
+        &self,
+    ) -> CollectionResult<crate::common::memory_reporter::CollectionMemoryReport> {
+        let local = self.local.read().await;
+        match local.as_ref() {
+            Some(Shard::Local(local_shard)) => local_shard.memory_report().await,
+            Some(Shard::Proxy(proxy_shard)) => proxy_shard.memory_report().await,
+            Some(Shard::ForwardProxy(forward_shard)) => forward_shard.memory_report().await,
+            Some(Shard::QueueProxy(queue_shard)) => queue_shard.memory_report().await,
+            Some(Shard::Dummy(_)) | None => {
+                Ok(crate::common::memory_reporter::CollectionMemoryReport::default())
+            }
+        }
+    }
+
+    /// Collect memory reports from both local and remote shards.
+    pub async fn memory_report(
+        &self,
+    ) -> CollectionResult<crate::common::memory_reporter::CollectionMemoryReport> {
+        use crate::common::memory_reporter::CollectionMemoryReport;
+
+        let local_future = self.local_memory_report();
+        let remote_futures = async {
+            let remotes = self.remotes.read().await;
+            let futures: Vec<_> = remotes
+                .iter()
+                .map(|remote| remote.memory_report())
+                .collect();
+            futures::future::try_join_all(futures).await
+        };
+
+        let (local_report, remote_reports) =
+            futures::future::try_join(local_future, remote_futures).await?;
+
+        let mut all_reports = vec![local_report];
+        all_reports.extend(remote_reports);
+        Ok(CollectionMemoryReport::merge_all(all_reports))
     }
 
     /// Get optimizations info from only the local shard.

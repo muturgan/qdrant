@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use common::fs::{atomic_save_json, read_json};
+use common::fs::atomic_save_json;
+use common::universal_io::{OkNotFound, UniversalReadFs, read_json_via};
 use serde::{Deserialize, Serialize};
 
 use crate::common::operation_error::OperationResult;
@@ -9,12 +10,13 @@ pub const HNSW_INDEX_CONFIG_FILE: &str = "hnsw_config.json";
 
 #[derive(Debug, Deserialize, Serialize, Copy, Clone, PartialEq, Eq)]
 pub struct HnswGraphConfig {
-    pub m: usize,
     /// Requested M
-    pub m0: usize,
+    pub m: usize,
     /// Actual M on level 0
-    pub ef_construct: usize,
+    pub m0: usize,
     /// Number of neighbours to search on construction
+    pub ef_construct: usize,
+    /// Number of neighbours to hold in the candidate list during search (initialized to `ef_construct`)
     pub ef: usize,
     /// We prefer a full scan search upto (excluding) this number of vectors.
     ///
@@ -57,8 +59,11 @@ impl HnswGraphConfig {
         path.join(HNSW_INDEX_CONFIG_FILE)
     }
 
-    pub fn load(path: &Path) -> OperationResult<Self> {
-        Ok(read_json(path)?)
+    pub fn load_universal<Fs: UniversalReadFs>(
+        fs: &Fs,
+        path: &Path,
+    ) -> OperationResult<Option<Self>> {
+        Ok(read_json_via(fs, path).ok_not_found()?)
     }
 
     pub fn save(&self, path: &Path) -> OperationResult<()> {

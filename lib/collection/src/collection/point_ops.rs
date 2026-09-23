@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::types::DeferredBehavior;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt as _, TryFutureExt, TryStreamExt as _, future};
 use itertools::Itertools;
@@ -15,10 +16,12 @@ use shard::scroll::ScrollRequestInternal;
 use super::Collection;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::point_ops::WriteOrdering;
+use crate::operations::routing::RoutingToken;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::shards::shard::ShardId;
+use crate::shards::shard_trait::WaitUntil;
 
 impl Collection {
     /// Apply collection update operation to all local shards.
@@ -30,10 +33,18 @@ impl Collection {
     pub async fn update_all_local(
         &self,
         operation: CollectionUpdateOperations,
-        wait: bool,
+        wait: WaitUntil,
         hw_measurement_acc: HwMeasurementAcc,
+        force: bool,
     ) -> CollectionResult<Option<UpdateResult>> {
-        let shard_holder = self.shards_holder.clone().read_owned().await;
+        let shards: Vec<_> = self
+            .shards_holder
+            .clone()
+            .read_owned()
+            .await
+            .all_shards()
+            .map(Arc::clone)
+            .collect();
 
         let results = self
             .update_runtime
@@ -45,25 +56,26 @@ impl Collection {
                 // requests if any of them returns an error, so we *have to* use
                 // `futures::join_all`/`TryStreamExt::collect` instead!
 
-                let local_updates: FuturesUnordered<_> = shard_holder
-                    .all_shards()
-                    .map(|shard| {
-                        // The operation *can't* have a clock tag!
-                        //
-                        // We update *all* shards with a single operation, but each shard has it's own clock,
-                        // so it's *impossible* to assign any single clock tag to this operation.
-                        shard.update_local(
-                            OperationWithClockTag::from(operation.clone()),
-                            wait,
-                            None,
-                            hw_measurement_acc.clone(),
-                            false,
-                        )
-                    })
-                    .collect();
+                let local_updates = FuturesUnordered::new();
+
+                for shard in shards {
+                    // The operation *can't* have a clock tag!
+                    //
+                    // We update *all* shards with a single operation, but each shard has it's own clock,
+                    // so it's *impossible* to assign any single clock tag to this operation.
+                    let operation = OperationWithClockTag::from(operation.clone());
+                    let hw_measurement_acc = hw_measurement_acc.clone();
+
+                    let local_update = async move {
+                        shard
+                            .update_local(operation, wait, None, hw_measurement_acc, force)
+                            .await
+                    };
+
+                    local_updates.push(local_update);
+                }
 
                 let results: Vec<_> = local_updates.collect().await;
-
                 results
             })
             .await?;
@@ -92,15 +104,23 @@ impl Collection {
         &self,
         operation: OperationWithClockTag,
         shard_selection: ShardId,
-        wait: bool,
+        wait: WaitUntil,
         timeout: Option<Duration>,
         ordering: WriteOrdering,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
-        let shard_holder = self.shards_holder.clone().read_owned().await;
+        check_quota(&operation.operation)?;
+
+        let shard = self
+            .shards_holder
+            .clone()
+            .read_owned()
+            .await
+            .get_shard(shard_selection)
+            .cloned();
 
         let result = self.update_runtime.spawn(async move {
-            let Some(shard) = shard_holder.get_shard(shard_selection) else {
+            let Some(shard) = shard else {
                 return Ok(None);
             };
 
@@ -141,75 +161,77 @@ impl Collection {
     pub async fn update_from_client(
         &self,
         operation: CollectionUpdateOperations,
-        wait: bool,
+        wait: WaitUntil,
         timeout: Option<Duration>,
         ordering: WriteOrdering,
         shard_keys_selection: Option<ShardKey>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
-        let shard_holder = self.shards_holder.clone().read_owned().await;
+        // Deliberately no quota check here: this node may hold no replica of the
+        // shards being written, and even where it does, its own limit must not
+        // decide the fate of replicas on other machines. Each replica set gates
+        // its own local write instead.
+        let updates = FuturesUnordered::new();
+
+        {
+            let shard_holder = self.shards_holder.clone().read_owned().await;
+            let operations = shard_holder.split_by_shard(operation, &shard_keys_selection)?;
+
+            for (shard, operation) in operations {
+                let operation = shard_holder.split_by_mode(shard.shard_id, operation);
+
+                let shard = shard.clone();
+                let hw_acc = hw_measurement_acc.clone();
+
+                updates.push(async move {
+                    let mut result = UpdateResult {
+                        operation_id: None,
+                        status: UpdateStatus::Acknowledged,
+                        clock_tag: None,
+                    };
+
+                    for operation in operation.update_all {
+                        result = shard
+                            .update_with_consistency(
+                                operation,
+                                wait,
+                                timeout,
+                                ordering,
+                                false,
+                                hw_acc.clone(),
+                            )
+                            .await?;
+                    }
+
+                    for operation in operation.update_only_existing {
+                        let res = shard
+                            .update_with_consistency(
+                                operation,
+                                wait,
+                                timeout,
+                                ordering,
+                                true,
+                                hw_acc.clone(),
+                            )
+                            .await;
+
+                        if let Err(err) = &res
+                            && err.is_missing_point()
+                        {
+                            continue;
+                        }
+
+                        result = res?;
+                    }
+
+                    CollectionResult::Ok(result)
+                });
+            }
+        }
+
         let start_time = std::time::Instant::now();
 
-        let results = self
-            .update_runtime
-            .spawn(async move {
-                let updates = FuturesUnordered::new();
-                let operations = shard_holder.split_by_shard(operation, &shard_keys_selection)?;
-
-                for (shard, operation) in operations {
-                    let operation = shard_holder.split_by_mode(shard.shard_id, operation);
-
-                    let hw_acc = hw_measurement_acc.clone();
-                    updates.push(async move {
-                        let mut result = UpdateResult {
-                            operation_id: None,
-                            status: UpdateStatus::Acknowledged,
-                            clock_tag: None,
-                        };
-
-                        for operation in operation.update_all {
-                            result = shard
-                                .update_with_consistency(
-                                    operation,
-                                    wait,
-                                    timeout,
-                                    ordering,
-                                    false,
-                                    hw_acc.clone(),
-                                )
-                                .await?;
-                        }
-
-                        for operation in operation.update_only_existing {
-                            let res = shard
-                                .update_with_consistency(
-                                    operation,
-                                    wait,
-                                    timeout,
-                                    ordering,
-                                    true,
-                                    hw_acc.clone(),
-                                )
-                                .await;
-
-                            if let Err(err) = &res
-                                && err.is_missing_point()
-                            {
-                                continue;
-                            }
-
-                            result = res?;
-                        }
-
-                        CollectionResult::Ok(result)
-                    });
-                }
-
-                let results: Vec<_> = updates.collect().await;
-
-                CollectionResult::Ok(results)
-            })
-            .await??;
+        let results: Vec<_> = self.update_runtime.spawn(updates.collect()).await?;
 
         if results.is_empty() {
             return Err(CollectionError::bad_request(
@@ -292,14 +314,22 @@ impl Collection {
         ordering: WriteOrdering,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
-        self.update_from_client(operation, wait, timeout, ordering, None, hw_measurement_acc)
-            .await
+        self.update_from_client(
+            operation,
+            WaitUntil::from(wait),
+            timeout,
+            ordering,
+            None,
+            hw_measurement_acc,
+        )
+        .await
     }
 
     pub async fn scroll_by(
         &self,
         mut request: ScrollRequestInternal,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -311,9 +341,7 @@ impl Collection {
             .unwrap_or_else(|| default_request.limit.unwrap());
 
         if limit == 0 {
-            return Err(CollectionError::BadRequest {
-                description: "Limit cannot be 0".to_string(),
-            });
+            return Err(CollectionError::bad_request("Limit cannot be 0"));
         }
 
         let local_only = shard_selection.is_shard_id();
@@ -339,6 +367,7 @@ impl Collection {
                     .scroll_by(
                         request.clone(),
                         read_consistency,
+                        routing_token,
                         local_only,
                         timeout,
                         hw_measurement_acc.clone(),
@@ -400,6 +429,7 @@ impl Collection {
         &self,
         request: CountRequestInternal,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -416,9 +446,11 @@ impl Collection {
                 shard.count(
                     Arc::clone(&request),
                     read_consistency,
+                    routing_token,
                     timeout,
                     shard_selection.is_shard_id(),
                     hw_measurement_acc.clone(),
+                    DeferredBehavior::VisibleOnly,
                 )
             })
             .collect();
@@ -435,6 +467,7 @@ impl Collection {
         &self,
         request: PointRequestInternal,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -469,6 +502,7 @@ impl Collection {
                             with_payload,
                             &request.with_vector,
                             read_consistency,
+                            routing_token,
                             timeout,
                             shard_selection.is_shard_id(),
                             hw_acc,
@@ -506,4 +540,19 @@ impl Collection {
 
         Ok(points)
     }
+}
+
+/// Reject an update that would take this node past its resource quota.
+///
+/// Guards the forwarded-write entry point, where this node is acting as a
+/// replica and answers only for itself. The coordinator sees the rejection as
+/// this peer failing the operation, and deactivates it exactly as it would a
+/// peer that had gone offline — see `ShardReplicaSet::update`, which applies the
+/// same gate to the local replica.
+fn check_quota(operation: &CollectionUpdateOperations) -> CollectionResult<()> {
+    if !operation.consumes_quota() {
+        return Ok(());
+    }
+
+    Ok(shard::quota::global().check_update()?)
 }

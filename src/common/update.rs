@@ -24,13 +24,14 @@ use storage::content_manager::collection_verification::check_strict_mode;
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, Auth, AuthType};
+use storage::rbac::{Access, AccessRequirements, Auth};
 use validator::Validate;
 
 use crate::common::inference::params::InferenceParams;
 use crate::common::inference::service::InferenceType;
 use crate::common::inference::update_requests::*;
 use crate::common::strict_mode::*;
+use crate::common::validate_vectors::validate_vector_dimensions;
 
 #[serde_with::serde_as]
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, Validate)]
@@ -67,16 +68,23 @@ impl UpdateParams {
 pub struct InternalUpdateParams {
     pub shard_id: Option<ShardId>,
     pub clock_tag: Option<ClockTag>,
+    /// When present, fully overrides the `wait` boolean from the public API message.
+    /// When absent, falls back to the `wait` boolean (backward compatible with older nodes).
+    pub wait_override: Option<collection::shards::shard_trait::WaitUntil>,
 }
 
 impl InternalUpdateParams {
     pub fn from_grpc(
         shard_id: Option<ShardId>,
         clock_tag: Option<api::grpc::qdrant::ClockTag>,
+        wait_override: Option<i32>,
     ) -> Self {
         Self {
             shard_id,
             clock_tag: clock_tag.map(ClockTag::from),
+            wait_override: wait_override
+                .and_then(|v| api::grpc::qdrant::WaitUntil::try_from(v).ok())
+                .map(collection::shards::shard_trait::WaitUntil::from),
         }
     }
 }
@@ -117,6 +125,19 @@ impl Validate for UpdateOperation {
 }
 
 impl StrictModeVerification for UpdateOperation {
+    fn consumes_memory(&self) -> bool {
+        match self {
+            UpdateOperation::Upsert(op) => op.upsert.consumes_memory(),
+            UpdateOperation::Delete(op) => op.delete.consumes_memory(),
+            UpdateOperation::SetPayload(op) => op.set_payload.consumes_memory(),
+            UpdateOperation::OverwritePayload(op) => op.overwrite_payload.consumes_memory(),
+            UpdateOperation::DeletePayload(op) => op.delete_payload.consumes_memory(),
+            UpdateOperation::ClearPayload(op) => op.clear_payload.consumes_memory(),
+            UpdateOperation::UpdateVectors(op) => op.update_vectors.consumes_memory(),
+            UpdateOperation::DeleteVectors(op) => op.delete_vectors.consumes_memory(),
+        }
+    }
+
     fn query_limit(&self) -> Option<usize> {
         None
     }
@@ -188,6 +209,10 @@ impl StrictModeVerification for UpdateOperation {
 }
 
 impl StrictModeVerification for CreateFieldIndex {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
     async fn check_custom(
         &self,
         collection: &Collection,
@@ -298,6 +323,13 @@ pub async fn do_upsert_points(
     use point_ops::UpdateMode;
     use segment::types::Filter;
 
+    // The REST handler already runs this via `actix_web_validator::Json`, but the
+    // gRPC handler does not — without this, empty vectors entering through gRPC
+    // would only be rejected on the synchronous (wait=true) apply path.
+    operation
+        .validate()
+        .map_err(|err| StorageError::bad_input(err.to_string()))?;
+
     let toc = toc_provider
         .check_strict_mode(
             &operation,
@@ -334,6 +366,18 @@ pub async fn do_upsert_points(
             (operation, shard_key, usage, update_filter, update_mode)
         }
     };
+
+    // Validate vector dimensions early, before writing to WAL.
+    // This ensures that dimension mismatches are reported even for async (wait=false) operations,
+    // rather than being silently discarded during background processing.
+    {
+        let collection_pass = auth
+            .unlogged_access()
+            .check_collection_access(&collection_name, AccessRequirements::new())?;
+        let collection = toc.get_collection(&collection_pass).await?;
+        let vectors_config = collection.vectors_config().await;
+        validate_vector_dimensions(&operation, &vectors_config)?;
+    }
 
     // Decide which operation to use based on update_filter and update_mode
     let operation = match (update_filter, update_mode) {
@@ -892,6 +936,12 @@ pub async fn do_create_index(
     )
     .await?;
 
+    // Building an index consumes memory and disk, but arrives at the shards
+    // through consensus, past the check on the update path — a peer must not
+    // refuse what the cluster has already agreed to. So the quota is applied
+    // here, before the operation is proposed at all.
+    shard::quota::global().check_update()?;
+
     let Some(field_schema) = operation.field_schema else {
         return Err(StorageError::bad_request(
             "Can't auto-detect field type, please specify `field_schema` in the request",
@@ -910,10 +960,6 @@ pub async fn do_create_index(
     dispatcher
         .submit_collection_meta_op(consensus_op, auth, params.timeout)
         .await?;
-
-    // This function is required as long as we want to maintain interface compatibility
-    // for `wait` parameter and return type.
-    // The idea is to migrate from the point-like interface to consensus-like interface in the next few versions
 
     do_create_index_internal(
         toc,
@@ -950,7 +996,7 @@ pub async fn do_create_index_internal(
         internal_params,
         params,
         None,
-        Auth::new(Access::full("Internal API"), None, None, AuthType::Internal),
+        Auth::new_internal(Access::full("Internal API")),
         hw_measurement_acc,
     )
     .await
@@ -1017,7 +1063,162 @@ pub async fn do_delete_index_internal(
         internal_params,
         params,
         None,
-        Auth::new(Access::full("Internal API"), None, None, AuthType::Internal),
+        Auth::new_internal(Access::full("Internal API")),
+        hw_measurement_acc,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+pub async fn do_create_vector_name(
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
+    vector_name: String,
+    config: VectorNameConfig,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    auth: Auth,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    // Validate the vector name once at the single chokepoint that both REST and
+    // gRPC entrypoints land in (REST also runs the same check via `VectorNamePath`).
+    common::validation::validate_vector_name(&vector_name).map_err(|err| {
+        StorageError::bad_input(format!("Invalid vector name `{vector_name}`: {err}"))
+    })?;
+
+    // Reject before consensus submission — this operation allocates storage for
+    // the new vector across every existing point, and once proposed it reaches
+    // the shards past the check on the update path, where a peer must not refuse
+    // what the cluster has already agreed to.
+    let operation = shard::operations::CreateVectorName {
+        vector_name: vector_name.clone(),
+        config: config.clone(),
+    };
+    let pass = check_strict_mode(
+        &operation,
+        params.timeout_as_secs(),
+        &collection_name,
+        &dispatcher,
+        &auth,
+    )
+    .await?;
+    shard::quota::global().check_update()?;
+
+    let consensus_op = CreateNamedVector {
+        collection_name: collection_name.clone(),
+        vector_name: vector_name.clone(),
+        config: config.clone(),
+    };
+
+    let toc = dispatcher.toc(&auth, &pass).clone();
+
+    dispatcher
+        .submit_collection_meta_op(
+            CollectionMetaOperations::CreateNamedVector(consensus_op),
+            auth,
+            params.timeout,
+        )
+        .await?;
+
+    do_create_vector_name_internal(
+        toc,
+        collection_name,
+        vector_name,
+        config,
+        internal_params,
+        params,
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_create_vector_name_internal(
+    toc: Arc<TableOfContent>,
+    collection_name: String,
+    vector_name: String,
+    config: segment::data_types::vector_name_config::VectorNameConfig,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    let operation = CollectionUpdateOperations::VectorNameOperation(
+        VectorNameOperations::CreateVectorName(CreateVectorName {
+            vector_name,
+            config,
+        }),
+    );
+
+    update(
+        &toc,
+        &collection_name,
+        operation,
+        internal_params,
+        params,
+        None,
+        Auth::new_internal(Access::full("Internal API")),
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_delete_vector_name(
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
+    vector_name: String,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    auth: Auth,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    use collection::operations::verification::new_unchecked_verification_pass;
+
+    let consensus_op = DeleteNamedVector {
+        collection_name: collection_name.clone(),
+        vector_name: vector_name.clone(),
+    };
+
+    let pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(&auth, &pass).clone();
+
+    dispatcher
+        .submit_collection_meta_op(
+            CollectionMetaOperations::DeleteNamedVector(consensus_op),
+            auth,
+            params.timeout,
+        )
+        .await?;
+
+    do_delete_vector_name_internal(
+        toc,
+        collection_name,
+        vector_name,
+        internal_params,
+        params,
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_delete_vector_name_internal(
+    toc: Arc<TableOfContent>,
+    collection_name: String,
+    vector_name: String,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    let operation = CollectionUpdateOperations::VectorNameOperation(
+        VectorNameOperations::DeleteVectorName(DeleteVectorName { vector_name }),
+    );
+
+    update(
+        &toc,
+        &collection_name,
+        operation,
+        internal_params,
+        params,
+        None,
+        Auth::new_internal(Access::full("Internal API")),
         hw_measurement_acc,
     )
     .await
@@ -1037,31 +1238,48 @@ pub async fn update(
     let InternalUpdateParams {
         shard_id,
         clock_tag,
+        wait_override,
     } = internal_params;
 
     let UpdateParams {
         wait,
         ordering,
-        timeout: _,
+        timeout,
     } = params;
 
+    // Default missing timeout to the inter-node update timeout so REST/gRPC
+    // user requests can't wait indefinitely on a vanished client.
+    let timeout = timeout.or_else(|| Some(toc.get_channel_service().request_timeout()));
+
+    // Use wait_override if present, otherwise fall back to the wait boolean
+    let wait =
+        wait_override.unwrap_or_else(|| collection::shards::shard_trait::WaitUntil::from(wait));
+
     let shard_selector = match operation {
-        CollectionUpdateOperations::PointOperation(point_ops::PointOperations::SyncPoints(_)) => {
+        CollectionUpdateOperations::PointOperation(
+            point_ops::PointOperations::SyncPoints(_)
+            | point_ops::PointOperations::SyncPointsRaw(_)
+            | point_ops::PointOperations::UpsertPointsRaw(_),
+        ) => {
             debug_assert_eq!(
                 shard_key, None,
-                "Sync points operations can't specify shard key"
+                "Sync points and raw point operations can't specify shard key"
             );
 
             match shard_id {
                 Some(shard_id) => ShardSelectorInternal::ShardId(shard_id),
                 None => {
-                    debug_assert!(false, "Sync operation is supposed to select shard directly");
+                    debug_assert!(
+                        false,
+                        "Sync and raw operations are supposed to select shard directly"
+                    );
                     ShardSelectorInternal::Empty
                 }
             }
         }
 
-        CollectionUpdateOperations::FieldIndexOperation(_) => {
+        CollectionUpdateOperations::FieldIndexOperation(_)
+        | CollectionUpdateOperations::VectorNameOperation(_) => {
             debug_assert_eq!(
                 shard_key, None,
                 "Field index operations can't specify shard key"
@@ -1072,15 +1290,25 @@ pub async fn update(
                 None => ShardSelectorInternal::All,
             }
         }
-
-        _ => get_shard_selector_for_update(shard_id, shard_key),
+        CollectionUpdateOperations::VectorOperation(_)
+        | CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(_))
+        | CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsConditional(_))
+        | CollectionUpdateOperations::PointOperation(PointOperations::DeletePoints { .. })
+        | CollectionUpdateOperations::PointOperation(PointOperations::DeletePointsByFilter(_))
+        | CollectionUpdateOperations::PayloadOperation(_) => {
+            get_shard_selector_for_update(shard_id, shard_key)
+        }
+        #[cfg(feature = "staging")]
+        CollectionUpdateOperations::StagingOperation(_) => {
+            get_shard_selector_for_update(shard_id, shard_key)
+        }
     };
 
     toc.update(
         collection_name,
         OperationWithClockTag::new(operation, clock_tag),
         wait,
-        params.timeout,
+        timeout,
         ordering,
         shard_selector,
         auth,

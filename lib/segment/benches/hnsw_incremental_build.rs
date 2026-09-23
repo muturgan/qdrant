@@ -1,3 +1,8 @@
+#![expect(clippy::wildcard_enum_match_arm, reason = "benchmarks")]
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -6,10 +11,10 @@ use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
 use clap::Parser;
+use common::bench_cache::{cache_path, cached_json};
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::{FeatureFlags, feature_flags, init_feature_flags};
-use common::fs::{atomic_save_json, read_json};
 use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
 use fs_err as fs;
@@ -17,7 +22,7 @@ use fs_err::File;
 use itertools::Itertools as _;
 use ndarray::{ArrayView2, Axis};
 use ndarray_npy::ViewNpyExt;
-use rand::rngs::StdRng;
+use rand::rngs::SmallRng;
 use rand::seq::SliceRandom as _;
 use rand::{Rng, SeedableRng as _};
 use rayon::iter::{
@@ -28,12 +33,12 @@ use segment::common::operation_error::OperationResult;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, QueryVector, VectorElementType, VectorInternal, only_default_vector,
 };
-use segment::entry::{NonAppendableSegmentEntry as _, SegmentEntry as _};
+use segment::entry::{SegmentEntry as _, StorageSegmentEntry as _};
 use segment::fixtures::index_fixtures::random_vector;
-use segment::id_tracker::IdTrackerSS;
+use segment::id_tracker::{IdTrackerEnum, IdTrackerRead};
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{VectorIndex as _, VectorIndexEnum};
+use segment::index::{VectorIndexEnum, VectorIndexRead as _};
 use segment::segment::Segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
@@ -145,17 +150,12 @@ fn main() {
     let args = Args::parse();
     log::info!("args={args:?}");
 
-    let mut main_rng = StdRng::seed_from_u64(args.random_seed);
+    let mut main_rng = SmallRng::seed_from_u64(args.random_seed);
 
     let tmp_dir = Builder::new()
         .prefix("hnsw_incremental_build")
         .tempdir()
         .unwrap();
-
-    let cache_path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(env!("CARGO_PKG_NAME"))
-        .join(env!("CARGO_CRATE_NAME"));
-    fs::create_dir_all(&cache_path).unwrap();
 
     // Load the dataset or generate random vectors.
     let (dataset_mmap, dataset);
@@ -185,7 +185,7 @@ fn main() {
                     .collect_vec();
 
                 // Shuffle the dataset to avoid bias.
-                slices_vec.shuffle(&mut StdRng::from_rng(&mut main_rng));
+                slices_vec.shuffle(&mut SmallRng::from_rng(&mut main_rng));
 
                 // Last `arg_queries` vectors from the dataset are used as query vectors.
                 let query_vectors = slices_vec
@@ -198,13 +198,13 @@ fn main() {
             }
             // Generate random vectors.
             (Some(dimensions), None) => {
-                let mut rng = StdRng::from_rng(&mut main_rng);
+                let mut rng = SmallRng::from_rng(&mut main_rng);
                 let query_vectors = std::iter::repeat_with(|| random_vector(&mut rng, dimensions))
                     .take(args.queries)
                     .map(QueryVector::from)
                     .collect_vec();
 
-                let mut rng = StdRng::from_rng(&mut main_rng);
+                let mut rng = SmallRng::from_rng(&mut main_rng);
                 vectors_mem = std::iter::repeat_with(|| random_vector(&mut rng, dimensions))
                     .take(args.init_vectors + args.to_add * args.iterations)
                     .collect_vec();
@@ -224,7 +224,7 @@ fn main() {
 
     // Build initial segment and index it non-incrementally.
     let mut sliding_window = 0..args.init_vectors;
-    let mut rng = StdRng::from_rng(&mut main_rng);
+    let mut rng = SmallRng::from_rng(&mut main_rng);
     let mut last_segment = make_segment(
         &mut rng,
         tmp_dir.path(),
@@ -233,13 +233,13 @@ fn main() {
         args.distance,
     );
     let initial_index_path = if args.cache {
-        cache_path.join(format!(
+        cache_path!(
             "initial-{dataset_hash}-{m}-{ef_construct}-{distance:?}",
             dataset_hash = dataset_hash(vectors[sliding_window.clone()].iter().copied()),
             m = args.m,
             ef_construct = args.ef_construct,
             distance = args.distance,
-        ))
+        )
     } else {
         last_segment.data_path().join("hnsw_bench")
     };
@@ -276,10 +276,10 @@ fn main() {
             && (iteration % args.accuracy_check_period == 0 || iteration == args.iterations - 1)
         {
             let top = 10;
-            let exact_cache_path = cache_path.join(format!(
+            let exact_cache_path = cache_path!(
                 "exact-{queries_hash}-{}-{top}",
                 dataset_hash(sliding_window.clone().map(|i| vectors[i % vectors.len()])),
-            ));
+            );
             let accuracy = measure_accuracy(
                 &exact_cache_path,
                 &segment,
@@ -309,7 +309,7 @@ fn main() {
 }
 
 fn make_segment(
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     path: &Path,
     all_vectors: &[&[VectorElementType]],
     sliding_window: std::ops::Range<usize>,
@@ -354,7 +354,11 @@ fn dataset_hash<'a>(
         hasher.update(vector.as_bytes());
     }
 
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn build_hnsw_index<R: Rng + ?Sized>(
@@ -366,6 +370,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
     ef_construct: usize,
 ) -> HNSWIndex {
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold: 1,
@@ -394,7 +399,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
         return HNSWIndex::open(open_args).unwrap();
     }
 
-    let permit_cpu_count = num_rayon_threads(open_args.hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(open_args.hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     HNSWIndex::build(
@@ -424,24 +429,18 @@ fn measure_accuracy(
     let id_tracker = segment.id_tracker.borrow();
 
     // Exact search (aka full scan) is slow, so we cache the results.
-    let exact_search_results;
-    if exact_cache_path.exists() {
-        exact_search_results = read_json(exact_cache_path).unwrap()
-    } else {
-        let start = std::time::Instant::now();
-        exact_search_results = query_vectors
+    let exact_search_results: Vec<_> = cached_json(exact_cache_path, || {
+        query_vectors
             .par_iter()
             .map(|query| {
                 segment.vector_data[DEFAULT_VECTOR_NAME]
                     .vector_index
                     .borrow()
                     .search(&[query], None, top, None, &Default::default())
-                    .pipe(|results| process_search_results(&*id_tracker, results))
+                    .pipe(|results| process_search_results(&id_tracker, results))
             })
-            .collect::<Vec<_>>();
-        log::debug!("Exact search time = {:?}", start.elapsed());
-        atomic_save_json(exact_cache_path, &exact_search_results).unwrap();
-    }
+            .collect::<Vec<_>>()
+    });
 
     let sames: usize = query_vectors
         .par_iter()
@@ -458,7 +457,7 @@ fn measure_accuracy(
                     }),
                     &Default::default(),
                 )
-                .pipe(|results| process_search_results(&*id_tracker, results));
+                .pipe(|results| process_search_results(&id_tracker, results));
 
             // Get number of same results.
             index_result
@@ -472,7 +471,7 @@ fn measure_accuracy(
 }
 
 fn process_search_results(
-    id_tracker: &IdTrackerSS,
+    id_tracker: &IdTrackerEnum,
     results: OperationResult<Vec<Vec<ScoredPointOffset>>>,
 ) -> Vec<ExtendedPointId> {
     // Expect exactly one result

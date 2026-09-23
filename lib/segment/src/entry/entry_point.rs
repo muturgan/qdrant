@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use ahash::AHashMap;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::TelemetryDetail;
+use common::types::{DeferredBehavior, TelemetryDetail};
 use uuid::Uuid;
 
 use crate::common::Flusher;
@@ -15,7 +15,8 @@ use crate::data_types::facets::{FacetParams, FacetValue};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::order_by::{OrderBy, OrderValue};
 use crate::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
-use crate::data_types::segment_record::SegmentRecord;
+use crate::data_types::segment_record::{SegmentRecord, SegmentRecordRaw};
+use crate::data_types::vector_name_config::VectorNameConfig;
 use crate::data_types::vectors::{QueryVector, VectorInternal};
 use crate::entry::snapshot_entry::SnapshotEntry;
 use crate::index::field_index::{CardinalityEstimation, FieldIndex};
@@ -27,17 +28,11 @@ use crate::types::{
     VectorName, VectorNameBuf, WithPayload, WithVector,
 };
 
-/// Define all operations which can be performed with non-appendable Segment or Segment-like entity.
+/// Define all operations on segment that do not require mutable access.
 ///
 /// Assume all operations are idempotent - which means that no matter how many times an operation
 /// is executed - the storage state will be the same.
-pub trait NonAppendableSegmentEntry: SnapshotEntry {
-    /// Get current update version of the segment
-    fn version(&self) -> SeqNumberType;
-
-    /// Get current persistent version of the segment
-    fn persistent_version(&self) -> SeqNumberType;
-
+pub trait ReadSegmentEntry {
     fn is_proxy(&self) -> bool;
 
     /// Get version of specified point
@@ -74,6 +69,18 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<VectorInternal>>;
 
+    /// Like [`ReadSegmentEntry::vector`], but with explicit deferred semantics.
+    ///
+    /// With [`DeferredBehavior::WithDeferred`] this resolves the latest head of
+    /// the point, including a deferred head that is invisible to ordinary reads.
+    fn vector_with_behavior(
+        &self,
+        vector_name: &VectorName,
+        point_id: PointIdType,
+        deferred_behavior: DeferredBehavior,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<VectorInternal>>;
+
     fn all_vectors(
         &self,
         point_id: PointIdType,
@@ -92,7 +99,23 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         with_vector: &WithVector,
         hw_counter: &HardwareCounterCell,
         is_stopped: &AtomicBool,
+        deferred_behavior: DeferredBehavior,
     ) -> OperationResult<AHashMap<ExtendedPointId, SegmentRecord>>;
+
+    /// Byte-blob analogue of [`ReadSegmentEntry::retrieve`]: returns vectors and
+    /// payload as stored ([`SegmentRecordRaw`]), to avoid a lossy round-trip and
+    /// a needless parse when relocating points (copy-on-write moves, shard
+    /// transfer). A caller that needs the parsed payload decodes it itself.
+    ///
+    /// Like `retrieve`, may return fewer records than requested and in any order.
+    fn retrieve_raw(
+        &self,
+        point_ids: &[PointIdType],
+        with_vector: &WithVector,
+        hw_counter: &HardwareCounterCell,
+        is_stopped: &AtomicBool,
+        deferred_behavior: DeferredBehavior,
+    ) -> OperationResult<AHashMap<ExtendedPointId, SegmentRecordRaw>>;
 
     /// Retrieve payload for the point
     /// If not found, return empty payload
@@ -101,9 +124,6 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         point_id: PointIdType,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Payload>;
-
-    /// Iterator over all points in segment in ascending order.
-    fn iter_points(&self) -> Box<dyn Iterator<Item = PointIdType> + '_>;
 
     /// Paginate over points which satisfies filtering condition starting with `offset` id including.
     ///
@@ -115,7 +135,8 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
         hw_counter: &HardwareCounterCell,
-    ) -> Vec<PointIdType>;
+        deferred_behavior: DeferredBehavior,
+    ) -> OperationResult<Vec<PointIdType>>;
 
     /// Return points which satisfies filtering condition ordered by the `order_by.key` field,
     /// starting with `order_by.start_from` value including.
@@ -129,6 +150,7 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         order_by: &'a OrderBy,
         is_stopped: &AtomicBool,
         hw_counter: &HardwareCounterCell,
+        deferred_behavior: DeferredBehavior,
     ) -> OperationResult<Vec<(OrderValue, PointIdType)>>;
 
     /// Return random points which satisfies filtering condition.
@@ -140,7 +162,7 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
         hw_counter: &HardwareCounterCell,
-    ) -> Vec<PointIdType>;
+    ) -> OperationResult<Vec<PointIdType>>;
 
     /// Read points in [from; to) range
     fn read_range(&self, from: Option<PointIdType>, to: Option<PointIdType>) -> Vec<PointIdType>;
@@ -164,17 +186,19 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
 
     /// Check if there is point with `point_id` in this segment.
     ///
-    /// Soft deleted points are excluded.
-    fn has_point(&self, point_id: PointIdType) -> bool;
+    /// Soft deleted points are excluded. `deferred_behavior` selects whether a
+    /// deferred-only point counts as present.
+    fn has_point(&self, point_id: PointIdType, deferred_behavior: DeferredBehavior) -> bool;
 
     /// Estimate available point count in this segment for given filter.
     fn estimate_point_count<'a>(
         &'a self,
         filter: Option<&'a Filter>,
         hw_counter: &HardwareCounterCell,
-    ) -> CardinalityEstimation;
+    ) -> OperationResult<CardinalityEstimation>;
 
-    fn vector_names(&self) -> HashSet<VectorNameBuf>;
+    /// Names of all vectors in this segment, sorted.
+    fn vector_names(&self) -> Vec<VectorNameBuf>;
 
     /// Whether this segment is completely empty in terms of points
     ///
@@ -188,10 +212,14 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
     /// Number of available points
     ///
     /// - excludes soft deleted points
+    /// - includes deferred points.
     fn available_point_count(&self) -> usize;
 
     /// Number of deleted points
     fn deleted_point_count(&self) -> usize;
+
+    /// Similar to `available_point_count()` but excludes all deferred points.
+    fn available_point_count_without_deferred(&self) -> usize;
 
     /// Size of all available vectors in storage
     fn available_vectors_size_in_bytes(&self, vector_name: &VectorName) -> OperationResult<usize>;
@@ -213,7 +241,7 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
     fn segment_type(&self) -> SegmentType;
 
     /// Get current stats of the segment
-    fn info(&self) -> SegmentInfo;
+    fn info(&self) -> OperationResult<SegmentInfo>;
 
     /// Get size related stats of the segment.
     /// This returns `SegmentInfo` with some non size-related data (like `schema`) unset to improve performance.
@@ -227,6 +255,44 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
     /// Returns appendable state of outer most segment. If this is a proxy segment, this shadows
     /// the appendable state of the wrapped segment.
     fn is_appendable(&self) -> bool;
+
+    /// Get indexed fields
+    fn get_indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
+
+    // Get collected telemetry data of segment
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> OperationResult<SegmentTelemetry>;
+
+    fn fill_query_context(&self, query_context: &mut QueryContext) -> OperationResult<()>;
+
+    /// Check whether the point is marked as deferred in the segment
+    fn point_is_deferred(&self, point_id: PointIdType) -> bool;
+
+    /// Returns external IDs of all deferred points in the segment
+    fn deferred_point_ids(&self) -> Vec<PointIdType>;
+
+    /// Returns the amount of non-deleted deferred points.
+    ///
+    /// Note: This value can return `0` with `has_deferred_points()` returning `true`.
+    /// This is because this function returns the *non-deleted* deferred points.
+    fn deferred_point_count(&self) -> usize;
+
+    /// Returns `true` if there is at least one point that is hidden (deferred).
+    /// Non-appendable segments always return `false` as they can't have deferred points.
+    ///
+    /// Note: the deferred point can be deleted and this function would still return `true`.
+    fn has_deferred_points(&self) -> bool;
+}
+
+/// Segment with storage.
+pub trait StorageSegmentEntry: ReadSegmentEntry + SnapshotEntry {
+    /// Get current update version of the segment
+    fn version(&self) -> SeqNumberType;
+
+    /// Checks if segment errored during last operations
+    fn check_error(&self) -> Option<SegmentFailedState>;
+
+    /// Get current persistent version of the segment
+    fn persistent_version(&self) -> SeqNumberType;
 
     /// Returns a function, which when called, will flush all pending changes to disk.
     /// If there are currently no changes to flush, returns None.
@@ -247,6 +313,19 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
 
     /// Path to data, owned by segment
     fn data_path(&self) -> PathBuf;
+}
+
+/// Define all operations which can be performed with non-appendable Segment or Segment-like entity.
+///
+/// Assume all operations are idempotent - which means that no matter how many times an operation
+/// is executed - the storage state will be the same.
+pub trait NonAppendableSegmentEntry: StorageSegmentEntry {
+    fn delete_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
 
     /// Delete field index, if exists
     fn delete_field_index(
@@ -320,23 +399,26 @@ pub trait NonAppendableSegmentEntry: SnapshotEntry {
         self.apply_field_index(op_num, key.to_owned(), schema, indexes)
     }
 
-    fn delete_point(
+    /// Create a new named vector in the segment.
+    /// For appendable segments: creates a real, writable vector storage + plain index.
+    /// For immutable segments: creates a placeholder (empty) vector storage.
+    /// Returns Ok(false) if the vector already exists (idempotent).
+    fn create_vector_name(
         &mut self,
         op_num: SeqNumberType,
-        point_id: PointIdType,
-        hw_counter: &HardwareCounterCell,
+        vector_name: &VectorName,
+        vector_config: &VectorNameConfig,
     ) -> OperationResult<bool>;
 
-    /// Get indexed fields
-    fn get_indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
-
-    /// Checks if segment errored during last operations
-    fn check_error(&self) -> Option<SegmentFailedState>;
-
-    // Get collected telemetry data of segment
-    fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;
-
-    fn fill_query_context(&self, query_context: &mut QueryContext);
+    /// Delete a named vector from the segment.
+    /// Removes vector storage, index, and quantization data.
+    /// Removes the vector from segment config.
+    /// Returns Ok(false) if the vector does not exist (idempotent).
+    fn delete_vector_name(
+        &mut self,
+        op_num: SeqNumberType,
+        vector_name: &VectorName,
+    ) -> OperationResult<bool>;
 }
 
 /// Define mutable operations which can be performed with Segment or Segment-like entity.
@@ -349,6 +431,44 @@ pub trait SegmentEntry: NonAppendableSegmentEntry {
         op_num: SeqNumberType,
         point_id: PointIdType,
         vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    /// Byte-blob analogue of [`SegmentEntry::upsert_point`]: vector values are
+    /// storage-native bytes in the exact form returned by
+    /// [`ReadSegmentEntry::retrieve_raw`], so requantized (e.g. TurboQuant)
+    /// vectors relocate without a lossy decode/re-encode round-trip.
+    ///
+    /// The bytes carry no encoding/version tag: the target segment must have
+    /// the same vector configuration (kind, datatype, dim) as the source. The
+    /// bytes are inserted as-is, without preprocessing — they were already
+    /// preprocessed (e.g. cosine-normalized) when first ingested.
+    fn upsert_point_raw(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        vectors: &[(VectorNameBuf, Vec<u8>)],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<bool>;
+
+    /// Upsert a complete point in a single operation: storage-native raw
+    /// vectors (the [`ReadSegmentEntry::retrieve_raw`] form, same contract as
+    /// [`SegmentEntry::upsert_point_raw`]), decoded vectors overriding them
+    /// name-by-name, and the full payload. Named vectors present in neither
+    /// list are deleted.
+    ///
+    /// This is the copy-on-write move primitive: it is equivalent to
+    /// `upsert_point_raw` + `update_vectors` + `set_full_payload`, but writes
+    /// the point once. On append-only segments each of those steps clones the
+    /// whole point to a fresh internal id, so issuing them separately turns
+    /// one moved point into a chain of immediately-dead slots.
+    fn upsert_moved_point(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        raw_vectors: &[(VectorNameBuf, Vec<u8>)],
+        updated_vectors: NamedVectors,
+        payload: &Payload,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 

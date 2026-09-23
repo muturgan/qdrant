@@ -3,10 +3,9 @@ use std::collections::HashMap;
 use segment::common::BYTES_IN_KB;
 use segment::types::VectorNameBuf;
 use shard::locked_segment::LockedSegment;
-use shard::segment_holder::SegmentHolder;
+use shard::optimizers::config::DEFAULT_INDEXING_THRESHOLD_KB;
 
 use crate::config::CollectionConfigInternal;
-use crate::optimizers_builder::DEFAULT_INDEXING_THRESHOLD_KB;
 
 /// Returns the number of vectors which will be excluded from requests with `indexed_only` enabled.
 /// Note: For vectors names without any excluded vectors, we return `0` instead of skipping them in the output.
@@ -40,7 +39,7 @@ pub fn get_index_only_excluded_vectors(
                 .filter_map(move |vector_name| {
                     let segment_config = segment_guard.config().vector_data.get(&vector_name)?;
 
-                    let points = segment_guard.available_point_count();
+                    let points = segment_guard.available_point_count_without_deferred();
 
                     // Skip segments that have an index.
                     if segment_config.index.is_indexed() {
@@ -73,38 +72,4 @@ pub fn get_index_only_excluded_vectors(
         });
 
     index_only_excluded
-}
-
-/// Finds the size in bytes of the largest unindexed segment.
-/// Returns size of the largest vector in this segment.
-/// Returns `None` if there are no unindexed segments or if there are no vectors configured.
-pub fn get_largest_unindexed_segment_vector_size(segment_holder: &SegmentHolder) -> Option<usize> {
-    segment_holder
-        .iter()
-        .filter_map(|(_, segment)| {
-            let segment_guard = segment.get().read();
-
-            // Collect sizes of unindexed vectors in this segment.
-            segment_guard
-                .vector_names()
-                .into_iter()
-                .filter_map(|vector_name| {
-                    let segment_config = segment_guard.config().vector_data.get(&vector_name)?;
-
-                    // Skip segments that have an index.
-                    if segment_config.index.is_indexed() {
-                        return None;
-                    }
-
-                    match segment_guard.available_vectors_size_in_bytes(&vector_name) {
-                        Ok(sz) => Some(sz),
-                        Err(err) => {
-                            log::error!("Failed to get vector size from segment: {err:?}");
-                            None
-                        }
-                    }
-                })
-                .max()
-        })
-        .max()
 }

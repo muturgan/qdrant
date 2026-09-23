@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write as _};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -5,28 +9,29 @@ use std::path::Path;
 
 use atomicwrites::AtomicFile;
 use atomicwrites::OverwriteBehavior::AllowOverwrite;
+use common::types::PointOffsetType;
 use fs_err::File;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, Payload, PayloadStorageType, QuantizationConfig, SegmentConfig,
-    SparseVectorDataConfig, StrictModeConfig, VectorDataConfig, VectorName, VectorNameBuf,
-    VectorStorageDatatype, VectorStorageType,
+    Distance, HnswConfig, Indexes, Memory, Payload, PayloadStorageType, QuantizationConfig,
+    SegmentConfig, SparseVectorDataConfig, StrictModeConfig, VectorDataConfig, VectorName,
+    VectorNameBuf, VectorStorageDatatype, VectorStorageType,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 use wal::WalOptions;
 
 use crate::operations::config_diff::{DiffConfig, QuantizationConfigDiff};
 use crate::operations::types::{
-    CollectionError, CollectionResult, CollectionWarning, SparseVectorParams, SparseVectorsConfig,
-    VectorParams, VectorParamsDiff, VectorsConfig, VectorsConfigDiff,
+    CollectionError, CollectionResult, CollectionWarning, Datatype, SparseVectorParams,
+    SparseVectorsConfig, VectorParams, VectorParamsDiff, VectorsConfig, VectorsConfigDiff,
 };
 use crate::operations::validation;
-use crate::optimizers_builder::OptimizersConfig;
+use crate::optimizers_builder::{OptimizersConfig, build_segment_optimizer_config};
 
 pub const COLLECTION_CONFIG_FILE: &str = "config.json";
 
@@ -124,42 +129,112 @@ pub struct CollectionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[anonymize(false)]
     pub read_fan_out_delay_ms: Option<u64>,
+    /// Deprecated: use `payload.memory` instead.
     /// If true - point's payload will not be stored in memory.
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
     /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
     ///
     /// Default: true
-    #[serde(default = "default_on_disk_payload")]
-    pub on_disk_payload: bool,
+    #[serde(default = "default_on_disk_payload_opt")]
+    #[deprecated(since = "1.19.0", note = "Use `payload.memory` instead")]
+    pub on_disk_payload: Option<bool>,
+    /// Configuration of the payload storage
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub payload: Option<PayloadStorageParams>,
     /// Configuration of the sparse vector storage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
 }
 
+/// Params of the payload storage
+#[derive(
+    Debug,
+    Default,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    Validate,
+    Anonymize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+)]
+#[serde(rename_all = "snake_case")]
+#[anonymize(false)]
+pub struct PayloadStorageParams {
+    /// Memory placement of the payload storage. Overrides the deprecated `on_disk_payload` flag
+    /// if both are set. `pinned` is not supported for payload storage.
+    /// Default: `cold` (`cached` if `on_disk_payload` is set to false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_payload_storage_memory"))]
+    pub memory: Option<Memory>,
+}
+
+impl PayloadStorageParams {
+    /// Update this config with fields from `diff`; fields specified in `diff` win.
+    pub fn update(&self, diff: &PayloadStorageParams) -> Self {
+        let PayloadStorageParams { memory } = diff;
+        PayloadStorageParams {
+            memory: memory.or(self.memory),
+        }
+    }
+}
+
+/// Reject memory placements not supported by payload storage.
+/// `validator` unwraps `Option<Memory>` before calling, so we receive `&Memory`.
+fn validate_payload_storage_memory(memory: &Memory) -> Result<(), ValidationError> {
+    match memory {
+        Memory::Cold | Memory::Cached => Ok(()),
+        Memory::Pinned => {
+            let mut error = ValidationError::new("unsupported_memory_placement");
+            error.message = Some(std::borrow::Cow::from(
+                "`pinned` memory placement is not supported for payload storage",
+            ));
+            Err(error)
+        }
+    }
+}
+
 impl CollectionParams {
     pub fn payload_storage_type(&self) -> PayloadStorageType {
-        #[cfg(feature = "rocksdb")]
-        if self.on_disk_payload {
-            PayloadStorageType::Mmap
-        } else if common::flags::feature_flags().payload_storage_skip_rocksdb {
-            PayloadStorageType::InRamMmap
-        } else {
-            PayloadStorageType::InMemory
-        }
+        PayloadStorageType::from_memory(self.payload_memory_placement())
+    }
 
-        #[cfg(not(feature = "rocksdb"))]
-        if self.on_disk_payload {
-            PayloadStorageType::Mmap
-        } else {
-            PayloadStorageType::InRamMmap
-        }
+    /// Effective memory placement of the payload storage, resolving the new `payload.memory`
+    /// parameter against the deprecated `on_disk_payload` flag.
+    ///
+    /// No conflict warning is logged here: `on_disk_payload` is always populated with its default,
+    /// so an explicitly configured `payload.memory` would always "conflict" with it.
+    pub fn payload_memory_placement(&self) -> Memory {
+        let memory = self.payload.and_then(|payload| payload.memory);
+        Memory::resolve(memory, self.on_disk_payload.map(Memory::from_on_disk))
+            .unwrap_or(Memory::Cold)
+    }
+
+    /// All vector names (dense and sparse) currently present in the collection schema.
+    ///
+    /// Covers both kinds because a segment's `vector_data` holds dense and sparse vectors
+    /// together; callers validating segment data against the schema (WAL-recovery name
+    /// stripping, the optimizer's live-schema read) need the full set. A dense-only set would
+    /// make a sparse vector look deleted.
+    pub fn vector_names(&self) -> HashSet<VectorNameBuf> {
+        let dense = self.vectors.params_iter().map(|(name, _)| name.to_owned());
+        let sparse = self
+            .sparse_vectors
+            .iter()
+            .flatten()
+            .map(|(name, _)| name.to_owned());
+        dense.chain(sparse).collect()
     }
 
     pub fn check_compatible(&self, other: &CollectionParams) -> CollectionResult<()> {
         let CollectionParams {
-            vectors,
+            vectors: _,                  // May be changed
             shard_number: _, // Maybe be updated by resharding, assume local shards needs to be dropped
             sharding_method, // Not changeable
             replication_factor: _, // May be changed
@@ -167,30 +242,9 @@ impl CollectionParams {
             read_fan_out_factor: _, // May be changed
             read_fan_out_delay_ms: _, // May be changed,
             on_disk_payload: _, // May be changed
-            sparse_vectors,  // Parameters may be changes, but not the structure
+            payload: _,      // May be changed
+            sparse_vectors: _, // Sets may differ via named vector CRUD
         } = other;
-
-        self.vectors.check_compatible(vectors)?;
-
-        let this_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = &self.sparse_vectors {
-            sparse_vectors.keys().collect()
-        } else {
-            HashSet::new()
-        };
-
-        let other_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = sparse_vectors {
-            sparse_vectors.keys().collect()
-        } else {
-            HashSet::new()
-        };
-
-        if this_sparse_vectors != other_sparse_vectors {
-            return Err(CollectionError::bad_input(format!(
-                "sparse vectors are incompatible: \
-                 origin sparse vectors: {this_sparse_vectors:?}, \
-                 while other sparse vectors: {other_sparse_vectors:?}",
-            )));
-        }
 
         let this_sharding_method = self.sharding_method.unwrap_or_default();
         let other_sharding_method = sharding_method.unwrap_or_default();
@@ -204,6 +258,50 @@ impl CollectionParams {
         }
 
         Ok(())
+    }
+
+    pub fn get_deferred_point_id(
+        &self,
+        hnsw_config: &HnswConfig,
+        deferred_point_threshold_bytes: Option<NonZeroUsize>,
+    ) -> Option<PointOffsetType> {
+        let threshold_bytes = deferred_point_threshold_bytes?.get();
+
+        // Because we cannot predict multivector size,
+        // define here a constant-size inner vectors count for multivector.
+        const MULTIVECTOR_SIZE: usize = 16;
+
+        self.vectors
+            .params_iter()
+            // Skip vectors without HNSW indexing
+            .filter_map(|(_name, params)| {
+                // Merge HNSW config with vector config to get effective HNSW config for the vector.
+                let effective_hnsw = hnsw_config.update_opt(params.hnsw_config.as_ref());
+                (effective_hnsw.m > 0 || effective_hnsw.payload_m.unwrap_or_default() > 0)
+                    .then_some(params)
+            })
+            .map(|params| {
+                let element_bytes = match params.datatype {
+                    Some(Datatype::Float16) => 2,
+                    Some(Datatype::Uint8) => 1,
+                    // Placeholder: Turbo4 is ~0.5 byte/dim + per-row scale.
+                    // Mirroring Uint8 (1 byte) until accurate accounting is implemented.
+                    Some(Datatype::Turbo4) => 1,
+                    Some(Datatype::Float32) | None => 4,
+                };
+
+                let dim = params.size.get() as usize;
+
+                let vector_bytes = if params.multivector_config.is_some() {
+                    element_bytes * dim * MULTIVECTOR_SIZE
+                } else {
+                    element_bytes * dim
+                };
+
+                let deferred_from = threshold_bytes.div_ceil(vector_bytes);
+                PointOffsetType::try_from(deferred_from).unwrap_or(PointOffsetType::MAX)
+            })
+            .min()
     }
 }
 
@@ -221,6 +319,14 @@ pub fn default_write_consistency_factor() -> NonZeroU32 {
 
 pub const fn default_on_disk_payload() -> bool {
     true
+}
+
+/// Default for the deprecated [`CollectionParams::on_disk_payload`] field.
+///
+/// The field is optional purely so that schema-generated clients keep working once it is removed
+/// from the API. Qdrant itself always fills it in, so it never reaches a client as `null`.
+pub const fn default_on_disk_payload_opt() -> Option<bool> {
+    Some(default_on_disk_payload())
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
@@ -249,6 +355,15 @@ pub struct CollectionConfigInternal {
 }
 
 impl CollectionConfigInternal {
+    /// Returns `true` if any named dense vector uses a TurboQuant (`Turbo4`)
+    /// storage datatype.
+    ///
+    /// Used to decide whether shard transfer should ship storage-native (raw)
+    /// vector bytes instead of decoded floats, avoiding a lossy TQ round-trip.
+    pub fn has_turbo_vector_storage(&self) -> bool {
+        self.params.has_turbo_vector_storage()
+    }
+
     pub fn to_bytes(&self) -> CollectionResult<Vec<u8>> {
         serde_json::to_vec(self).map_err(|err| CollectionError::service_error(err.to_string()))
     }
@@ -285,45 +400,38 @@ impl CollectionConfigInternal {
 
     /// Get warnings related to this configuration
     pub fn get_warnings(&self) -> Vec<CollectionWarning> {
-        let mut warnings = Vec::new();
-
-        for (vector_name, vector_config) in self.params.vectors.params_iter() {
-            let vector_hnsw = self
-                .hnsw_config
-                .update_opt(vector_config.hnsw_config.as_ref());
-
-            let vector_quantization =
-                vector_config.quantization_config.is_some() || self.quantization_config.is_some();
-
-            if vector_hnsw.inline_storage.unwrap_or_default() {
-                if vector_config.multivector_config.is_some() {
-                    warnings.push(CollectionWarning {
-                        message: format!(
-                            "The `hnsw_config.inline_storage` option for vector '{vector_name}' \
-                             is not compatible with multivectors. This option will be ignored."
-                        ),
-                    });
-                } else if !vector_quantization {
-                    warnings.push(CollectionWarning {
-                        message: format!(
-                            "The `hnsw_config.inline_storage` option for vector '{vector_name}' \
-                             requires quantization to be enabled. This option will be ignored."
-                        ),
-                    });
-                }
-            }
-        }
-
-        warnings
+        build_segment_optimizer_config(&self.params, &self.hnsw_config, &self.quantization_config)
+            .dense_vectors
+            .iter()
+            .filter_map(|(vector_name, vector_config)| {
+                let message = vector_config.indexed().check_inline_vectors().err()?;
+                Some(CollectionWarning {
+                    message: format!("Vector '{vector_name}': {message}"),
+                })
+            })
+            .collect()
     }
 
-    pub fn to_base_segment_config(&self) -> CollectionResult<SegmentConfig> {
+    pub fn to_base_segment_config(&self) -> SegmentConfig {
         self.params
             .to_base_segment_config(self.quantization_config.as_ref())
     }
 }
 
 impl CollectionParams {
+    /// Returns `true` if any named dense vector uses a TurboQuant (`Turbo4`)
+    /// storage datatype.
+    ///
+    /// Its primary vector storage keeps TurboQuant-encoded codes in-place, so
+    /// reading storage-native bytes yields those codes. Relocating them verbatim
+    /// (raw shard transfer) avoids a lossy decode→encode round-trip that would
+    /// otherwise drift the encoding.
+    pub fn has_turbo_vector_storage(&self) -> bool {
+        self.vectors
+            .params_iter()
+            .any(|(_, params)| matches!(params.datatype, Some(Datatype::Turbo4)))
+    }
+
     pub fn empty() -> Self {
         CollectionParams {
             vectors: Default::default(),
@@ -333,7 +441,8 @@ impl CollectionParams {
             write_consistency_factor: default_write_consistency_factor(),
             read_fan_out_factor: None,
             read_fan_out_delay_ms: None,
-            on_disk_payload: default_on_disk_payload(),
+            payload: None,
+            on_disk_payload: default_on_disk_payload_opt(),
             sparse_vectors: None,
         }
     }
@@ -359,30 +468,22 @@ impl CollectionParams {
         }
 
         if available_names.is_empty() {
-            CollectionError::BadInput {
-                description: "Vectors are not configured in this collection".into(),
-            }
+            CollectionError::bad_input("Vectors are not configured in this collection")
         } else if available_names == vec![DEFAULT_VECTOR_NAME] {
-            CollectionError::BadInput {
-                description: format!(
-                    "Vector with name {vector_name} is not configured in this collection"
-                ),
-            }
+            CollectionError::bad_input(format!(
+                "Vector with name {vector_name} is not configured in this collection"
+            ))
         } else {
             let available_names = available_names.join(", ");
             if vector_name == DEFAULT_VECTOR_NAME {
-                return CollectionError::BadInput {
-                    description: format!(
-                        "Collection requires specified vector name in the request, available names: {available_names}"
-                    ),
-                };
+                return CollectionError::bad_input(format!(
+                    "Collection requires specified vector name in the request, available names: {available_names}"
+                ));
             }
 
-            CollectionError::BadInput {
-                description: format!(
-                    "Vector with name `{vector_name}` is not configured in this collection, available names: {available_names}"
-                ),
-            }
+            CollectionError::bad_input(format!(
+                "Vector with name `{vector_name}` is not configured in this collection, available names: {available_names}"
+            ))
         }
     }
 
@@ -421,15 +522,13 @@ impl CollectionParams {
         &mut self,
         vector_name: &VectorName,
     ) -> CollectionResult<&mut VectorParams> {
-        self.vectors
-            .get_params_mut(vector_name)
-            .ok_or_else(|| CollectionError::BadInput {
-                description: if vector_name == DEFAULT_VECTOR_NAME {
-                    "Default vector params are not specified in config".into()
-                } else {
-                    format!("Vector params for {vector_name} are not specified in config")
-                },
+        self.vectors.get_params_mut(vector_name).ok_or_else(|| {
+            CollectionError::bad_input(if vector_name == DEFAULT_VECTOR_NAME {
+                "Default vector params are not specified in config".into()
+            } else {
+                format!("Vector params for {vector_name} are not specified in config")
             })
+        })
     }
 
     pub fn get_sparse_vector_params_opt(
@@ -447,16 +546,16 @@ impl CollectionParams {
     ) -> CollectionResult<&mut SparseVectorParams> {
         self.sparse_vectors
             .as_mut()
-            .ok_or_else(|| CollectionError::BadInput {
-                description: format!(
+            .ok_or_else(|| {
+                CollectionError::bad_input(format!(
                     "Sparse vector `{vector_name}` is not specified in collection config"
-                ),
+                ))
             })?
             .get_mut(vector_name)
-            .ok_or_else(|| CollectionError::BadInput {
-                description: format!(
+            .ok_or_else(|| {
+                CollectionError::bad_input(format!(
                     "Sparse vector `{vector_name}` is not specified in collection config"
-                ),
+                ))
             })
     }
 
@@ -471,6 +570,7 @@ impl CollectionParams {
                 hnsw_config,
                 quantization_config,
                 on_disk,
+                memory,
             } = update_params.clone();
 
             if let Some(hnsw_diff) = hnsw_config {
@@ -492,12 +592,17 @@ impl CollectionParams {
                     QuantizationConfigDiff::Binary(binary) => {
                         Some(QuantizationConfig::Binary(binary))
                     }
+                    QuantizationConfigDiff::Turbo(turbo) => Some(QuantizationConfig::Turbo(turbo)),
                     QuantizationConfigDiff::Disabled(_) => None,
                 }
             }
 
             if let Some(on_disk) = on_disk {
                 vector_params.on_disk = Some(on_disk);
+            }
+
+            if let Some(memory) = memory {
+                vector_params.memory = Some(memory);
             }
         }
         Ok(())
@@ -534,7 +639,7 @@ impl CollectionParams {
     pub fn to_base_vector_data(
         &self,
         collection_quantization: Option<&QuantizationConfig>,
-    ) -> CollectionResult<HashMap<VectorNameBuf, VectorDataConfig>> {
+    ) -> HashMap<VectorNameBuf, VectorDataConfig> {
         let quantization_fn = |quantization_config: Option<&QuantizationConfig>| {
             quantization_config
                 // Only if there is no `quantization_config` we may start using `collection_quantization` (to avoid mixing quantizations between segments)
@@ -543,48 +648,58 @@ impl CollectionParams {
                 .cloned()
         };
 
-        Ok(self
-            .vectors
+        self.vectors
             .params_iter()
             .map(|(name, params)| {
+                let VectorParams {
+                    size,
+                    distance,
+                    hnsw_config: _,
+                    quantization_config,
+                    on_disk,
+                    memory,
+                    datatype,
+                    multivector_config,
+                } = params;
+
+                let memory_placement = Memory::resolve(
+                    *memory,
+                    Some(Memory::from_on_disk(on_disk.unwrap_or_default())),
+                )
+                .unwrap_or(Memory::Cached);
+
                 (
                     name.into(),
                     VectorDataConfig {
-                        size: params.size.get() as usize,
-                        distance: params.distance,
+                        size: size.get() as usize,
+                        distance: *distance,
                         // Plain (disabled) index
                         index: Indexes::Plain {},
                         // Quantizaton config in appendable segment if runtime feature flag is set
                         quantization_config: common::flags::feature_flags()
                             .appendable_quantization
-                            .then(|| quantization_fn(params.quantization_config.as_ref()))
+                            .then(|| quantization_fn(quantization_config.as_ref()))
                             .flatten(),
                         // Default to in memory storage
-                        storage_type: if params.on_disk.unwrap_or_default() {
-                            VectorStorageType::ChunkedMmap
-                        } else {
-                            VectorStorageType::InRamChunkedMmap
-                        },
-                        multivector_config: params.multivector_config,
-                        datatype: params.datatype.map(VectorStorageDatatype::from),
+                        storage_type: VectorStorageType::appendable_from_memory(memory_placement),
+                        multivector_config: *multivector_config,
+                        datatype: datatype.map(VectorStorageDatatype::from),
                     },
                 )
             })
-            .collect())
+            .collect()
     }
 
     /// Convert into unoptimized sparse vector data configs
     ///
     /// It is the job of the segment optimizer to change this configuration with optimized settings
     /// based on threshold configurations.
-    pub fn to_sparse_vector_data(
-        &self,
-    ) -> CollectionResult<HashMap<VectorNameBuf, SparseVectorDataConfig>> {
+    pub fn to_sparse_vector_data(&self) -> HashMap<VectorNameBuf, SparseVectorDataConfig> {
         if let Some(sparse_vectors) = &self.sparse_vectors {
             sparse_vectors
                 .iter()
                 .map(|(name, params)| {
-                    Ok((
+                    (
                         name.clone(),
                         SparseVectorDataConfig {
                             index: SparseIndexConfig {
@@ -596,15 +711,16 @@ impl CollectionParams {
                                     .index
                                     .and_then(|index| index.datatype)
                                     .map(VectorStorageDatatype::from),
+                                memory: params.index.and_then(|index| index.memory),
                             },
                             storage_type: params.storage_type(),
                             modifier: params.modifier,
                         },
-                    ))
+                    )
                 })
                 .collect()
         } else {
-            Ok(Default::default())
+            Default::default()
         }
     }
 
@@ -615,29 +731,66 @@ impl CollectionParams {
     pub fn to_base_segment_config(
         &self,
         collection_quantization: Option<&QuantizationConfig>,
-    ) -> CollectionResult<SegmentConfig> {
-        let vector_data = self
-            .to_base_vector_data(collection_quantization)
-            .map_err(|err| {
-                CollectionError::service_error(format!(
-                    "Failed to source dense vector configuration from collection parameters: {err:?}"
-                ))
-            })?;
-
-        let sparse_vector_data = self.to_sparse_vector_data().map_err(|err| {
-            CollectionError::service_error(format!(
-                "Failed to source sparse vector configuration from collection parameters: {err:?}"
-            ))
-        })?;
-
+    ) -> SegmentConfig {
+        let vector_data = self.to_base_vector_data(collection_quantization);
+        let sparse_vector_data = self.to_sparse_vector_data();
         let payload_storage_type = self.payload_storage_type();
 
-        let segment_config = SegmentConfig {
+        SegmentConfig {
             vector_data,
             sparse_vector_data,
             payload_storage_type,
-        };
+        }
+    }
+}
 
-        Ok(segment_config)
+#[cfg(test)]
+mod tests {
+    use segment::types::Distance;
+
+    use super::*;
+    use crate::operations::types::{Datatype, VectorsConfig};
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+
+    fn single(datatype: Option<Datatype>) -> CollectionParams {
+        let mut builder = VectorParamsBuilder::new(4, Distance::Dot);
+        if let Some(datatype) = datatype {
+            builder = builder.with_datatype(datatype);
+        }
+        let mut params = CollectionParams::empty();
+        params.vectors = VectorsConfig::Single(builder.build());
+        params
+    }
+
+    #[test]
+    fn has_turbo_vector_storage_by_datatype() {
+        // No explicit datatype (defaults to float32).
+        assert!(!single(None).has_turbo_vector_storage());
+        // Non-turbo datatypes.
+        assert!(!single(Some(Datatype::Float32)).has_turbo_vector_storage());
+        assert!(!single(Some(Datatype::Float16)).has_turbo_vector_storage());
+        assert!(!single(Some(Datatype::Uint8)).has_turbo_vector_storage());
+        // TurboQuant storage datatype.
+        assert!(single(Some(Datatype::Turbo4)).has_turbo_vector_storage());
+    }
+
+    #[test]
+    fn has_turbo_vector_storage_multi_any() {
+        let mut vectors = BTreeMap::new();
+        vectors.insert(
+            "plain".to_string(),
+            VectorParamsBuilder::new(4, Distance::Dot).build(),
+        );
+        vectors.insert(
+            "turbo".to_string(),
+            VectorParamsBuilder::new(4, Distance::Dot)
+                .with_datatype(Datatype::Turbo4)
+                .build(),
+        );
+        let mut params = CollectionParams::empty();
+        params.vectors = VectorsConfig::Multi(vectors);
+
+        // A single Turbo4-backed named vector is enough to trigger raw transfer.
+        assert!(params.has_turbo_vector_storage());
     }
 }

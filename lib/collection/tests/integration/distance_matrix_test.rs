@@ -6,7 +6,7 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::prelude::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use tempfile::Builder;
 
@@ -31,7 +31,14 @@ async fn distance_matrix_empty() {
         using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
+        .search_points_matrix(
+            request,
+            ShardSelectorInternal::All,
+            None,
+            None,
+            None,
+            hw_acc,
+        )
         .await
         .unwrap();
 
@@ -88,7 +95,14 @@ async fn distance_matrix_anonymous_vector() {
         using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
+        .search_points_matrix(
+            request,
+            ShardSelectorInternal::All,
+            None,
+            None,
+            None,
+            hw_acc,
+        )
         .await
         .unwrap();
 

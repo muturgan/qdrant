@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -7,13 +11,13 @@ use common::flags::FeatureFlags;
 use common::progress_tracker::ProgressTracker;
 use itertools::Itertools;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::segment_constructor::VectorIndexBuildArgs;
@@ -22,12 +26,12 @@ use segment::types::{
     Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig, PayloadSchemaType,
     SearchParams, SeqNumberType,
 };
-use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
+use segment::vector_storage::query::{ContextPair, DiscoverQuery};
 use tempfile::Builder;
 
 const MAX_EXAMPLE_PAIRS: usize = 3;
 
-fn random_discovery_query<R: Rng + ?Sized>(rng: &mut R, dim: usize) -> QueryVector {
+fn random_discover_query<R: Rng + ?Sized>(rng: &mut R, dim: usize) -> QueryVector {
     let num_pairs: usize = rng.random_range(1..MAX_EXAMPLE_PAIRS);
 
     let target = random_vector(rng, dim).into();
@@ -40,7 +44,7 @@ fn random_discovery_query<R: Rng + ?Sized>(rng: &mut R, dim: usize) -> QueryVect
         })
         .collect_vec();
 
-    DiscoveryQuery::new(target, pairs).into()
+    DiscoverQuery::new(target, pairs).into()
 }
 
 fn get_random_keyword_of<R: Rng + ?Sized>(num_options: usize, rng: &mut R) -> String {
@@ -48,7 +52,7 @@ fn get_random_keyword_of<R: Rng + ?Sized>(num_options: usize, rng: &mut R) -> St
     format!("keyword_{random_number}")
 }
 
-/// Checks discovery search precision when using hnsw index, this is different from the tests in
+/// Checks discover search precision when using hnsw index, this is different from the tests in
 /// `filtrable_hnsw_test.rs` because it sets higher `m` and `ef_construct` parameters to get better precision
 #[test]
 fn hnsw_discover_precision() {
@@ -89,10 +93,11 @@ fn hnsw_discover_precision() {
     let payload_index_ptr = segment.payload_index.clone();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,
-        max_indexing_threads: 2,
+        max_indexing_threads: 1,
         on_disk: Some(false),
         payload_m: None,
         inline_storage: None,
@@ -126,12 +131,12 @@ fn hnsw_discover_precision() {
     .unwrap();
 
     let top = 3;
-    let mut discovery_hits = 0;
+    let mut discover_hits = 0;
     let attempts = 100;
     for _i in 0..attempts {
-        let query: QueryVector = random_discovery_query(&mut rng, dim);
+        let query: QueryVector = random_discover_query(&mut rng, dim);
 
-        let index_discovery_result = hnsw_index
+        let index_discover_result = hnsw_index
             .search(
                 &[&query],
                 None,
@@ -144,20 +149,20 @@ fn hnsw_discover_precision() {
             )
             .unwrap();
 
-        let plain_discovery_result = segment.vector_data[DEFAULT_VECTOR_NAME]
+        let plain_discover_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
             .search(&[&query], None, top, None, &Default::default())
             .unwrap();
 
-        if plain_discovery_result == index_discovery_result {
-            discovery_hits += 1;
+        if plain_discover_result == index_discover_result {
+            discover_hits += 1;
         }
     }
-    eprintln!("discovery_hits = {discovery_hits:#?} out of {attempts}");
+    eprintln!("discover_hits = {discover_hits:#?} out of {attempts}");
     assert!(
-        attempts - discovery_hits <= max_failures,
-        "hits: {discovery_hits} of {attempts}"
+        attempts - discover_hits <= max_failures,
+        "hits: {discover_hits} of {attempts}"
     ); // Not more than X% failures
 }
 
@@ -217,16 +222,17 @@ fn filtered_hnsw_discover_precision() {
         .unwrap();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,
-        max_indexing_threads: 2,
+        max_indexing_threads: 1,
         on_disk: Some(false),
         payload_m: None,
         inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
@@ -254,7 +260,7 @@ fn filtered_hnsw_discover_precision() {
     .unwrap();
 
     let top = 3;
-    let mut discovery_hits = 0;
+    let mut discover_hits = 0;
     let attempts = 100;
     for _i in 0..attempts {
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
@@ -264,9 +270,9 @@ fn filtered_hnsw_discover_precision() {
 
         let filter_query = Some(&filter);
 
-        let query: QueryVector = random_discovery_query(&mut rng, dim);
+        let query: QueryVector = random_discover_query(&mut rng, dim);
 
-        let index_discovery_result = hnsw_index
+        let index_discover_result = hnsw_index
             .search(
                 &[&query],
                 filter_query,
@@ -279,20 +285,20 @@ fn filtered_hnsw_discover_precision() {
             )
             .unwrap();
 
-        let plain_discovery_result = segment.vector_data[DEFAULT_VECTOR_NAME]
+        let plain_discover_result = segment.vector_data[DEFAULT_VECTOR_NAME]
             .vector_index
             .borrow()
             .search(&[&query], filter_query, top, None, &Default::default())
             .unwrap();
 
-        if plain_discovery_result == index_discovery_result {
-            discovery_hits += 1;
+        if plain_discover_result == index_discover_result {
+            discover_hits += 1;
         }
     }
 
-    eprintln!("discovery_hits = {discovery_hits:#?} out of {attempts}");
+    eprintln!("discover_hits = {discover_hits:#?} out of {attempts}");
     assert!(
-        attempts - discovery_hits <= max_failures,
-        "hits: {discovery_hits} of {attempts}"
+        attempts - discover_hits <= max_failures,
+        "hits: {discover_hits} of {attempts}"
     ); // Not more than X% failures
 }

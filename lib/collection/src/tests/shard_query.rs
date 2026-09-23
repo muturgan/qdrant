@@ -1,3 +1,4 @@
+use std::assert_matches;
 use std::sync::Arc;
 
 use common::budget::ResourceBudget;
@@ -11,12 +12,13 @@ use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::types::CollectionError;
 use crate::operations::universal_query::shard_query::{
     FusionInternal, ScoringQuery, ShardPrefetch, ShardQueryRequest,
 };
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::*;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -27,7 +29,8 @@ async fn test_shard_query_rrf_rescoring() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -41,7 +44,7 @@ async fn test_shard_query_rrf_rescoring() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -52,7 +55,12 @@ async fn test_shard_query_rrf_rescoring() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, None, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
@@ -79,7 +87,7 @@ async fn test_shard_query_rrf_rescoring() {
     let expected_error = CollectionError::bad_input(
         "Validation failed: cannot apply Fusion without prefetches".to_string(),
     );
-    assert!(matches!(sources_scores, Err(err) if err == expected_error));
+    assert_matches!(sources_scores, Err(err) if err == expected_error);
 
     // RRF query with single prefetch
     let nearest_query = QueryEnum::Nearest(NamedQuery::new(
@@ -232,7 +240,8 @@ async fn test_shard_query_vector_rescoring() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -246,7 +255,7 @@ async fn test_shard_query_vector_rescoring() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -257,7 +266,12 @@ async fn test_shard_query_vector_rescoring() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, None, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
@@ -370,7 +384,8 @@ async fn test_shard_query_payload_vector() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -384,7 +399,7 @@ async fn test_shard_query_payload_vector() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -395,7 +410,12 @@ async fn test_shard_query_payload_vector() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, None, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 

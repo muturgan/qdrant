@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::{env, str};
+use std::{env, fs, str};
 
 use common::defaults;
-use tonic_build::Builder;
+use tonic_prost_build::Builder;
 
 fn main() -> std::io::Result<()> {
     // Ensure Qdrant version is configured correctly
@@ -13,10 +13,33 @@ fn main() -> std::io::Result<()> {
         "crate version does not match with defaults.rs",
     );
 
+    // Since `tonic` 0.14 (when `tonic-build` was refactored into `tonic-prost-build`),
+    // `tonic_prost_build` *does not* emit `cargo:rerun-if-changed=` directives, which forces Cargo
+    // to recompile `api` (and any other crate that *uses* `api`; which is most crates in Qdrant)
+    // on every `cargo check`/`cargo build`/`cargo run`.
+    //
+    // As a workaround, we emit `cargo:rerun-if-changed=` explicitly. 🤷‍♀️
+    //
+    // See:
+    // - https://github.com/grpc/grpc-rust/issues/2415
+    // - https://github.com/grpc/grpc-rust/issues/2511
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "std::fs is allowed in build-script"
+    )]
+    for result in fs::read_dir("src/grpc/proto").unwrap() {
+        let proto = result.unwrap();
+
+        if proto.path().extension().and_then(|str| str.to_str()) == Some("proto") {
+            println!("cargo:rerun-if-changed={}", proto.path().display());
+        }
+    }
+
     let build_out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Build gRPC bits from proto file
-    tonic_build::configure()
+    tonic_prost_build::configure()
         // Because we want to attach all validation rules to the generated gRPC types, we must do
         // so by extending the builder. This is ugly, but better than manually implementing
         // `Validation` for all these types and seems to be the best approach. The line below
@@ -24,7 +47,7 @@ fn main() -> std::io::Result<()> {
         .configure_validation()
         .file_descriptor_set_path(build_out_dir.join("qdrant_descriptor.bin"))
         .out_dir("src/grpc/") // saves generated structures at this location
-        .compile(
+        .compile_protos(
             &["src/grpc/proto/qdrant.proto"], // proto entry point
             &["src/grpc/proto"], // specify the root location to search proto dependencies
         )?;
@@ -161,6 +184,7 @@ fn configure_validation(builder: Builder) -> Builder {
             ("QuantizationConfig.quantization", ""),
             ("QuantizationConfigDiff.quantization", ""),
             ("ScalarQuantization.quantile", "range(min = 0.5, max = 1.0)"),
+            ("SparseIndexConfig.datatype", "custom(function = \"crate::grpc::validate::validate_sparse_datatype\")"),
             ("UpdateCollectionClusterSetupRequest.timeout", "range(min = 1)"),
             ("UpdateCollectionClusterSetupRequest.operation", ""),
             ("StrictModeConfig.max_query_limit", "range(min = 1)"),
@@ -168,6 +192,7 @@ fn configure_validation(builder: Builder) -> Builder {
             ("StrictModeConfig.max_points_count", "range(min = 1)"),
             ("StrictModeConfig.read_rate_limit", "range(min = 1)"),
             ("StrictModeConfig.write_rate_limit", "range(min = 1)"),
+            ("StrictModeConfig.max_resident_memory_percent", "range(min = 1, max = 100)"),
             ("StrictModeConfig.multivector_config", ""),
             ("StrictModeConfig.sparse_config", ""),
             ("StrictModeSparseConfig.sparse_config", ""),
@@ -181,6 +206,7 @@ fn configure_validation(builder: Builder) -> Builder {
             "UpdateCollectionClusterSetupRequest",
             "ProductQuantization",
             "BinaryQuantization",
+            "TurboQuantization",
             "Disabled",
             "QuantizationConfigDiff",
             "quantization_config_diff::Quantization",
@@ -196,6 +222,7 @@ fn configure_validation(builder: Builder) -> Builder {
             ("GetShardRecoveryPointRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("UpdateShardCutoffPointRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("GetShardOptimizationsRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("GetShardMemoryReportRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
         ], &[])
         // Service: points.proto
         .validates(&[
@@ -227,6 +254,11 @@ fn configure_validation(builder: Builder) -> Builder {
             ("PayloadIndexParams.index_params", ""),
             ("DeleteFieldIndexCollection.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("DeleteFieldIndexCollection.field_name", "length(min = 1)"),
+            ("CreateVectorNameRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("CreateVectorNameRequest.vector_config", ""),
+            ("DenseVectorCreationConfig.size", "range(min = 1, max = 65536)"),
+            ("SparseVectorCreationConfig.datatype", "custom(function = \"crate::grpc::validate::validate_sparse_datatype\")"),
+            ("DeleteVectorNameRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("SearchPoints.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("SearchPoints.filter", ""),
             ("SearchPoints.limit", "range(min = 1)"),
@@ -242,8 +274,11 @@ fn configure_validation(builder: Builder) -> Builder {
             ("SearchPointGroups.group_size", "range(min = 1)"),
             ("SearchPointGroups.limit", "range(min = 1)"),
             ("SearchPointGroups.timeout", "range(min = 1)"),
+            ("SearchParams.hnsw_ef", "range(min = 1)"),
             ("SearchParams.quantization", ""),
             ("SearchParams.acorn", ""),
+            ("SearchParams.idf", ""),
+            ("IdfParams.corpus", ""),
             ("QuantizationSearchParams.oversampling", "range(min = 1.0)"),
             ("ScrollPoints.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("ScrollPoints.filter", ""),
@@ -276,8 +311,12 @@ fn configure_validation(builder: Builder) -> Builder {
             ("DiscoverBatchPoints.timeout", "range(min = 1)"),
             ("CountPoints.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
             ("CountPoints.filter", ""),
-            ("GeoPolygon.exterior", "custom(function = \"crate::grpc::validate::validate_geo_polygon_exterior\")"),
-            ("GeoPolygon.interiors", "custom(function = \"crate::grpc::validate::validate_geo_polygon_interiors\")"),
+            ("GeoBoundingBox.bottom_right", ""),
+            ("GeoBoundingBox.top_left", ""),
+            ("GeoLineString.points", ""),
+            ("GeoPolygon.exterior", "custom(function = \"crate::grpc::validate::validate_geo_polygon_exterior\"), nested"),
+            ("GeoPolygon.interiors", "custom(function = \"crate::grpc::validate::validate_geo_polygon_interiors\"), nested"),
+            ("GeoRadius.center", ""),
             ("Filter.should", ""),
             ("Filter.must", ""),
             ("Filter.must_not", ""),
@@ -285,6 +324,7 @@ fn configure_validation(builder: Builder) -> Builder {
             ("Condition.condition_one_of", ""),
             ("Filter.min_should", ""),
             ("MinShould.conditions", ""),
+            ("MinShould.min_count", "range(min = 1, message = \"min_count must be greater than 0\")"),
             ("PointStruct.vectors", ""),
             ("Vectors.vectors_options", ""),
             ("NamedVectors.vectors", ""),
@@ -310,6 +350,8 @@ fn configure_validation(builder: Builder) -> Builder {
             ("Expression.variant", ""),
             ("MultExpression.mult", ""),
             ("SumExpression.sum", ""),
+            ("MaxExpression.max", ""),
+            ("MinExpression.min", ""),
             ("DivExpression.left", ""),
             ("DivExpression.right", ""),
             ("PowExpression.base", ""),
@@ -355,7 +397,9 @@ fn configure_validation(builder: Builder) -> Builder {
             ("SearchMatrixPoints.sample", "range(min = 2)"),
             ("SearchMatrixPoints.limit", "range(min = 1)"),
             ("SearchMatrixPoints.timeout", "range(min = 1)")
-        ], &[])
+        ], &[
+            "SparseVectorCreationConfig",
+        ])
         .type_attribute(".", "#[derive(serde::Serialize)]")
         // Service: points_internal_service.proto
         .validates(&[
@@ -368,6 +412,8 @@ fn configure_validation(builder: Builder) -> Builder {
             ("ClearPayloadPointsInternal.clear_payload_points", ""),
             ("CreateFieldIndexCollectionInternal.create_field_index_collection", ""),
             ("DeleteFieldIndexCollectionInternal.delete_field_index_collection", ""),
+            ("CreateVectorNameInternal.create_vector_name", ""),
+            ("DeleteVectorNameInternal.delete_vector_name", ""),
             ("UpdateOperation.update", ""),
             ("UpdateBatchInternal.operations", ""),
             ("SearchPointsInternal.search_points", ""),
@@ -421,6 +467,24 @@ fn configure_validation(builder: Builder) -> Builder {
             "CreateFullSnapshotRequest",
             "ListFullSnapshotsRequest",
         ])
+        // Service: storage_read_service.proto
+        .validates(&[
+            ("FileExistsRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("FileExistsRequest.path", "length(min = 1)"),
+            ("ListFilesRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("ListFilesRequest.prefix_path", "length(min = 1)"),
+            ("FileLengthRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("FileLengthRequest.path", "length(min = 1)"),
+            ("ReadBytesRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("ReadBytesRequest.path", "length(min = 1)"),
+            ("ReadBytesStreamRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("ReadBytesStreamRequest.path", "length(min = 1)"),
+            ("ReadWholeRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("ReadWholeRequest.path", "length(min = 1)"),
+            ("ReadBatchRequest.collection_name", "length(min = 1, max = 255), custom(function = \"common::validation::validate_collection_name_legacy\")"),
+            ("ReadBatchRequest.path", "length(min = 1)"),
+            ("ReadBatchRequest.ranges", "length(min = 1)"),
+        ], &[])
 }
 
 fn append_to_file(path: &str, line: &str) {

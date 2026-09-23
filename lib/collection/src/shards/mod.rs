@@ -35,11 +35,9 @@ use crate::shards::shard_config::ShardConfig;
 
 pub type CollectionId = String;
 
-pub type ShardVersion = usize;
-
 /// Path to a shard directory
 pub fn shard_path(collection_path: &Path, shard_id: ShardId) -> PathBuf {
-    collection_path.join(format!("{shard_id}"))
+    collection_path.join(shard_id.to_string())
 }
 
 /// Path to a shard directory

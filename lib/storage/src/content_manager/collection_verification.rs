@@ -2,7 +2,8 @@ use std::iter;
 use std::sync::Arc;
 
 use collection::operations::verification::{
-    StrictModeVerification, VerificationPass, check_timeout, new_unchecked_verification_pass,
+    StrictModeVerification, VerificationPass, check_resident_memory, check_search_batch_size,
+    check_timeout, new_unchecked_verification_pass,
 };
 
 use super::errors::StorageError;
@@ -17,6 +18,7 @@ use crate::rbac::{AccessRequirements, Auth};
 pub async fn check_strict_mode_toc_batch<'a, I>(
     requests: impl Iterator<Item = &'a I>,
     timeout: Option<usize>,
+    batch_size: Option<usize>,
     collection_name: &str,
     toc: &TableOfContent,
     auth: &Auth,
@@ -34,18 +36,39 @@ where
         .unlogged_access() // expected for strict mode check
         .check_collection_access(collection_name, AccessRequirements::new())?;
     let collection = toc.get_collection(&collection_pass).await?;
-    if let Some(strict_mode_config) = &collection.strict_mode_config().await
-        && strict_mode_config.enabled.unwrap_or_default()
-    {
-        for request in requests {
+
+    // Strict mode config only if the collection actually has strict mode turned
+    // on. Global quotas are enforced either way, so this stays `None` for the
+    // quota check on a collection with strict mode disabled.
+    let strict_mode_config = collection
+        .strict_mode_config()
+        .await
+        .filter(|config| config.enabled.unwrap_or_default());
+
+    if let (Some(strict_mode_config), Some(batch_size)) = (&strict_mode_config, batch_size) {
+        check_search_batch_size(batch_size, strict_mode_config)?;
+    }
+
+    let mut any_consumes_memory = false;
+
+    for request in requests {
+        any_consumes_memory |= request.consumes_memory();
+        if let Some(strict_mode_config) = &strict_mode_config {
             request
                 .check_strict_mode(&collection, strict_mode_config)
                 .await?;
         }
+    }
 
-        if let Some(timeout) = timeout {
-            check_timeout(timeout, strict_mode_config)?;
-        }
+    // The node-wide quota governs this collection too, but it is enforced on the
+    // update path rather than here — every update reaches it, whether or not the
+    // handler it arrived through remembered to ask for a strict mode check.
+    if let (Some(strict_mode_config), true) = (&strict_mode_config, any_consumes_memory) {
+        check_resident_memory(strict_mode_config)?;
+    }
+
+    if let (Some(strict_mode_config), Some(timeout)) = (&strict_mode_config, timeout) {
+        check_timeout(timeout, strict_mode_config)?;
     }
 
     // It's checked now
@@ -55,6 +78,7 @@ where
 pub async fn check_strict_mode_batch<'a, I>(
     requests: impl Iterator<Item = &'a I>,
     timeout: Option<usize>,
+    batch_size: Option<usize>,
     collection_name: &str,
     dispatcher: &Dispatcher,
     auth: &Auth,
@@ -63,7 +87,7 @@ where
     I: StrictModeVerification + 'a,
 {
     let toc = get_toc_without_verification_pass(dispatcher, auth);
-    check_strict_mode_toc_batch(requests, timeout, collection_name, toc, auth).await
+    check_strict_mode_toc_batch(requests, timeout, batch_size, collection_name, toc, auth).await
 }
 
 pub async fn check_strict_mode(
@@ -76,6 +100,7 @@ pub async fn check_strict_mode(
     check_strict_mode_batch(
         iter::once(request),
         timeout,
+        None,
         collection_name,
         dispatcher,
         auth,
@@ -94,7 +119,15 @@ pub async fn check_strict_mode_toc(
     toc: &TableOfContent,
     auth: &Auth,
 ) -> Result<VerificationPass, StorageError> {
-    check_strict_mode_toc_batch(iter::once(request), timeout, collection_name, toc, auth).await
+    check_strict_mode_toc_batch(
+        iter::once(request),
+        timeout,
+        None,
+        collection_name,
+        toc,
+        auth,
+    )
+    .await
 }
 
 pub async fn check_strict_mode_timeout(

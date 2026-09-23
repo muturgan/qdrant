@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::hash::Hash;
 
+use blobstore::Blob;
 use common::types::ScoreType;
-use gridstore::Blob;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
@@ -44,7 +44,7 @@ pub struct RemappedSparseVector {
 /// Sort two arrays by the first array.
 pub fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) {
     // Check if the indices are already sorted
-    if indices.windows(2).all(|w| w[0] < w[1]) {
+    if indices.array_windows().all(|[a, b]| a < b) {
         return;
     }
 
@@ -86,7 +86,7 @@ pub fn score_vectors<T: Ord + Eq>(
             }
         }
     }
-    if overlap { Some(score) } else { None }
+    overlap.then_some(score)
 }
 
 impl RemappedSparseVector {
@@ -102,7 +102,7 @@ impl RemappedSparseVector {
 
     /// Check if this vector is sorted by indices.
     pub fn is_sorted(&self) -> bool {
-        self.indices.windows(2).all(|w| w[0] < w[1])
+        self.indices.array_windows().all(|[a, b]| a < b)
     }
 
     /// Score this vector against another vector using dot product.
@@ -130,6 +130,11 @@ impl SparseVector {
         let vector = SparseVector { indices, values };
         vector.validate()?;
         Ok(vector)
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn new_unchecked(indices: Vec<DimId>, values: Vec<DimWeight>) -> Self {
+        SparseVector { indices, values }
     }
 
     /// Sort this vector by indices.

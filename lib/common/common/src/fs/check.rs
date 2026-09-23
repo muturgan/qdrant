@@ -29,6 +29,7 @@ const MAGIC_BYTES_POSITION: usize = MAGIC_FILE_SIZE / 2; // write in the middle
 
 const MAGIC_FILE_NAME: &str = ".qdrant_fs_check";
 
+#[cfg(fs_type_check_supported)]
 #[derive(Debug, PartialEq)]
 enum FsType {
     Ext234,
@@ -50,6 +51,7 @@ enum FsType {
     Other,
 }
 
+#[cfg(fs_type_check_supported)]
 impl FsType {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn from_magic(magic: i64) -> Self {
@@ -84,6 +86,7 @@ impl FsType {
             "xfs" => Self::Xfs,
             "ntfs" => Self::Ntfs,
             "fat" | "fat12" | "fat16" | "fat32" => Self::Fat,
+            "exfat" => Self::ExFat,
             "nfs" => Self::Nfs,
             "hfs" | "htf+" => Self::Hfs,
             "apfs" => Self::Apfs,
@@ -186,7 +189,7 @@ pub fn check_fs_info(path: impl AsRef<Path>) -> FsCheckResult {
     }
 }
 
-/// This function simulates an access pattern we use in vector storage and gridstore
+/// This function simulates an access pattern we use in vector storage and blobstore
 /// This check fails, it means that fundamental assumptions about file system are violated
 /// therefore, there are no guarantees that data will be safe
 pub fn check_mmap_functionality(path: impl AsRef<Path>) -> io::Result<bool> {

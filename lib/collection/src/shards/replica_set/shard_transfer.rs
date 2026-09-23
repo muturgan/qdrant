@@ -7,7 +7,7 @@ use segment::types::{Filter, PointIdType};
 use super::ShardReplicaSet;
 use crate::hash_ring::HashRingRouter;
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::forward_proxy_shard::{ForwardProxyShard, TransferBatchResult};
+use crate::shards::forward_proxy_shard::{ForwardProxyShard, PreparedTransferBatch};
 use crate::shards::local_shard::clock_map::RecoveryPoint;
 use crate::shards::queue_proxy_shard::QueueProxyShard;
 use crate::shards::remote_shard::RemoteShard;
@@ -342,20 +342,62 @@ impl ShardReplicaSet {
         let _ = local.insert(Shard::Local(local_shard));
     }
 
-    /// Custom operation for transferring data from one shard to another during transfer
+    /// Revert any proxy wrapper on the local shard back into a plain local shard, discarding
+    /// all proxy state. Nothing is ever sent to a remote shard: queued updates are forgotten
+    /// and update forwarding stops.
     ///
-    /// Returns new point offset and transferred count
+    /// Does nothing if there is no local shard, or if the local shard is not a proxy.
+    ///
+    /// This method cannot fail and performs no remote calls.
     ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    pub async fn transfer_batch(
+    ///
+    /// If cancelled - the proxy may not be reverted to a local shard.
+    pub async fn discard_proxy_local(&self) {
+        let mut local = self.local.write().await;
+
+        let Some(shard) = local.take() else {
+            return;
+        };
+
+        // Making `await` calls between `local.take()` and `local.insert(...)` is *not* cancel safe!
+        let shard = match shard {
+            shard @ (Shard::Local(_) | Shard::Dummy(_)) => shard,
+            Shard::ForwardProxy(proxy) => {
+                log::debug!("Discarding forward proxy and reverting to local shard");
+                Shard::Local(proxy.wrapped_shard)
+            }
+            Shard::QueueProxy(proxy) => {
+                log::debug!("Forgetting queue proxy updates and reverting to local shard");
+                let (local_shard, _) = proxy.forget_updates_and_finalize();
+                Shard::Local(local_shard)
+            }
+            Shard::Proxy(proxy) => {
+                log::debug!("Discarding proxy and reverting to local shard");
+                Shard::Local(proxy.wrapped_shard)
+            }
+        };
+
+        let _ = local.insert(shard);
+    }
+
+    /// Read a transfer batch without sending it yet.
+    ///
+    /// Returns a [`PreparedTransferBatch`] that holds the update lock. The caller can then drop
+    /// other locks (e.g. the shard holder lock) before calling [`PreparedTransferBatch::send`].
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
+    pub async fn read_transfer_batch(
         &self,
         offset: Option<PointIdType>,
         batch_size: usize,
         hashring_filter: Option<&HashRingRouter>,
         merge_points: bool,
-    ) -> CollectionResult<TransferBatchResult> {
+    ) -> CollectionResult<PreparedTransferBatch> {
         let local = self.local.read().await;
 
         let Some(Shard::ForwardProxy(proxy)) = local.deref() else {
@@ -366,7 +408,7 @@ impl ShardReplicaSet {
         };
 
         proxy
-            .transfer_batch(
+            .read_transfer_batch(
                 offset,
                 batch_size,
                 hashring_filter,

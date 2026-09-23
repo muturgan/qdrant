@@ -96,6 +96,7 @@ def upsert_random_points(
     num_cities=None,
     headers={},
     extra_payload=None,
+    timeout=None,
 ):
     extra_payload = extra_payload or {}
 
@@ -129,6 +130,7 @@ def upsert_random_points(
                 "shard_key": shard_key,
             },
             headers=headers,
+            timeout=timeout,
         )
         if fail_on_error:
             assert_http_ok(r_batch)
@@ -151,12 +153,15 @@ def create_collection(
     sparse_vectors=True,
     default_segment_number=None,
     on_disk_payload=None,
+    read_fan_out_factor=None,
+    fail_on_error=True,
 ):
     payload = {
         "vectors": {"size": DENSE_VECTOR_SIZE, "distance": "Dot"},
         "shard_number": shard_number,
         "replication_factor": replication_factor,
         "write_consistency_factor": write_consistency_factor,
+        "read_fan_out_factor": read_fan_out_factor,
         "sharding_method": sharding_method,
         "optimizers_config": {
             "indexing_threshold": indexing_threshold,
@@ -175,7 +180,8 @@ def create_collection(
         json=payload,
         headers=headers,
     )
-    assert_http_ok(r_batch)
+    if fail_on_error:
+        assert_http_ok(r_batch)
 
 
 def drop_collection(peer_url, collection="test_collection", timeout=10, headers={}):

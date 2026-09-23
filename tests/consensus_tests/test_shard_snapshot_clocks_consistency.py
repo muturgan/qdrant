@@ -16,6 +16,8 @@ def test_shard_snapshot_clocks_consistency(tmp_path: pathlib.Path):
     peer_urls, _, _ = start_cluster(tmp_path, 1, extra_env={ "QDRANT__STAGING__SNAPSHOT_SHARD_CLOCKS_DELAY": "5" })
     peer_url = peer_urls[0]
 
+    skip_if_no_feature(peer_url, "staging")
+
     # Bootstrap collection
     create_collection(peer_url)
     upsert_random_points(peer_url, 10_000, batch_size=100, with_sparse_vector=False)
@@ -52,7 +54,9 @@ def test_shard_snapshot_clocks_consistency(tmp_path: pathlib.Path):
     sleep(1)
 
     # TODO: Compare clock tags of most recent operations in WAL with recovery point
-    recovery_point = requests.get(f"{peer_url}/collections/test_collection/shards/0/recovery_point").json()['result']
+    response = requests.get(f"{peer_url}/collections/test_collection/shards/0/recovery_point")
+    assert_http_ok(response)
+    recovery_point = response.json()['result']
     wal = requests.get(f"{peer_url}/collections/test_collection/shards/0/wal?entries=5").json()['result']
 
     assert len(recovery_point) == 1

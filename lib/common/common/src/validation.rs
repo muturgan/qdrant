@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::path::Path;
 
 use serde::Serialize;
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 // Multivector should be small enough to fit the chunk of vector storage
 
@@ -11,15 +12,32 @@ pub const MAX_MULTIVECTOR_FLATTENED_LEN: usize = 32 * 1024;
 #[cfg(not(debug_assertions))]
 pub const MAX_MULTIVECTOR_FLATTENED_LEN: usize = 1024 * 1024;
 
-#[allow(clippy::manual_try_fold)] // `try_fold` can't be used because it shortcuts on Err
+/// Validate every item in an iterator and collect per-item errors under a
+/// placeholder `?` key. We can't use `ValidationErrors::merge` repeatedly with
+/// the same key — its internal `add_nested` panics on the second insert
+/// ("Attempt to replace non-empty ValidationErrors entry"). For N≥2 we use a
+/// `List` indexed by position; for N=1 we keep the historical `Struct` shape so
+/// existing renderings (`?.<field>`) are preserved.
 pub fn validate_iter<T: Validate>(iter: impl Iterator<Item = T>) -> Result<(), ValidationErrors> {
-    let errors = iter
-        .filter_map(|v| v.validate().err())
-        .fold(Err(ValidationErrors::new()), |bag, err| {
-            ValidationErrors::merge(bag, "?", Err(err))
-        })
-        .unwrap_err();
-    errors.errors().is_empty().then_some(()).ok_or(errors)
+    let mut child_errors: Vec<ValidationErrors> = iter.filter_map(|v| v.validate().err()).collect();
+    if child_errors.is_empty() {
+        return Ok(());
+    }
+
+    let kind = if child_errors.len() == 1 {
+        ValidationErrorsKind::Struct(Box::new(child_errors.pop().unwrap()))
+    } else {
+        ValidationErrorsKind::List(
+            child_errors
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| (i, Box::new(e)))
+                .collect(),
+        )
+    };
+    let mut bag = ValidationErrors::new();
+    bag.errors_mut().insert(Cow::Borrowed("?"), kind);
+    Err(bag)
 }
 
 /// Validate the value is in `[min, max]`
@@ -33,8 +51,7 @@ where
     N: PartialOrd + Serialize,
 {
     // If value is within bounds we're good
-    if min.as_ref().map(|min| &value >= min).unwrap_or(true)
-        && max.as_ref().map(|max| &value <= max).unwrap_or(true)
+    if min.as_ref().is_none_or(|min| &value >= min) && max.as_ref().is_none_or(|max| &value <= max)
     {
         return Ok(());
     }
@@ -49,6 +66,16 @@ where
     Err(err)
 }
 
+/// Build the `ValidationError` for a sparse vector configured with the
+/// `Turbo4` datatype. Shared between REST and gRPC validators.
+pub fn sparse_turbo4_unsupported_error() -> ValidationError {
+    let mut err = ValidationError::new("unsupported_sparse_datatype");
+    err.message = Some(Cow::Borrowed(
+        "sparse vectors do not support the `turbo4` datatype",
+    ));
+    err
+}
+
 /// Validate that `value` is a non-empty string.
 pub fn validate_not_empty(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
@@ -58,23 +85,78 @@ pub fn validate_not_empty(value: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Validate the collection name contains no illegal characters
+/// Filesystem-unsafe characters rejected for both collection and vector names.
 ///
-/// This does not check the length of the name.
-pub fn validate_collection_name(value: &str) -> Result<(), ValidationError> {
-    const INVALID_CHARS: [char; 11] =
-        ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0', '\u{1F}'];
+/// These end up as path components on disk (collection directories,
+/// per-vector storage subdirectories — see
+/// `segment_constructor::get_vector_storage_path`), so they must be safe on both
+/// Linux and Windows filesystems.
+const INVALID_NAME_CHARS: [char; 11] =
+    ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0', '\u{1F}'];
 
-    match INVALID_CHARS.into_iter().find(|c| value.contains(*c)) {
-        Some(c) => {
-            let mut err = ValidationError::new("does_not_contain");
-            err.add_param(Cow::from("pattern"), &c);
-            err.message
-                .replace(format!("collection name cannot contain \"{c}\" char").into());
-            Err(err)
-        }
-        None => Ok(()),
+/// Reject any character from [`INVALID_NAME_CHARS`] in `value`. The `kind`
+/// argument is interpolated into the error message ("collection name" /
+/// "vector name") so callers get a context-appropriate error.
+fn check_invalid_name_chars(value: &str, kind: &str) -> Result<(), ValidationError> {
+    let Some(c) = INVALID_NAME_CHARS.into_iter().find(|c| value.contains(*c)) else {
+        return Ok(());
+    };
+    let mut err = ValidationError::new("does_not_contain");
+    err.add_param(Cow::from("pattern"), &c);
+    err.message
+        .replace(format!("{kind} cannot contain \"{c}\" char").into());
+    Err(err)
+}
+
+/// Reject names that are not a plain, single path component.
+///
+/// Name is used as the name of a storage directory on disk.
+/// It must not contain path separators or dot-segments (`.`, `..`),
+/// so that it won't be interpreted as a path.
+///
+/// `Path::file_name` is a simple way to check this: it returns the whole path
+/// only when it's a simple name with no restricted components.
+/// Same check is used in `collection::common::snapshots_manager`.
+fn check_plain_dir_name(value: &str, kind: &str) -> Result<(), ValidationError> {
+    if Path::new(value).file_name() != Some(value.as_ref()) {
+        let mut err = ValidationError::new("invalid_path_component");
+        err.add_param(Cow::from("value"), &value);
+        err.message.replace(
+            format!("{kind} cannot be {value:?}, it is used as a directory name on disk").into(),
+        );
+        return Err(err);
     }
+    Ok(())
+}
+
+/// Validate the collection name contains no illegal characters and stays a plain directory name
+/// on disk: dot segments (`.`, `..`) and the empty string are rejected.
+///
+/// This does not check the maximum length of the name.
+pub fn validate_collection_name(value: &str) -> Result<(), ValidationError> {
+    check_invalid_name_chars(value, "collection name")?;
+    check_plain_dir_name(value, "collection name")
+}
+
+/// Validate a named vector identifier.
+///
+/// Vector names become directory components on disk (see
+/// `segment_constructor::get_vector_storage_path`), so they are subject to the same
+/// rules as collection names: at most 200 bytes, and free of the
+/// filesystem-unsafe characters listed in [`INVALID_NAME_CHARS`].
+pub fn validate_vector_name(value: &str) -> Result<(), ValidationError> {
+    const MAX_LEN: usize = 200;
+
+    if value.len() > MAX_LEN {
+        let mut err = ValidationError::new("length");
+        err.add_param(Cow::from("max"), &MAX_LEN);
+        err.add_param(Cow::from("actual"), &value.len());
+        err.message
+            .replace(format!("vector name must be at most {MAX_LEN} bytes long").into());
+        return Err(err);
+    }
+
+    check_invalid_name_chars(value, "vector name")
 }
 
 /// Validate the collection name contains no illegal characters, legacy edition
@@ -83,21 +165,23 @@ pub fn validate_collection_name(value: &str) -> Result<(), ValidationError> {
 /// were supported pre Qdrant 1.5. More specifically, this only disallows characters that could
 /// never have been used on both Linux and Windows filesystems.
 ///
-/// This does not check the length of the name.
+/// Dot segments (`.`, `..`) and the empty string are rejected here as well: they were never
+/// usable as directory names, so no pre-existing collection can carry such a name.
+///
+/// This does not check the maximum length of the name.
 pub fn validate_collection_name_legacy(value: &str) -> Result<(), ValidationError> {
-    // Disallowed characters on on both Linux/Windows, sourced from: <https://stackoverflow.com/a/31976060/1000145>
+    // Disallowed characters on both Linux/Windows, sourced from: <https://stackoverflow.com/a/31976060/1000145>
     const INVALID_CHARS: [char; 2] = ['/', '\0'];
 
-    match INVALID_CHARS.into_iter().find(|c| value.contains(*c)) {
-        Some(c) => {
-            let mut err = ValidationError::new("does_not_contain");
-            err.add_param(Cow::from("pattern"), &c);
-            err.message
-                .replace(format!("collection name cannot contain \"{c}\" char").into());
-            Err(err)
-        }
-        None => Ok(()),
+    if let Some(c) = INVALID_CHARS.into_iter().find(|c| value.contains(*c)) {
+        let mut err = ValidationError::new("does_not_contain");
+        err.add_param(Cow::from("pattern"), &c);
+        err.message
+            .replace(format!("collection name cannot contain \"{c}\" char").into());
+        return Err(err);
     }
+
+    check_plain_dir_name(value, "collection name")
 }
 
 /// Validate a polygon has at least 4 points and is closed.
@@ -244,6 +328,14 @@ pub fn validate_multi_vector_len(
         return Err(errors);
     }
 
+    if flatten_dense_vector.is_empty() {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("empty_multi_vector");
+        err.add_param(Cow::from("message"), &"multi vector must not be empty");
+        errors.add("data", err);
+        return Err(errors);
+    }
+
     let dense_vector_len = flatten_dense_vector.len();
     if dense_vector_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
         let mut errors = ValidationErrors::default();
@@ -269,6 +361,17 @@ pub fn validate_multi_vector_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_multi_vector_len_rejects_empty_data() {
+        // Regression: empty flattened data with a positive vectors_count must be
+        // rejected. Previously this returned Ok (0.is_multiple_of(N) == true), and
+        // the value then reached convert_to_plain_multi_vector, which builds
+        // chunks(dim) with dim == 0 and panics on the gRPC upsert path.
+        assert!(validate_multi_vector_len(2, &[]).is_err());
+        // A non-empty, consistent multivector still validates.
+        assert!(validate_multi_vector_len(2, &[1.0, 2.0, 3.0, 4.0]).is_ok());
+    }
 
     #[test]
     fn test_validate_range_generic() {
@@ -322,18 +425,86 @@ mod tests {
     #[test]
     fn test_validate_collection_name() {
         assert!(validate_collection_name("test_collection").is_ok());
-        assert!(validate_collection_name("").is_ok());
         assert!(validate_collection_name("no/path").is_err());
         assert!(validate_collection_name("no*path").is_err());
         assert!(validate_collection_name("?").is_err());
         assert!(validate_collection_name("\0").is_err());
 
         assert!(validate_collection_name_legacy("test_collection").is_ok());
-        assert!(validate_collection_name_legacy("").is_ok());
         assert!(validate_collection_name_legacy("no/path").is_err());
         assert!(validate_collection_name_legacy("no*path").is_ok());
         assert!(validate_collection_name_legacy("?").is_ok());
         assert!(validate_collection_name_legacy("\0").is_err());
+    }
+
+    /// Collection names become directory components on disk
+    /// (`storage/collections/<name>`, `snapshots/<name>`), so a name that resolves outside the
+    /// parent directory must be rejected — by the legacy validator too, since a traversing name
+    /// was never usable as a directory and thus cannot refer to a pre-existing collection.
+    ///
+    /// Mirrors `TRAVERSING_NAMES` in `collection::common::snapshots_manager`.
+    #[test]
+    fn test_validate_collection_name_rejects_traversal() {
+        const TRAVERSING_NAMES: &[&str] = &[
+            "/collections/other-collection",
+            "/etc/passwd",
+            "other-collection/nested",
+            "../other-collection",
+            "./other-collection",
+            "..",
+            ".",
+            "",
+        ];
+
+        for name in TRAVERSING_NAMES {
+            assert!(
+                validate_collection_name(name).is_err(),
+                "collection name {name:?} escapes the collections directory and must be rejected",
+            );
+            assert!(
+                validate_collection_name_legacy(name).is_err(),
+                "collection name {name:?} escapes the collections directory and must be rejected \
+                 by the legacy validator",
+            );
+        }
+
+        // On Windows, backslashes are separators and drive prefixes re-root the joined path,
+        // so these names are paths there too. The legacy character list deliberately allows
+        // `\` and `:`, so containment rests on the plain-name check alone. No existing
+        // collection can carry such a name on Windows — they were never valid directory
+        // names there. (The strict validator rejects `\` and `:` on every platform.)
+        #[cfg(windows)]
+        for name in ["..\\other-collection", "a\\b", "C:", "C:other"] {
+            assert!(
+                validate_collection_name_legacy(name).is_err(),
+                "collection name {name:?} is a path on Windows and must be rejected by the \
+                 legacy validator",
+            );
+        }
+
+        // On Unix, a backslash is a plain character: the same name is a single path component
+        // and must stay valid, so existing collections keep working.
+        #[cfg(unix)]
+        for name in ["no\\path", "C:"] {
+            assert!(
+                validate_collection_name_legacy(name).is_ok(),
+                "collection name {name:?} is a single path component on Unix and must stay \
+                 valid for the legacy validator",
+            );
+        }
+
+        // Names merely containing dots do not traverse and must stay valid, so existing
+        // collections with such names remain reachable.
+        for name in ["v1.2", ".hidden", "..dots", "..."] {
+            assert!(
+                validate_collection_name(name).is_ok(),
+                "collection name {name:?} does not traverse and must stay valid",
+            );
+            assert!(
+                validate_collection_name_legacy(name).is_ok(),
+                "collection name {name:?} does not traverse and must stay valid",
+            );
+        }
     }
 
     #[test]
@@ -361,6 +532,41 @@ mod tests {
             validate_geo_polygon(&good_polygon).is_ok(),
             "good polygon should not error on validation",
         );
+    }
+
+    #[test]
+    fn test_validate_iter() {
+        #[derive(validator::Validate)]
+        struct Item {
+            #[validate(range(min = 1))]
+            idx: u32,
+        }
+
+        // Empty iter — Ok
+        assert!(validate_iter(std::iter::empty::<&Item>()).is_ok());
+
+        // All valid — Ok
+        let valid = [Item { idx: 1 }, Item { idx: 2 }];
+        assert!(validate_iter(valid.iter()).is_ok());
+
+        // Single failure — Struct under `?` (preserves historical `?.<field>`
+        // rendering for existing call sites).
+        let one_bad = [Item { idx: 0 }];
+        let err = validate_iter(one_bad.iter()).expect_err("should fail");
+        match err.errors().get("?") {
+            Some(ValidationErrorsKind::Struct(_)) => {}
+            other => panic!("expected Struct under `?`, got {other:?}"),
+        }
+
+        // Two+ failures — must NOT panic (regression: prior impl called
+        // `ValidationErrors::merge(_, "?", _)` repeatedly, and validator's
+        // internal `add_nested` panics on the second insert).
+        let many_bad = [Item { idx: 0 }, Item { idx: 0 }, Item { idx: 0 }];
+        let err = validate_iter(many_bad.iter()).expect_err("should fail");
+        match err.errors().get("?") {
+            Some(ValidationErrorsKind::List(list)) => assert_eq!(list.len(), 3),
+            other => panic!("expected List under `?`, got {other:?}"),
+        }
     }
 
     #[test]

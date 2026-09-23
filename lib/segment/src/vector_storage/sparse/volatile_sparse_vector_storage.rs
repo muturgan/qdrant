@@ -1,10 +1,12 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
-use bitvec::prelude::{BitSlice, BitVec};
+use common::bitvec::{BitSlice, BitSliceExt as _, BitVec, bitvec_set_deleted};
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::ext::BitSliceExt as _;
+use common::generic_consts::{AccessPattern, Random};
 use common::types::PointOffsetType;
+use common::universal_io::UserData;
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::{DimId, DimWeight};
 
@@ -13,9 +15,9 @@ use crate::common::operation_error::{OperationError, OperationResult, check_proc
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::vectors::VectorRef;
 use crate::types::{Distance, VectorStorageDatatype};
-use crate::vector_storage::bitvec::bitvec_set_deleted;
 use crate::vector_storage::{
-    AccessPattern, Random, SparseVectorStorage, VectorStorage, VectorStorageEnum,
+    SparseVectorStorage, SparseVectorStorageRead, VectorStorage, VectorStorageEnum,
+    VectorStorageRead, default_read_vector_bytes_impl,
 };
 
 pub const SPARSE_VECTOR_DISTANCE: Distance = Distance::Dot;
@@ -88,19 +90,9 @@ impl VolatileSparseVectorStorage {
             *entry = vector.cloned();
         }
     }
-
-    pub fn size_of_available_vectors_in_bytes(&self) -> usize {
-        if self.total_vector_count == 0 {
-            return 0;
-        }
-        let available_fraction =
-            (self.total_vector_count - self.deleted_count) as f32 / self.total_vector_count as f32;
-        let available_size = (self.total_sparse_size as f32 * available_fraction) as usize;
-        available_size * (std::mem::size_of::<DimWeight>() + std::mem::size_of::<DimId>())
-    }
 }
 
-impl SparseVectorStorage for VolatileSparseVectorStorage {
+impl SparseVectorStorageRead for VolatileSparseVectorStorage {
     fn get_sparse<P: AccessPattern>(&self, key: PointOffsetType) -> OperationResult<SparseVector> {
         let vector = self
             .get_sparse_opt::<P>(key)?
@@ -116,9 +108,55 @@ impl SparseVectorStorage for VolatileSparseVectorStorage {
         let opt_vector = self.vectors.get(key as usize).cloned().flatten();
         Ok(opt_vector)
     }
+
+    fn for_each_in_sparse_batch<F>(
+        &self,
+        keys: &[PointOffsetType],
+        mut callback: F,
+    ) -> OperationResult<()>
+    where
+        F: FnMut(usize, SparseVector),
+    {
+        for (idx, &key) in keys.iter().enumerate() {
+            let vector = self.get_sparse::<Random>(key)?;
+            callback(idx, vector);
+        }
+
+        Ok(())
+    }
 }
 
-impl VectorStorage for VolatileSparseVectorStorage {
+impl SparseVectorStorage for VolatileSparseVectorStorage {
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &mut impl Iterator<Item = (Cow<'a, SparseVector>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        let start_index = self.total_vector_count as PointOffsetType;
+        for (other_vector, other_deleted) in other_vectors {
+            check_process_stopped(stopped)?;
+            // Do not perform preprocessing - vectors should be already processed
+            let other_vector = other_vector.as_ref();
+            let new_id = self.total_vector_count as PointOffsetType;
+            self.total_vector_count += 1;
+            self.set_deleted(new_id, other_deleted);
+            self.update_stored(new_id, other_deleted, Some(other_vector));
+        }
+        Ok(start_index..self.total_vector_count as PointOffsetType)
+    }
+}
+
+impl VectorStorageRead for VolatileSparseVectorStorage {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        if self.total_vector_count == 0 {
+            return 0;
+        }
+        let available_fraction =
+            (self.total_vector_count - self.deleted_count) as f32 / self.total_vector_count as f32;
+        let available_size = (self.total_sparse_size as f32 * available_fraction) as usize;
+        available_size * (std::mem::size_of::<DimWeight>() + std::mem::size_of::<DimId>())
+    }
+
     fn distance(&self) -> Distance {
         SPARSE_VECTOR_DISTANCE
     }
@@ -151,6 +189,28 @@ impl VectorStorage for VolatileSparseVectorStorage {
         }
     }
 
+    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
+        self.deleted.get_bit(key as usize).unwrap_or(false)
+    }
+
+    fn deleted_vector_count(&self) -> usize {
+        self.deleted_count
+    }
+
+    fn deleted_vector_bitslice(&self) -> &BitSlice {
+        self.deleted.as_bitslice()
+    }
+
+    fn read_vector_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        default_read_vector_bytes_impl::<Self, P, U>(self, keys, callback)
+    }
+}
+
+impl VectorStorage for VolatileSparseVectorStorage {
     fn insert_vector(
         &mut self,
         key: PointOffsetType,
@@ -163,24 +223,6 @@ impl VectorStorage for VolatileSparseVectorStorage {
         self.set_deleted(key, false);
         self.update_stored(key, false, Some(vector));
         Ok(())
-    }
-
-    fn update_from<'a>(
-        &mut self,
-        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Range<PointOffsetType>> {
-        let start_index = self.total_vector_count as PointOffsetType;
-        for (other_vector, other_deleted) in other_vectors {
-            check_process_stopped(stopped)?;
-            // Do not perform preprocessing - vectors should be already processed
-            let other_vector = other_vector.as_vec_ref().try_into()?;
-            let new_id = self.total_vector_count as PointOffsetType;
-            self.total_vector_count += 1;
-            self.set_deleted(new_id, other_deleted);
-            self.update_stored(new_id, other_deleted, Some(other_vector));
-        }
-        Ok(start_index..self.total_vector_count as PointOffsetType)
     }
 
     fn flusher(&self) -> Flusher {
@@ -198,17 +240,5 @@ impl VectorStorage for VolatileSparseVectorStorage {
             self.update_stored(key, true, old_vector.as_ref());
         }
         Ok(is_deleted)
-    }
-
-    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get_bit(key as usize).unwrap_or(false)
-    }
-
-    fn deleted_vector_count(&self) -> usize {
-        self.deleted_count
-    }
-
-    fn deleted_vector_bitslice(&self) -> &BitSlice {
-        self.deleted.as_bitslice()
     }
 }

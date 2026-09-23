@@ -91,9 +91,9 @@ fn remove_peer(
 
         let has_shards = toc.peer_has_shards(peer_id).await;
         if !params.force && has_shards {
-            return Err(StorageError::BadRequest {
-                description: format!("Cannot remove peer {peer_id} as there are shards on it"),
-            });
+            return Err(StorageError::bad_request(format!(
+                "Cannot remove peer {peer_id} as there are shards on it"
+            )));
         }
 
         match dispatcher.consensus_state() {
@@ -105,9 +105,7 @@ fn remove_peer(
                     )
                     .await
             }
-            None => Err(StorageError::BadRequest {
-                description: "Distributed mode disabled.".to_string(),
-            }),
+            None => Err(StorageError::standalone_mode()),
         }
     })
 }
@@ -122,7 +120,7 @@ async fn get_cluster_metadata_keys(
 
         let keys = dispatcher
             .consensus_state()
-            .ok_or_else(|| StorageError::service_error("Qdrant is running in standalone mode"))?
+            .ok_or_else(StorageError::standalone_mode)?
             .persistent
             .read()
             .get_cluster_metadata_keys();
@@ -143,7 +141,7 @@ async fn get_cluster_metadata_key(
 
         let value = dispatcher
             .consensus_state()
-            .ok_or_else(|| StorageError::service_error("Qdrant is running in standalone mode"))?
+            .ok_or_else(StorageError::standalone_mode)?
             .persistent
             .read()
             .get_cluster_metadata_key(key.as_ref());
@@ -210,7 +208,7 @@ async fn get_cluster_telemetry(
     let pass = new_unchecked_verification_pass();
     helpers::time(async move {
         let toc = dispatcher.toc(&auth, &pass);
-        let access = auth.access("cluster_telemetry");
+        let access = auth.unlogged_access();
 
         let channel_service = toc.get_channel_service();
 

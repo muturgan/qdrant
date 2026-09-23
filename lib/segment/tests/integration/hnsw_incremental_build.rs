@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -10,15 +14,15 @@ use common::progress_tracker::ProgressTracker;
 use itertools::Itertools as _;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom as _;
-use rand::{Rng, SeedableRng as _};
+use rand::{Rng, RngExt, SeedableRng as _};
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, QueryVector, VectorElementType, only_default_vector,
 };
 use segment::entry::SegmentEntry as _;
 use segment::fixtures::index_fixtures::random_vector;
 use segment::index::VectorIndexEnum;
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
 use segment::segment::Segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
@@ -126,6 +130,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
     log::info!("Building HNSW index for {:?}", path.file_name().unwrap());
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m: M,
         ef_construct: EF_CONSTRUCT,
         full_scan_threshold: 1,
@@ -135,7 +140,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
         inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     HNSWIndex::build(

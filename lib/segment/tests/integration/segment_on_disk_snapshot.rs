@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
@@ -8,7 +12,7 @@ use fs_err::File;
 use rstest::rstest;
 use segment::data_types::index::{IntegerIndexParams, KeywordIndexParams};
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::entry::entry_point::{NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry};
 use segment::entry::snapshot_entry::SnapshotEntry as _;
 use segment::json_path::JsonPath;
 use segment::segment::Segment;
@@ -78,10 +82,12 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
             &JsonPath::new("names"),
             Some(&PayloadFieldSchema::FieldParams(
                 PayloadSchemaParams::Keyword(KeywordIndexParams {
+                    memory: None,
                     r#type: segment::data_types::index::KeywordIndexType::Keyword,
                     is_tenant: None,
                     on_disk: Some(true),
                     enable_hnsw: None,
+                    prefix: None,
                 }),
             )),
             &hw_counter,
@@ -93,6 +99,7 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
             &JsonPath::new("ages"),
             Some(&PayloadFieldSchema::FieldParams(
                 PayloadSchemaParams::Integer(IntegerIndexParams {
+                    memory: None,
                     r#type: segment::data_types::index::IntegerIndexType::Integer,
                     lookup: Some(true),
                     range: Some(true),
@@ -113,6 +120,7 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
                 distance: Distance::Dot,
                 storage_type: VectorStorageType::Mmap, // mmap vectors
                 index: Indexes::Hnsw(HnswConfig {
+                    memory: None,
                     m: 4,
                     ef_construct: 16,
                     full_scan_threshold: 8,
@@ -138,7 +146,10 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
         &HnswGlobalConfig::default(),
     )
     .unwrap();
-    segment_builder.update(&[&segment], &false.into()).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    segment_builder
+        .update(&[&segment], &false.into(), &hw_counter)
+        .unwrap();
     let segment = segment_builder.build_for_test(segment_base_dir.path());
 
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
@@ -196,7 +207,7 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
     assert_eq!(entry.file_name(), segment_id);
 
     let restored_segment =
-        load_segment(&entry.path(), Uuid::nil(), &AtomicBool::new(false)).unwrap();
+        load_segment(&entry.path(), Uuid::nil(), None, &AtomicBool::new(false)).unwrap();
 
     // validate restored snapshot is the same as original segment
     assert_eq!(

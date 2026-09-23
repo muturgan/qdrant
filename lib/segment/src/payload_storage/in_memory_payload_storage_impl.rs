@@ -1,60 +1,20 @@
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::json_path::JsonPath;
-use crate::payload_storage::PayloadStorage;
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
-use crate::types::Payload;
+use crate::payload_storage::{PayloadStorage, PayloadStorageRead};
+use crate::types::{OwnedPayloadRef, Payload};
 
-impl PayloadStorage for InMemoryPayloadStorage {
-    fn overwrite(
-        &mut self,
-        point_id: PointOffsetType,
-        payload: &Payload,
-        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
-    ) -> OperationResult<()> {
-        self.payload.insert(point_id, payload.to_owned());
-        Ok(())
-    }
-
-    fn set(
-        &mut self,
-        point_id: PointOffsetType,
-        payload: &Payload,
-        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
-    ) -> OperationResult<()> {
-        match self.payload.get_mut(&point_id) {
-            Some(point_payload) => point_payload.merge(payload),
-            None => {
-                self.payload.insert(point_id, payload.to_owned());
-            }
-        }
-        Ok(())
-    }
-
-    fn set_by_key(
-        &mut self,
-        point_id: PointOffsetType,
-        payload: &Payload,
-        key: &JsonPath,
-        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
-    ) -> OperationResult<()> {
-        match self.payload.get_mut(&point_id) {
-            Some(point_payload) => point_payload.merge_by_key(payload, key),
-            None => {
-                let mut dest_payload = Payload::default();
-                dest_payload.merge_by_key(payload, key);
-                self.payload.insert(point_id, dest_payload);
-            }
-        }
-        Ok(())
-    }
-
+impl PayloadStorageRead for InMemoryPayloadStorage {
     fn get(
         &self,
         point_id: PointOffsetType,
@@ -73,6 +33,120 @@ impl PayloadStorage for InMemoryPayloadStorage {
     ) -> OperationResult<Payload> {
         // In memory => No optimizations available.
         self.get(point_id, hw_counter)
+    }
+
+    fn payload_ref(
+        &self,
+        point_id: PointOffsetType,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<OwnedPayloadRef<'_>> {
+        Ok(self
+            .payload_ptr(point_id)
+            .map(OwnedPayloadRef::from)
+            .unwrap_or_else(|| OwnedPayloadRef::from(Payload::default())))
+    }
+
+    fn iter<F>(&self, mut callback: F, _hw_counter: &HardwareCounterCell) -> OperationResult<()>
+    where
+        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
+    {
+        for (key, val) in &self.payload {
+            let do_continue = callback(*key, val)?;
+            if !do_continue {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        for (user_data, point_offset) in point_offsets {
+            let payload = self.get(point_offset, hw_counter)?;
+            callback(user_data, payload)?;
+        }
+
+        Ok(())
+    }
+
+    fn read_payloads_raw<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, Option<&[u8]>) -> OperationResult<()>,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<()> {
+        for (user_data, point_offset) in point_offsets {
+            let encoded = self.payload.get(&point_offset).map(Blob::to_bytes);
+            callback(user_data, encoded.as_deref())?;
+        }
+
+        Ok(())
+    }
+
+    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        let mut estimated_size = 0;
+        for (_p_id, val) in &self.payload {
+            // account for point_id
+            estimated_size += size_of::<PointOffsetType>();
+            for (key, val) in val.0.iter() {
+                // account for key and value
+                estimated_size += key.len() + serde_json::to_string(val).unwrap().len()
+            }
+        }
+        Ok(estimated_size)
+    }
+
+    fn is_on_disk(&self) -> bool {
+        false
+    }
+}
+
+impl PayloadStorage for InMemoryPayloadStorage {
+    fn overwrite(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
+    ) -> OperationResult<()> {
+        self.payload.insert(point_id, payload.to_owned());
+        Ok(())
+    }
+
+    fn set(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
+    ) -> OperationResult<()> {
+        match self.payload.entry(point_id) {
+            Entry::Occupied(mut e) => e.get_mut().merge(payload),
+            Entry::Vacant(e) => {
+                e.insert(payload.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn set_by_key(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &JsonPath,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<()> {
+        match self.payload.entry(point_id) {
+            Entry::Occupied(mut e) => e.get_mut().merge_by_key(payload, key),
+            Entry::Vacant(e) => {
+                let mut dest_payload = Payload::default();
+                dest_payload.merge_by_key(payload, key);
+                e.insert(dest_payload);
+            }
+        }
+        Ok(())
     }
 
     fn delete(
@@ -109,38 +183,8 @@ impl PayloadStorage for InMemoryPayloadStorage {
         Box::new(|| Ok(()))
     }
 
-    fn iter<F>(&self, mut callback: F, _hw_counter: &HardwareCounterCell) -> OperationResult<()>
-    where
-        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
-    {
-        for (key, val) in self.payload.iter() {
-            let do_continue = callback(*key, val)?;
-            if !do_continue {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
     fn files(&self) -> Vec<PathBuf> {
         vec![]
-    }
-
-    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
-        let mut estimated_size = 0;
-        for (_p_id, val) in self.payload.iter() {
-            // account for point_id
-            estimated_size += size_of::<PointOffsetType>();
-            for (key, val) in val.0.iter() {
-                // account for key and value
-                estimated_size += key.len() + serde_json::to_string(val).unwrap().len()
-            }
-        }
-        Ok(estimated_size)
-    }
-
-    fn is_on_disk(&self) -> bool {
-        false
     }
 }
 
@@ -152,13 +196,13 @@ mod tests {
 
     use super::*;
     use crate::common::utils::IndexesMap;
-    use crate::fixtures::payload_context_fixture::FixtureIdTracker;
+    use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
     use crate::payload_storage::query_checker::check_payload;
     use crate::types::{Condition, FieldCondition, Filter, OwnedPayloadRef};
 
     #[test]
     fn test_condition_checking() {
-        let id_tracker = FixtureIdTracker::new(1);
+        let id_tracker = create_id_tracker_fixture(1);
         let get_payload = || {
             let payload: Payload = serde_json::from_value(json!({
                 "name": "John Doe",
@@ -206,6 +250,33 @@ mod tests {
             0,
             &IndexesMap::new(),
             &HardwareCounterCell::new(),
+        );
+    }
+
+    #[test]
+    fn test_read_payloads_raw_encodes_on_the_fly() {
+        let mut storage = InMemoryPayloadStorage::default();
+        let payload: Payload = serde_json::from_str(r#"{"name": "John Doe"}"#).unwrap();
+
+        let hw_counter = HardwareCounterCell::new();
+        storage.set(1, &payload, &hw_counter).unwrap();
+
+        let mut read = Vec::new();
+        storage
+            .read_payloads_raw::<common::generic_consts::Random, _>(
+                [((), 1), ((), 2)].into_iter(),
+                |(), payload| {
+                    read.push(payload.map(<[u8]>::to_vec));
+                    Ok(())
+                },
+                &hw_counter,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read,
+            // Point 2 has no payload at all
+            [Some(payload.to_bytes()), None],
         );
     }
 

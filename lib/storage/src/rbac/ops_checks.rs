@@ -67,9 +67,22 @@ impl Access {
                     AccessRequirements::new().write().extras(),
                 )?;
             }
+            CollectionMetaOperations::CreateNamedVector(op) => {
+                self.check_collection_access(
+                    &op.collection_name,
+                    AccessRequirements::new().write().extras(),
+                )?;
+            }
+            CollectionMetaOperations::DeleteNamedVector(op) => {
+                self.check_collection_access(
+                    &op.collection_name,
+                    AccessRequirements::new().write().extras(),
+                )?;
+            }
             CollectionMetaOperations::Nop { token: _ } => (),
             #[cfg(feature = "staging")]
-            CollectionMetaOperations::TestSlowDown(_) => {
+            CollectionMetaOperations::TestSlowDown(_)
+            | CollectionMetaOperations::TestTransientError(_) => {
                 self.check_global_access(AccessRequirements::new().manage())?;
             }
         }
@@ -295,7 +308,8 @@ impl CheckableCollectionOperation for CollectionUpdateOperations {
                 manage: false,
                 extras: false,
             },
-            CollectionUpdateOperations::FieldIndexOperation(_) => AccessRequirements {
+            CollectionUpdateOperations::FieldIndexOperation(_)
+            | CollectionUpdateOperations::VectorNameOperation(_) => AccessRequirements {
                 write: true,
                 manage: true,
                 extras: true,
@@ -352,15 +366,13 @@ impl Auth {
 mod tests_ops {
     use std::fmt::Debug;
 
-    use api::rest::{
-        self, LookupLocation, OrderByInterface, RecommendStrategy, SearchRequestInternal,
-    };
+    use api::rest::{self, LookupLocation, RecommendStrategy, SearchRequestInternal};
     use collection::operations::payload_ops::PayloadOpsDiscriminants;
     use collection::operations::point_ops::{
         BatchPersisted, BatchVectorStructPersisted, ConditionalInsertOperationInternal,
         PointInsertOperationsInternal, PointInsertOperationsInternalDiscriminants,
-        PointOperationsDiscriminants, PointStructPersisted, PointSyncOperation,
-        VectorStructPersisted,
+        PointOperationsDiscriminants, PointStructPersisted, PointStructRawPersisted,
+        PointSyncOperation, PointSyncRawOperation, VectorStructPersisted,
     };
     use collection::operations::query_enum::QueryEnum;
     use collection::operations::types::{ContextExamplePair, RecommendExample, UsingVector};
@@ -371,6 +383,7 @@ mod tests_ops {
         CollectionUpdateOperationsDiscriminants, CreateIndex, FieldIndexOperations,
         FieldIndexOperationsDiscriminants,
     };
+    use segment::data_types::order_by::OrderByInterface;
     use segment::data_types::vectors::NamedQuery;
     use segment::types::{
         Condition, ExtendedPointId, Filter, Payload, PointIdType, SearchParams,
@@ -688,6 +701,9 @@ mod tests_ops {
             CollectionUpdateOperationsDiscriminants::FieldIndexOperation => {
                 check_collection_update_operations_field_index()
             }
+            CollectionUpdateOperationsDiscriminants::VectorNameOperation => {
+                check_collection_update_operations_vector_name()
+            }
             #[cfg(feature = "staging")]
             CollectionUpdateOperationsDiscriminants::StagingOperation => {
                 use shard::operations::staging::{StagingOperations, TestDelayOperation};
@@ -774,6 +790,29 @@ mod tests_ops {
                         points: Vec::new(),
                     },
                 ));
+                assert_requires_whole_write_access(&op);
+            }
+
+            PointOperationsDiscriminants::UpsertPointsRaw => {
+                let op = CollectionUpdateOperations::PointOperation(
+                    PointOperations::UpsertPointsRaw(vec![PointStructRawPersisted {
+                        id: ExtendedPointId::NumId(12345),
+                        vectors: vec![("dense".to_string(), vec![0, 1, 2, 3])].into(),
+                        payload: None,
+                        payload_raw: None,
+                    }]),
+                );
+                assert_requires_whole_write_access(&op);
+            }
+
+            PointOperationsDiscriminants::SyncPointsRaw => {
+                let op = CollectionUpdateOperations::PointOperation(
+                    PointOperations::SyncPointsRaw(PointSyncRawOperation {
+                        from_id: None,
+                        to_id: None,
+                        points: Vec::new(),
+                    }),
+                );
                 assert_requires_whole_write_access(&op);
             }
         });
@@ -893,6 +932,45 @@ mod tests_ops {
             };
 
             let op = CollectionUpdateOperations::FieldIndexOperation(inner);
+            assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
+            assert_forbidden(&op, &Access::Global(GlobalAccessMode::Read));
+            assert_forbidden(&op, &AccessCollectionBuilder::new().add("col", true).into());
+            assert_forbidden(
+                &op,
+                &AccessCollectionBuilder::new().add("col", false).into(),
+            );
+        }
+    }
+
+    /// Tests for [`CollectionUpdateOperations::VectorNameOperation`].
+    fn check_collection_update_operations_vector_name() {
+        use segment::types::Distance;
+        use shard::operations::vector_name_ops::{
+            DenseVectorConfig, VectorNameConfig, VectorNameOperationsDiscriminants,
+        };
+        use shard::operations::{CreateVectorName, DeleteVectorName, VectorNameOperations};
+
+        for discr in VectorNameOperationsDiscriminants::iter() {
+            let inner = match discr {
+                VectorNameOperationsDiscriminants::CreateVectorName => {
+                    VectorNameOperations::CreateVectorName(CreateVectorName {
+                        vector_name: "test".into(),
+                        config: VectorNameConfig::dense(DenseVectorConfig {
+                            size: 4,
+                            distance: Distance::Cosine,
+                            multivector_config: None,
+                            datatype: None,
+                        }),
+                    })
+                }
+                VectorNameOperationsDiscriminants::DeleteVectorName => {
+                    VectorNameOperations::DeleteVectorName(DeleteVectorName {
+                        vector_name: "test".into(),
+                    })
+                }
+            };
+
+            let op = CollectionUpdateOperations::VectorNameOperation(inner);
             assert_allowed(&op, &Access::Global(GlobalAccessMode::Manage));
             assert_forbidden(&op, &Access::Global(GlobalAccessMode::Read));
             assert_forbidden(&op, &AccessCollectionBuilder::new().add("col", true).into());

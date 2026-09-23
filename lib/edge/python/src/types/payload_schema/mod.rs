@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 pub mod text_index;
 
 use std::fmt;
@@ -7,10 +11,39 @@ use derive_more::Into;
 use pyo3::IntoPyObjectExt as _;
 use pyo3::prelude::*;
 use segment::data_types::index::*;
-use segment::types::{PayloadSchemaParams, PayloadSchemaType};
+use segment::types::{PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType};
 
 pub use self::text_index::*;
 use crate::repr::*;
+
+#[derive(Clone, Debug, Into)]
+pub struct PyPayloadFieldSchema(PayloadFieldSchema);
+
+impl FromPyObject<'_, '_> for PyPayloadFieldSchema {
+    type Error = PyErr;
+
+    fn extract(schema: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        #[derive(FromPyObject)]
+        enum Helper {
+            Type(PyPayloadSchemaType),
+            Params(PyPayloadSchemaParams),
+        }
+
+        fn _variants(schema: PayloadFieldSchema) {
+            match schema {
+                PayloadFieldSchema::FieldType(_) => {}
+                PayloadFieldSchema::FieldParams(_) => {}
+            }
+        }
+
+        let schema = match schema.extract()? {
+            Helper::Type(schema_type) => PayloadFieldSchema::FieldType(schema_type.into()),
+            Helper::Params(schema_params) => PayloadFieldSchema::FieldParams(schema_params.into()),
+        };
+
+        Ok(Self(schema))
+    }
+}
 
 #[pyclass(name = "PayloadSchemaType", from_py_object)]
 #[derive(Copy, Clone, Debug)]
@@ -173,11 +206,29 @@ impl Repr for PyPayloadSchemaParams {
 #[pyclass(name = "KeywordIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyKeywordIndexParams(KeywordIndexParams);
+pub struct PyKeywordIndexParams(KeywordIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyKeywordIndexParams {
+    #[new]
+    #[pyo3(signature = (is_tenant = None, on_disk = None, enable_hnsw = None, prefix = None))]
+    pub fn new(
+        is_tenant: Option<bool>,
+        on_disk: Option<bool>,
+        enable_hnsw: Option<bool>,
+        prefix: Option<bool>,
+    ) -> Self {
+        Self(KeywordIndexParams {
+            r#type: Default::default(),
+            is_tenant,
+            on_disk,
+            memory: None,
+            enable_hnsw,
+            prefix,
+        })
+    }
+
     #[getter]
     pub fn is_tenant(&self) -> Option<bool> {
         self.0.is_tenant
@@ -192,6 +243,11 @@ impl PyKeywordIndexParams {
     pub fn enable_hnsw(&self) -> Option<bool> {
         self.0.enable_hnsw
     }
+
+    #[getter]
+    pub fn prefix(&self) -> Option<bool> {
+        self.0.prefix
+    }
 }
 
 impl PyKeywordIndexParams {
@@ -201,7 +257,9 @@ impl PyKeywordIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_tenant: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
+            prefix: _,
         } = self.0;
     }
 }
@@ -209,11 +267,31 @@ impl PyKeywordIndexParams {
 #[pyclass(name = "IntegerIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyIntegerIndexParams(IntegerIndexParams);
+pub struct PyIntegerIndexParams(IntegerIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyIntegerIndexParams {
+    #[new]
+    #[pyo3(signature = (lookup = None, range = None, is_principal = None, on_disk = None, enable_hnsw = None))]
+    pub fn new(
+        lookup: Option<bool>,
+        range: Option<bool>,
+        is_principal: Option<bool>,
+        on_disk: Option<bool>,
+        enable_hnsw: Option<bool>,
+    ) -> Self {
+        Self(IntegerIndexParams {
+            r#type: Default::default(),
+            lookup,
+            range,
+            is_principal,
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn lookup(&self) -> Option<bool> {
         self.0.lookup
@@ -249,6 +327,7 @@ impl PyIntegerIndexParams {
             range: _,
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -257,11 +336,27 @@ impl PyIntegerIndexParams {
 #[pyclass(name = "FloatIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyFloatIndexParams(FloatIndexParams);
+pub struct PyFloatIndexParams(FloatIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyFloatIndexParams {
+    #[new]
+    #[pyo3(signature = (is_principal = None, on_disk = None, enable_hnsw = None))]
+    pub fn new(
+        is_principal: Option<bool>,
+        on_disk: Option<bool>,
+        enable_hnsw: Option<bool>,
+    ) -> Self {
+        Self(FloatIndexParams {
+            r#type: Default::default(),
+            is_principal,
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn is_principal(&self) -> Option<bool> {
         self.0.is_principal
@@ -285,6 +380,7 @@ impl PyFloatIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -293,11 +389,22 @@ impl PyFloatIndexParams {
 #[pyclass(name = "GeoIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyGeoIndexParams(GeoIndexParams);
+pub struct PyGeoIndexParams(GeoIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyGeoIndexParams {
+    #[new]
+    #[pyo3(signature = (on_disk = None, enable_hnsw = None))]
+    pub fn new(on_disk: Option<bool>, enable_hnsw: Option<bool>) -> Self {
+        Self(GeoIndexParams {
+            r#type: Default::default(),
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn on_disk(&self) -> Option<bool> {
         self.0.on_disk
@@ -315,6 +422,7 @@ impl PyGeoIndexParams {
         let GeoIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -323,11 +431,22 @@ impl PyGeoIndexParams {
 #[pyclass(name = "BoolIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyBoolIndexParams(BoolIndexParams);
+pub struct PyBoolIndexParams(BoolIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyBoolIndexParams {
+    #[new]
+    #[pyo3(signature = (on_disk = None, enable_hnsw = None))]
+    pub fn new(on_disk: Option<bool>, enable_hnsw: Option<bool>) -> Self {
+        Self(BoolIndexParams {
+            r#type: Default::default(),
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn on_disk(&self) -> Option<bool> {
         self.0.on_disk
@@ -345,6 +464,7 @@ impl PyBoolIndexParams {
         let BoolIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -353,11 +473,27 @@ impl PyBoolIndexParams {
 #[pyclass(name = "DatetimeIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyDatetimeIndexParams(DatetimeIndexParams);
+pub struct PyDatetimeIndexParams(DatetimeIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyDatetimeIndexParams {
+    #[new]
+    #[pyo3(signature = (is_principal = None, on_disk = None, enable_hnsw = None))]
+    pub fn new(
+        is_principal: Option<bool>,
+        on_disk: Option<bool>,
+        enable_hnsw: Option<bool>,
+    ) -> Self {
+        Self(DatetimeIndexParams {
+            r#type: Default::default(),
+            is_principal,
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn is_principal(&self) -> Option<bool> {
         self.0.is_principal
@@ -381,6 +517,7 @@ impl PyDatetimeIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -389,11 +526,23 @@ impl PyDatetimeIndexParams {
 #[pyclass(name = "UuidIndexParams", from_py_object)]
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
-struct PyUuidIndexParams(UuidIndexParams);
+pub struct PyUuidIndexParams(UuidIndexParams);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyUuidIndexParams {
+    #[new]
+    #[pyo3(signature = (is_tenant = None, on_disk = None, enable_hnsw = None))]
+    pub fn new(is_tenant: Option<bool>, on_disk: Option<bool>, enable_hnsw: Option<bool>) -> Self {
+        Self(UuidIndexParams {
+            r#type: Default::default(),
+            is_tenant,
+            on_disk,
+            memory: None,
+            enable_hnsw,
+        })
+    }
+
     #[getter]
     pub fn is_tenant(&self) -> Option<bool> {
         self.0.is_tenant
@@ -417,6 +566,7 @@ impl PyUuidIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_tenant: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }

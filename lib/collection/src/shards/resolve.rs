@@ -89,10 +89,10 @@ impl Resolve for FacetResponse {
                     if let Some(counts) = map.get_mut(&hit.value) {
                         counts.push(CountResult { count: hit.count });
                     } else {
-                        map.entry(hit.value.clone())
-                            .or_insert(Vec::with_capacity(num_replicas))
-                            .push(CountResult { count: hit.count });
-                    };
+                        let mut counts = Vec::with_capacity(num_replicas);
+                        counts.push(CountResult { count: hit.count });
+                        map.insert(hit.value.clone(), counts);
+                    }
                     map
                 },
             )
@@ -247,8 +247,8 @@ where
         // Select coordinates of accepted items, avoiding copying
         let resolved_coords: HashSet<_> = resolver
             .items
-            .into_iter()
-            .filter_map(|(_, points)| {
+            .into_values()
+            .filter_map(|points| {
                 points
                     .into_iter()
                     .find(|point| point.count >= resolution_count)

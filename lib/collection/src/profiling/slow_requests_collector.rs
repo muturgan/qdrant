@@ -18,6 +18,7 @@ pub struct RequestProfileMessage {
     duration: std::time::Duration,
     collection_name: String,
     datetime: DateTime<Utc>,
+    cpu_usage_ratio: Option<f32>,
 }
 
 impl RequestProfileMessage {
@@ -25,12 +26,14 @@ impl RequestProfileMessage {
         request: Box<dyn Loggable + Send + Sync>,
         duration: std::time::Duration,
         collection_name: String,
+        cpu_usage_ratio: Option<f32>,
     ) -> Self {
         RequestProfileMessage {
             request,
             duration,
             collection_name,
             datetime: Utc::now(),
+            cpu_usage_ratio,
         }
     }
 }
@@ -79,14 +82,13 @@ impl RequestsCollector {
                 .unwrap_or_else(|_| 0);
 
             // Atomically update if enough time has passed
-            let updated =
-                LAST_SEND_WARN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-                    if now.saturating_sub(prev) >= WARN_INTERVAL_SECS {
-                        Some(now)
-                    } else {
-                        None
-                    }
-                });
+            let updated = LAST_SEND_WARN.try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                if now.saturating_sub(prev) >= WARN_INTERVAL_SECS {
+                    Some(now)
+                } else {
+                    None
+                }
+            });
 
             if updated.is_err() {
                 return;
@@ -106,11 +108,16 @@ impl RequestsCollector {
                 duration,
                 collection_name,
                 datetime,
+                cpu_usage_ratio,
             } = message;
 
-            log.write()
-                .await
-                .log_request(&collection_name, duration, datetime, request.as_ref());
+            log.write().await.log_request(
+                &collection_name,
+                duration,
+                datetime,
+                request.as_ref(),
+                cpu_usage_ratio,
+            );
         }
     }
 }

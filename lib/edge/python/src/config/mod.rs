@@ -1,60 +1,107 @@
+pub mod optimizers;
 pub mod quantization;
 pub mod sparse_vector_data;
 pub mod vector_data;
 
 use std::collections::HashMap;
-use std::fmt;
 
-use bytemuck::TransparentWrapper;
 use derive_more::Into;
+use edge::EdgeConfig;
 use pyo3::prelude::*;
-use segment::types::*;
+use segment::types::{QuantizationConfig, VectorNameBuf};
 
+pub use self::optimizers::*;
 pub use self::quantization::*;
 pub use self::sparse_vector_data::*;
 pub use self::vector_data::*;
 use crate::repr::*;
 
 #[pyclass(name = "EdgeConfig", from_py_object)]
-#[derive(Clone, Debug, Into, TransparentWrapper)]
+#[derive(Clone, Debug, Into)]
 #[repr(transparent)]
-pub struct PyEdgeConfig(SegmentConfig);
+pub struct PyEdgeConfig(pub EdgeConfig);
 
 #[pyclass_repr]
 #[pymethods]
 impl PyEdgeConfig {
     #[new]
-    #[pyo3(signature = (vector_data, sparse_vector_data=None))]
+    #[pyo3(signature = (vectors=None, sparse_vectors=None, on_disk_payload=None, hnsw_config=None, quantization_config=None, optimizers=None, max_search_threads=None, search_pool_core=None))]
+    // Python-facing keyword arguments mirror EdgeConfig's fields one-to-one.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        #[pyo3(from_py_with = vector_data_config_helper)]
-        // `vector_data_config_helper` accepts either
-        // - a single default vector config: `VectorDataConfig(...)`
-        // - or a map of named vector configs: `{ "": VectorDataConfig(...), "named_vector": VectorDataConfig(...) }`
-        vector_data: HashMap<String, PyVectorDataConfig>,
-        sparse_vector_data: Option<HashMap<String, PySparseVectorDataConfig>>,
-    ) -> Self {
-        Self(SegmentConfig {
-            vector_data: PyVectorDataConfig::peel_map(vector_data),
-            sparse_vector_data: PySparseVectorDataConfig::peel_map(
-                sparse_vector_data.unwrap_or_default(),
-            ),
-            payload_storage_type: PayloadStorageType::Mmap,
-        })
+        #[pyo3(from_py_with = option_edge_vectors_helper)] vectors: Option<
+            HashMap<String, PyEdgeVectorParams>,
+        >,
+        sparse_vectors: Option<HashMap<String, PyEdgeSparseVectorParams>>,
+        on_disk_payload: Option<bool>,
+        hnsw_config: Option<PyHnswIndexConfig>,
+        quantization_config: Option<PyQuantizationConfig>,
+        optimizers: Option<PyEdgeOptimizersConfig>,
+        max_search_threads: Option<usize>,
+        search_pool_core: Option<usize>,
+    ) -> PyResult<Self> {
+        let vectors = vectors.unwrap_or_default();
+        let sparse_vectors = sparse_vectors.unwrap_or_default();
+        if vectors.is_empty() && sparse_vectors.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "EdgeConfig requires at least one of vectors or sparse_vectors to be non-empty",
+            ));
+        }
+        let vectors = PyEdgeVectorParams::peel_map(vectors);
+        let sparse_vectors = PyEdgeSparseVectorParams::peel_map(sparse_vectors);
+        let vectors: HashMap<VectorNameBuf, _> = vectors.into_iter().collect();
+        let sparse_vectors: HashMap<VectorNameBuf, _> = sparse_vectors.into_iter().collect();
+        Ok(Self(EdgeConfig {
+            on_disk_payload,
+            vectors,
+            sparse_vectors,
+            hnsw_config: hnsw_config.map(|h| h.0),
+            quantization_config: quantization_config.map(QuantizationConfig::from),
+            optimizers: optimizers.map(|o| o.0),
+            wal_options: None,
+            max_search_threads,
+            search_pool_core,
+        }))
     }
 
     #[getter]
-    pub fn vector_data(&self) -> &HashMap<String, PyVectorDataConfig> {
-        PyVectorDataConfig::wrap_map_ref(&self.0.vector_data)
+    pub fn vectors(&self) -> HashMap<String, PyEdgeVectorParams> {
+        PyEdgeVectorParams::wrap_map(&self.0.vectors)
     }
 
     #[getter]
-    pub fn sparse_vector_data(&self) -> &HashMap<String, PySparseVectorDataConfig> {
-        PySparseVectorDataConfig::wrap_map_ref(&self.0.sparse_vector_data)
+    pub fn sparse_vectors(&self) -> HashMap<String, PyEdgeSparseVectorParams> {
+        PyEdgeSparseVectorParams::wrap_map(&self.0.sparse_vectors)
     }
 
     #[getter]
-    pub fn payload_storage_type(&self) -> PyPayloadStorageType {
-        PyPayloadStorageType::from(self.0.payload_storage_type)
+    pub fn on_disk_payload(&self) -> Option<bool> {
+        self.0.on_disk_payload
+    }
+
+    #[getter]
+    pub fn hnsw_config(&self) -> Option<PyHnswIndexConfig> {
+        self.0.hnsw_config.map(PyHnswIndexConfig)
+    }
+
+    #[getter]
+    pub fn quantization_config(&self) -> Option<PyQuantizationConfig> {
+        self.0.quantization_config.clone().map(PyQuantizationConfig)
+    }
+
+    #[getter]
+    pub fn optimizers(&self) -> Option<PyEdgeOptimizersConfig> {
+        self.0.optimizers.clone().map(PyEdgeOptimizersConfig)
+    }
+
+    #[getter]
+    pub fn max_search_threads(&self) -> Option<usize> {
+        self.0.max_search_threads
+    }
+
+    #[getter]
+    pub fn search_pool_core(&self) -> Option<usize> {
+        self.0.search_pool_core
     }
 
     pub fn __repr__(&self) -> String {
@@ -64,77 +111,43 @@ impl PyEdgeConfig {
 
 impl PyEdgeConfig {
     fn _getters(self) {
-        // Every field should have a getter method
-        let SegmentConfig {
-            vector_data: _,
-            sparse_vector_data: _,
-            payload_storage_type: _,
+        let EdgeConfig {
+            on_disk_payload: _,
+            vectors: _,
+            sparse_vectors: _,
+            hnsw_config: _,
+            quantization_config: _,
+            optimizers: _,
+            wal_options: _,
+            max_search_threads: _,
+            search_pool_core: _,
         } = self.0;
     }
 }
 
-#[pyclass(name = "PayloadStorageType", from_py_object)]
-#[derive(Copy, Clone, Debug)]
-pub enum PyPayloadStorageType {
-    Mmap,
-    InRamMmap,
-}
-
-#[pymethods]
-impl PyPayloadStorageType {
-    pub fn __repr__(&self) -> String {
-        self.repr()
-    }
-}
-
-impl Repr for PyPayloadStorageType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let repr = match self {
-            PyPayloadStorageType::Mmap => "Mmap",
-            PyPayloadStorageType::InRamMmap => "InRamMmap",
-        };
-
-        f.simple_enum::<Self>(repr)
-    }
-}
-
-impl From<PayloadStorageType> for PyPayloadStorageType {
-    fn from(storage_type: PayloadStorageType) -> Self {
-        #[allow(unreachable_patterns)]
-        match storage_type {
-            PayloadStorageType::Mmap => PyPayloadStorageType::Mmap,
-            PayloadStorageType::InRamMmap => PyPayloadStorageType::InRamMmap,
-            _ => unimplemented!("RocksDB-backed storage types are not supported by Qdrant Edge"),
-        }
-    }
-}
-
-impl From<PyPayloadStorageType> for PayloadStorageType {
-    fn from(storage_type: PyPayloadStorageType) -> Self {
-        match storage_type {
-            PyPayloadStorageType::Mmap => PayloadStorageType::Mmap,
-            PyPayloadStorageType::InRamMmap => PayloadStorageType::InRamMmap,
-        }
-    }
-}
-
-fn vector_data_config_helper(
+fn option_edge_vectors_helper(
     config: &Bound<'_, PyAny>,
-) -> PyResult<HashMap<String, PyVectorDataConfig>> {
+) -> PyResult<Option<HashMap<String, PyEdgeVectorParams>>> {
+    if config.is_none() {
+        return Ok(None);
+    }
+    edge_vectors_helper(config).map(Some)
+}
+
+fn edge_vectors_helper(config: &Bound<'_, PyAny>) -> PyResult<HashMap<String, PyEdgeVectorParams>> {
     #[derive(FromPyObject)]
     enum Helper {
-        Default(PyVectorDataConfig),
-        Explicit(HashMap<String, PyVectorDataConfig>),
+        Default(PyEdgeVectorParams),
+        Explicit(HashMap<String, PyEdgeVectorParams>),
     }
 
     let config = match config.extract()? {
         Helper::Default(default) => {
-            let mut config = HashMap::new();
-            config.insert("".into(), default);
-            config
+            let mut map = HashMap::new();
+            map.insert("".to_string(), default);
+            map
         }
-
-        Helper::Explicit(config) => config,
+        Helper::Explicit(map) => map,
     };
 
     Ok(config)

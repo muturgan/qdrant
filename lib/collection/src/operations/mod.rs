@@ -7,6 +7,7 @@ pub mod loggable;
 pub mod operation_effect;
 pub mod payload_ops;
 pub mod point_ops;
+pub mod routing;
 pub mod shard_selector_internal;
 pub mod shared_storage_config;
 pub mod snapshot_ops;
@@ -51,6 +52,9 @@ impl SplitByShard for CollectionUpdateOperations {
                 .split_by_shard(ring)
                 .map(CollectionUpdateOperations::PayloadOperation),
             operation @ CollectionUpdateOperations::FieldIndexOperation(_) => {
+                OperationToShard::to_all(operation)
+            }
+            operation @ CollectionUpdateOperations::VectorNameOperation(_) => {
                 OperationToShard::to_all(operation)
             }
             #[cfg(feature = "staging")]

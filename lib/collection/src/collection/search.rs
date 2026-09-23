@@ -4,18 +4,20 @@ use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use futures::{TryFutureExt, future};
+use futures::future;
 use itertools::{Either, Itertools};
 use segment::types::{
-    ExtendedPointId, Filter, Order, ScoredPoint, WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, Order, ScoredPoint, ShardKey, WithPayloadInterface, WithVector,
 };
 use shard::retrieve::record_internal::RecordInternal;
 use shard::search::CoreSearchRequestBatch;
 use tokio::time::Instant;
 
 use super::Collection;
+use crate::common::batching::empty_batch_results;
 use crate::events::SlowQueryEvent;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::routing::RoutingToken;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 
@@ -25,6 +27,7 @@ impl Collection {
         &self,
         request: CoreSearchRequest,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -40,6 +43,7 @@ impl Collection {
             .do_core_search_batch(
                 request_batch,
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc,
@@ -52,6 +56,7 @@ impl Collection {
         &self,
         request: CoreSearchRequestBatch,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -59,7 +64,7 @@ impl Collection {
         let start = Instant::now();
         // shortcuts batch if all requests with limit=0
         if request.searches.iter().all(|s| s.limit == 0) {
-            return Ok(vec![]);
+            return Ok(empty_batch_results(request.searches.len()));
         }
 
         let is_payload_required = request
@@ -107,6 +112,7 @@ impl Collection {
                 .do_core_search_batch(
                     without_payload_batch,
                     read_consistency,
+                    routing_token,
                     &shard_selection,
                     timeout,
                     hw_measurement_acc.clone(),
@@ -116,13 +122,14 @@ impl Collection {
             let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
             let filled_results = without_payload_results
                 .into_iter()
-                .zip(request.searches.into_iter())
+                .zip(request.searches)
                 .map(|(without_payload_result, req)| {
                     self.fill_search_result_with_payload(
                         without_payload_result,
                         req.with_payload.clone(),
                         req.with_vector.unwrap_or_default(),
                         read_consistency,
+                        routing_token,
                         &shard_selection,
                         timeout,
                         hw_measurement_acc.clone(),
@@ -134,6 +141,7 @@ impl Collection {
                 .do_core_search_batch(
                     request,
                     read_consistency,
+                    routing_token,
                     &shard_selection,
                     timeout,
                     hw_measurement_acc,
@@ -147,6 +155,7 @@ impl Collection {
         &self,
         request: CoreSearchRequestBatch,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -155,34 +164,46 @@ impl Collection {
 
         let instant = Instant::now();
 
-        // query all shards concurrently
-        let all_searches_res = {
+        // Snapshot the targeted shards under the read guard, then drop it
+        // before awaiting the per-shard searches. Holding the guard across
+        // the searches would block writers (e.g. shard creation) for the
+        // entire search duration; cloning `Arc<ShardReplicaSet>` lets each
+        // search keep the shard alive on its own.
+        let targets: Vec<(Arc<_>, Option<ShardKey>)> = {
             let shard_holder = self.shards_holder.read().await;
-            let target_shards = shard_holder.select_shards(shard_selection)?;
-            let all_searches = target_shards.into_iter().map(|(shard, shard_key)| {
-                let shard_key = shard_key.cloned();
-                shard
+            shard_holder
+                .select_shards(shard_selection)?
+                .into_iter()
+                .map(|(shard, shard_key)| (Arc::clone(shard), shard_key.cloned()))
+                .collect()
+        };
+
+        // query all shards concurrently
+        let all_searches = targets.into_iter().map(|(shard, shard_key)| {
+            let request = request.clone();
+            let hw_measurement_acc = hw_measurement_acc.clone();
+            async move {
+                let mut records = shard
                     .core_search(
-                        request.clone(),
+                        request,
                         read_consistency,
+                        routing_token,
                         shard_selection.is_shard_id(),
                         timeout,
-                        hw_measurement_acc.clone(),
+                        hw_measurement_acc,
                     )
-                    .and_then(move |mut records| async move {
-                        if shard_key.is_none() {
-                            return Ok(records);
+                    .await?;
+                if shard_key.is_some() {
+                    for batch in &mut records {
+                        for point in batch {
+                            point.shard_key.clone_from(&shard_key);
                         }
-                        for batch in &mut records {
-                            for point in batch {
-                                point.shard_key.clone_from(&shard_key);
-                            }
-                        }
-                        Ok(records)
-                    })
-            });
-            future::try_join_all(all_searches).await?
-        };
+                    }
+                }
+                CollectionResult::Ok(records)
+            }
+        });
+        let all_searches_res = future::try_join_all(all_searches).await?;
 
         let result = self
             .merge_from_shards(
@@ -206,6 +227,7 @@ impl Collection {
         with_payload: Option<WithPayloadInterface>,
         with_vector: WithVector,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -233,6 +255,7 @@ impl Collection {
             .retrieve(
                 retrieve_request,
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc,

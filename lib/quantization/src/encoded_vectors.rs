@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -10,12 +11,21 @@ use crate::EncodingError;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceType {
+    // Warning!
+    // Old Qdrant versions used `Dot` for both Cosine and Dot (since their implementations were equal).
+    // However, TurboQuant needs to know the exact distance type and can't treat Cosine and Dot equally.
+    // Because this distinction was introduced together with TQ, quantization storages created prior to
+    // TQ might still store `Dot` even though the original vectors use `Cosine`.
+    // Therefore, we can't rely on the exact type for any quantization storage other than TQ, and must *always* treat
+    // Cosine and Dot the same for quantization types that were implemented prior to TQ.
+    Cosine,
+
     Dot,
     L1,
     L2,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct VectorParameters {
     pub dim: usize,
     pub distance_type: DistanceType,
@@ -31,9 +41,26 @@ pub struct VectorParameters {
 pub trait EncodedVectors: Sized {
     type EncodedQuery;
 
+    fn is_in_ram_or_mmap() -> bool;
     fn is_on_disk(&self) -> bool;
 
     fn encode_query(&self, query: &[f32]) -> Self::EncodedQuery;
+
+    /// This function is expected to:
+    /// - be implemented by non-multivector storages
+    /// - be used by multivector storages
+    fn for_each_batch(
+        &self,
+        offsets: &[PointOffsetType],
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    );
+
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32;
 
     fn score_point(
         &self,
@@ -41,6 +68,26 @@ pub trait EncodedVectors: Sized {
         i: PointOffsetType,
         hw_counter: &HardwareCounterCell,
     ) -> f32;
+
+    /// Score a batch: `scores[i]` ← score of `query` against point
+    /// `offsets[i]`.
+    ///
+    /// The default is the per-vector loop the scorers have always run.
+    /// Implementations can batch harder — resolve contiguous storage runs
+    /// once and score each run with a single kernel call instead of paying
+    /// the per-point machinery for every vector.
+    fn score_points(
+        &self,
+        query: &Self::EncodedQuery,
+        offsets: &[PointOffsetType],
+        scores: &mut [f32],
+        hw_counter: &HardwareCounterCell,
+    ) {
+        debug_assert_eq!(offsets.len(), scores.len());
+        self.for_each_batch(offsets, |i, vector| {
+            scores[i] = self.score(query, &vector, hw_counter);
+        });
+    }
 
     fn score_internal(
         &self,
@@ -71,6 +118,14 @@ pub trait EncodedVectors: Sized {
 
     fn immutable_files(&self) -> Vec<PathBuf>;
 
+    /// Additional heap memory used by this encoded vectors instance
+    /// beyond what's tracked in files (storage heap + metadata).
+    ///
+    /// Required (no default) so every quantizer must account for its own
+    /// heap explicitly — at minimum delegating to the storage backend's
+    /// [`EncodedStorage::heap_size_bytes`].
+    fn heap_size_bytes(&self) -> usize;
+
     type SupportsBytes: TBool;
     fn score_bytes(
         &self,
@@ -84,7 +139,7 @@ pub trait EncodedVectors: Sized {
 impl DistanceType {
     pub fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self {
-            DistanceType::Dot => a.iter().zip(b).map(|(a, b)| a * b).sum(),
+            DistanceType::Dot | DistanceType::Cosine => a.iter().zip(b).map(|(a, b)| a * b).sum(),
             DistanceType::L1 => a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum(),
             DistanceType::L2 => a.iter().zip(b).map(|(a, b)| (a - b) * (a - b)).sum(),
         }

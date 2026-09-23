@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -119,11 +120,21 @@ pub struct ShardTransfer {
 
 impl ShardTransfer {
     pub fn key(&self) -> ShardTransferKey {
+        let ShardTransfer {
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            sync: _,
+            method: _,
+            filter: _,
+        } = self;
+
         ShardTransferKey {
-            shard_id: self.shard_id,
-            to_shard_id: self.to_shard_id,
-            from: self.from,
-            to: self.to,
+            shard_id: *shard_id,
+            to_shard_id: *to_shard_id,
+            from: *from,
+            to: *to,
         }
     }
 
@@ -167,7 +178,7 @@ impl ShardTransfer {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardTransferRestart {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,25 +188,70 @@ pub struct ShardTransferRestart {
     pub method: ShardTransferMethod,
 }
 
-impl ShardTransferRestart {
-    pub fn key(&self) -> ShardTransferKey {
-        ShardTransferKey {
-            shard_id: self.shard_id,
-            to_shard_id: self.to_shard_id,
-            from: self.from,
-            to: self.to,
+impl fmt::Debug for ShardTransferRestart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Delegate to ShardTransfer's Debug so log lines use the same format
+        ShardTransfer::from(self).fmt(f)
+    }
+}
+
+impl From<&ShardTransferRestart> for ShardTransfer {
+    fn from(restart: &ShardTransferRestart) -> Self {
+        let ShardTransferRestart {
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            method,
+        } = *restart;
+
+        Self {
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            sync: false,
+            method: Some(method),
+            filter: None,
         }
     }
 }
 
-impl From<ShardTransfer> for ShardTransferRestart {
-    fn from(transfer: ShardTransfer) -> Self {
+impl ShardTransferRestart {
+    pub fn key(&self) -> ShardTransferKey {
+        let ShardTransferRestart {
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            method: _,
+        } = self;
+
+        ShardTransferKey {
+            shard_id: *shard_id,
+            to_shard_id: *to_shard_id,
+            from: *from,
+            to: *to,
+        }
+    }
+
+    pub fn from_transfer(transfer: ShardTransfer, default_method: ShardTransferMethod) -> Self {
+        let ShardTransfer {
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            sync: _,
+            method,
+            filter: _,
+        } = transfer;
+
         Self {
-            shard_id: transfer.shard_id,
-            to_shard_id: transfer.to_shard_id,
-            from: transfer.from,
-            to: transfer.to,
-            method: transfer.method.unwrap_or_default(),
+            shard_id,
+            to_shard_id,
+            from,
+            to,
+            method: method.unwrap_or(default_method),
         }
     }
 }
@@ -225,11 +281,10 @@ impl ShardTransferKey {
 /// - `wal_delta` - Attempt to transfer shard difference by WAL delta.
 ///
 /// - `resharding_stream_records` - Shard transfer for resharding: stream all records in batches until all points are transferred.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ShardTransferMethod {
     // Stream all shard records in batches until the whole shard is transferred.
-    #[default]
     StreamRecords,
     // Snapshot the shard, transfer and restore it on the receiver.
     Snapshot,
@@ -242,7 +297,10 @@ pub enum ShardTransferMethod {
 
 impl ShardTransferMethod {
     pub fn is_resharding(&self) -> bool {
-        matches!(self, Self::ReshardingStreamRecords)
+        match self {
+            Self::ReshardingStreamRecords => true,
+            Self::StreamRecords | Self::Snapshot | Self::WalDelta => false,
+        }
     }
 }
 
@@ -470,6 +528,7 @@ pub trait ShardTransferConsensus: Send + Sync {
         &self,
         transfer_config: ShardTransfer,
         collection_id: CollectionId,
+        default_method: ShardTransferMethod,
     ) -> CollectionResult<()>;
 
     /// Propose to restart a shard transfer with a different given configuration
@@ -480,6 +539,7 @@ pub trait ShardTransferConsensus: Send + Sync {
         &self,
         transfer_config: &ShardTransfer,
         collection_id: &CollectionId,
+        default_method: ShardTransferMethod,
     ) -> CollectionResult<()> {
         let mut result = Err(CollectionError::service_error(
             "`restart_shard_transfer_confirm_and_retry` exit without attempting any work, \
@@ -493,7 +553,11 @@ pub trait ShardTransferConsensus: Send + Sync {
 
             log::trace!("Propose and confirm shard transfer restart operation");
             result = self
-                .restart_shard_transfer(transfer_config.clone(), collection_id.into())
+                .restart_shard_transfer(
+                    transfer_config.clone(),
+                    collection_id.into(),
+                    default_method,
+                )
                 .await;
 
             match &result {

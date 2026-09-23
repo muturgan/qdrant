@@ -2,10 +2,11 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
-use bitvec::prelude::{BitSlice, BitVec};
+use common::bitvec::{BitSlice, BitSliceExt as _, BitVec, bitvec_set_deleted};
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::ext::BitSliceExt as _;
+use common::generic_consts::AccessPattern;
 use common::types::PointOffsetType;
+use common::universal_io::UserData;
 
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationResult, check_process_stopped};
@@ -13,10 +14,10 @@ use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
-use crate::vector_storage::bitvec::bitvec_set_deleted;
-use crate::vector_storage::chunked_vectors::ChunkedVectors;
+use crate::vector_storage::volatile_chunked_vectors::VolatileChunkedVectors;
 use crate::vector_storage::{
-    AccessPattern, DenseVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
+    DenseVectorStorage, DenseVectorStorageRead, VectorOffsetType, VectorStorage, VectorStorageEnum,
+    VectorStorageRead, default_for_each_in_dense_batch, default_read_vector_bytes_impl,
 };
 
 /// In-memory vector storage that is volatile
@@ -26,7 +27,7 @@ use crate::vector_storage::{
 pub struct VolatileDenseVectorStorage<T: PrimitiveVectorElement> {
     dim: usize,
     distance: Distance,
-    vectors: ChunkedVectors<T>,
+    vectors: VolatileChunkedVectors<T>,
     /// BitVec for deleted flags. Grows dynamically upto last set flag.
     deleted: BitVec,
     /// Current number of deleted vectors.
@@ -52,7 +53,7 @@ impl<T: PrimitiveVectorElement> VolatileDenseVectorStorage<T> {
         Self {
             dim,
             distance,
-            vectors: ChunkedVectors::new(dim),
+            vectors: VolatileChunkedVectors::new(dim),
             deleted: BitVec::new(),
             deleted_count: 0,
         }
@@ -76,17 +77,46 @@ impl<T: PrimitiveVectorElement> VolatileDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for VolatileDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement> DenseVectorStorageRead<T> for VolatileDenseVectorStorage<T> {
     fn vector_dim(&self) -> usize {
         self.dim
     }
 
-    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> &[T] {
-        self.vectors.get(key as VectorOffsetType)
+    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> Cow<'_, [T]> {
+        Cow::Borrowed(self.vectors.get(key as VectorOffsetType))
+    }
+
+    fn for_each_in_dense_batch<F: FnMut(usize, &[T])>(
+        &self,
+        keys: &[PointOffsetType],
+        f: F,
+    ) -> OperationResult<()> {
+        default_for_each_in_dense_batch(self, keys, f)
     }
 }
 
-impl<T: PrimitiveVectorElement> VectorStorage for VolatileDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for VolatileDenseVectorStorage<T> {
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &mut impl Iterator<Item = (Cow<'a, [T]>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        let start_index = self.vectors.len() as PointOffsetType;
+        for (other_vector, other_deleted) in other_vectors {
+            check_process_stopped(stopped)?;
+            let new_id = self.vectors.push(other_vector.as_ref())? as PointOffsetType;
+            self.set_deleted(new_id, other_deleted);
+        }
+        let end_index = self.vectors.len() as PointOffsetType;
+        Ok(start_index..end_index)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorageRead for VolatileDenseVectorStorage<T> {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
+    }
+
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -115,6 +145,28 @@ impl<T: PrimitiveVectorElement> VectorStorage for VolatileDenseVectorStorage<T> 
             .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
     }
 
+    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
+        self.deleted.get_bit(key as usize).unwrap_or(false)
+    }
+
+    fn deleted_vector_count(&self) -> usize {
+        self.deleted_count
+    }
+
+    fn deleted_vector_bitslice(&self) -> &BitSlice {
+        self.deleted.as_bitslice()
+    }
+
+    fn read_vector_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        default_read_vector_bytes_impl::<Self, P, U>(self, keys, callback)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorage for VolatileDenseVectorStorage<T> {
     fn insert_vector(
         &mut self,
         key: PointOffsetType,
@@ -129,23 +181,6 @@ impl<T: PrimitiveVectorElement> VectorStorage for VolatileDenseVectorStorage<T> 
         Ok(())
     }
 
-    fn update_from<'a>(
-        &mut self,
-        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Range<PointOffsetType>> {
-        let start_index = self.vectors.len() as PointOffsetType;
-        for (other_vector, other_deleted) in other_vectors {
-            check_process_stopped(stopped)?;
-            // Do not perform preprocessing - vectors should be already processed
-            let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            let new_id = self.vectors.push(other_vector.as_ref())? as PointOffsetType;
-            self.set_deleted(new_id, other_deleted);
-        }
-        let end_index = self.vectors.len() as PointOffsetType;
-        Ok(start_index..end_index)
-    }
-
     fn flusher(&self) -> Flusher {
         Box::new(|| Ok(()))
     }
@@ -157,17 +192,5 @@ impl<T: PrimitiveVectorElement> VectorStorage for VolatileDenseVectorStorage<T> 
     fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool> {
         let is_deleted = !self.set_deleted(key, true);
         Ok(is_deleted)
-    }
-
-    fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get_bit(key as usize).unwrap_or(false)
-    }
-
-    fn deleted_vector_count(&self) -> usize {
-        self.deleted_count
-    }
-
-    fn deleted_vector_bitslice(&self) -> &BitSlice {
-        self.deleted.as_bitslice()
     }
 }

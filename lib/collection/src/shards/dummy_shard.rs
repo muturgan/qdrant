@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::types::DeferredBehavior;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, SizeStats, WithPayload, WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SizeStats, StrictModeConfig, WithPayload,
+    WithPayloadInterface, WithVector,
 };
 use shard::count::CountRequestInternal;
 use shard::operations::CollectionUpdateOperations;
@@ -14,15 +16,15 @@ use shard::retrieve::record_internal::RecordInternal;
 use shard::scroll::ScrollRequestInternal;
 use shard::search::CoreSearchRequestBatch;
 use shard::snapshots::snapshot_manifest::SnapshotManifest;
-use tokio::runtime::Handle;
 
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::OperationWithClockTag;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CountResult, OptimizersStatus,
     PointRequestInternal, ShardStatus, UpdateResult, UpdateStatus,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::shards::telemetry::LocalShardTelemetry;
 
 #[derive(Clone, Debug)]
@@ -42,10 +44,13 @@ impl DummyShard {
     }
 
     pub fn on_optimizer_config_update(&self) -> CollectionResult<()> {
-        self.dummy()
+        let error = self.dummy_error("Update optimizer config");
+        log::error!("{error}");
+        // We can't fail this operation because this operation is part of consensus loop
+        Ok(())
     }
 
-    pub fn on_strict_mode_config_update(&mut self) {}
+    pub fn on_strict_mode_config_update(&mut self, _new_strict_mode: &StrictModeConfig) {}
 
     pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
         LocalShardTelemetry {
@@ -77,15 +82,15 @@ impl DummyShard {
         &self,
         _: Option<&Filter>,
     ) -> CollectionResult<CardinalityEstimation> {
-        self.dummy()
+        self.dummy("estimate_cardinality")
     }
 
-    pub fn dummy_error(&self) -> CollectionError {
-        CollectionError::service_error(self.message.clone())
+    pub fn dummy_error(&self, action: &str) -> CollectionError {
+        CollectionError::service_error(format!("Failed to {action},  {}", self.message))
     }
 
-    fn dummy<T>(&self) -> CollectionResult<T> {
-        Err(self.dummy_error())
+    fn dummy<T>(&self, action: &str) -> CollectionResult<T> {
+        Err(self.dummy_error(action))
     }
 }
 
@@ -94,18 +99,19 @@ impl ShardOperation for DummyShard {
     async fn update(
         &self,
         op: OperationWithClockTag,
-        _: bool,
+        _: WaitUntil,
         _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         match &op.operation {
-            CollectionUpdateOperations::PointOperation(_) => self.dummy(),
-            CollectionUpdateOperations::VectorOperation(_) => self.dummy(),
-            CollectionUpdateOperations::PayloadOperation(_) => self.dummy(),
+            CollectionUpdateOperations::PointOperation(_) => self.dummy("Update Points"),
+            CollectionUpdateOperations::VectorOperation(_) => self.dummy("Update Vectors"),
+            CollectionUpdateOperations::PayloadOperation(_) => self.dummy("Update Payloads"),
 
-            // Allow (and ignore) field index operations. Field index schema is stored in collection
-            // config, and indices will be created (if needed) when dummy shard is recovered.
-            CollectionUpdateOperations::FieldIndexOperation(_) => Ok(UpdateResult {
+            // Allow (and ignore) field index and vector name operations.
+            // These schemas are stored in collection config and will be recreated when recovered.
+            CollectionUpdateOperations::FieldIndexOperation(_)
+            | CollectionUpdateOperations::VectorNameOperation(_) => Ok(UpdateResult {
                 operation_id: None,
                 status: UpdateStatus::Acknowledged,
                 clock_tag: None,
@@ -124,11 +130,11 @@ impl ShardOperation for DummyShard {
     async fn scroll_by(
         &self,
         _: Arc<ScrollRequestInternal>,
-        _: &Handle,
+        _: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
-        self.dummy()
+        self.dummy("Scroll")
     }
 
     async fn local_scroll_by_id(
@@ -138,35 +144,37 @@ impl ShardOperation for DummyShard {
         _: &WithPayloadInterface,
         _: &WithVector,
         _: Option<&Filter>,
-        _: &Handle,
+        _: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
+        _: DeferredBehavior,
     ) -> CollectionResult<Vec<RecordInternal>> {
-        self.dummy()
+        self.dummy("Scroll by ID")
     }
 
     async fn info(&self) -> CollectionResult<CollectionInfo> {
-        self.dummy()
+        self.dummy("Get Info")
     }
 
     async fn core_search(
         &self,
         _: Arc<CoreSearchRequestBatch>,
-        _: &Handle,
+        _: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
-        self.dummy()
+        self.dummy("search")
     }
 
     async fn count(
         &self,
         _: Arc<CountRequestInternal>,
-        _: &Handle,
+        _: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
+        _: DeferredBehavior,
     ) -> CollectionResult<CountResult> {
-        self.dummy()
+        self.dummy("count")
     }
 
     async fn retrieve(
@@ -174,31 +182,32 @@ impl ShardOperation for DummyShard {
         _: Arc<PointRequestInternal>,
         _: &WithPayload,
         _: &WithVector,
-        _: &Handle,
+        _: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
+        _: DeferredBehavior,
     ) -> CollectionResult<Vec<RecordInternal>> {
-        self.dummy()
+        self.dummy("retrieve")
     }
 
     async fn query_batch(
         &self,
         _requests: Arc<Vec<ShardQueryRequest>>,
-        _search_runtime_handle: &Handle,
+        _search_runtime_handle: &AdaptiveSearchHandle,
         _timeout: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
-        self.dummy()
+        self.dummy("query")
     }
 
     async fn facet(
         &self,
         _: Arc<FacetParams>,
-        _search_runtime_handle: &Handle,
+        _search_runtime_handle: &AdaptiveSearchHandle,
         _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
-        self.dummy()
+        self.dummy("facet")
     }
 
     async fn stop_gracefully(self) {}

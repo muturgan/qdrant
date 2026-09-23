@@ -2,11 +2,15 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
+use common::types::DeferredBehavior;
 use fs_err::File;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::query_context::QueryContext;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
-use segment::entry::{NonAppendableSegmentEntry as _, SegmentEntry as _, SnapshotEntry as _};
+use segment::entry::{
+    NonAppendableSegmentEntry as _, ReadSegmentEntry as _, SegmentEntry as _, SnapshotEntry as _,
+    StorageSegmentEntry as _,
+};
 use segment::types::{FieldCondition, PayloadSchemaType};
 use tempfile::Builder;
 
@@ -43,6 +47,118 @@ impl ProxySegment {
 
         Ok(result.into_iter().next().unwrap())
     }
+}
+
+/// Regression test for the proxy `deleted_mask` race that drops a live point from scored
+/// search (catalog: "exact dense search + payload filter drops a candidate", optimizer-on).
+///
+/// `deleted_mask` is a snapshot of the wrapped segment's deleted bitvec. If it is synced while
+/// the wrapped segment is still appendable, an upsert can still land afterwards at an internal
+/// offset past the snapshot; the scored search consults `deleted_mask` and treats every
+/// out-of-range offset as deleted (`NotDeletedChecker` → `unwrap_or(true)`), silently
+/// excluding the live point even though scroll/retrieve still see it.
+///
+/// [`UnsyncedProxySegment::finalize`] is what reads the mask, so the fix is timing: finalize
+/// only once the wrapped segment is frozen, so the mask covers its full final point range. This
+/// test exercises both orderings on two parallel segments — finalize-before-race (buggy) vs
+/// finalize-after-race (fixed) — entirely at the proxy level, no model-testing harness involved.
+#[test]
+fn test_proxy_deleted_mask_resync_after_race_window_write() {
+    let hw_counter = HardwareCounterCell::new();
+    let query_vector: QueryVector = [1.0, 1.0, 1.0, 1.0].into();
+
+    // Build a wrapped segment with 2 points (internal offsets 0 and 1) and an unsynced proxy
+    // around it. Returns `(unsynced_proxy, wrapped_handle)` so the caller controls when the proxy
+    // is finalized (mask synced) relative to the race-window write.
+    let build_unsynced_proxy = |dir: &std::path::Path| -> (UnsyncedProxySegment, LockedSegment) {
+        let original_segment = LockedSegment::new(empty_segment(dir));
+        original_segment
+            .get()
+            .write()
+            .upsert_point(
+                1,
+                1.into(),
+                only_default_vector(&[1.0, 0.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+        original_segment
+            .get()
+            .write()
+            .upsert_point(
+                2,
+                2.into(),
+                only_default_vector(&[0.0, 1.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+
+        // Keep a handle so we can write to the wrapped segment around the proxy lifecycle.
+        let wrapped_handle = original_segment.clone();
+        let proxy = UnsyncedProxySegment::new(original_segment);
+        (proxy, wrapped_handle)
+    };
+
+    // Race-window write: a brand-new point lands at offset 2, past a length-2 `deleted_mask`.
+    let race_window_write = |wrapped: &LockedSegment| {
+        wrapped
+            .get()
+            .write()
+            .upsert_point(
+                11,
+                3.into(),
+                only_default_vector(&[1.0, 1.0, 1.0, 1.0]),
+                &hw_counter,
+            )
+            .unwrap();
+    };
+
+    let search_ids = |proxy: &ProxySegment| -> Vec<PointIdType> {
+        proxy
+            .search(
+                DEFAULT_VECTOR_NAME,
+                &query_vector,
+                &WithPayload::default(),
+                &false.into(),
+                None,
+                10,
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|scored| scored.id)
+            .collect()
+    };
+
+    // --- Buggy ordering: finalize BEFORE the race write, so the mask snapshot stops at len 2 ---
+    let buggy_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (buggy_unsynced, buggy_wrapped) = build_unsynced_proxy(buggy_dir.path());
+    let mut buggy_proxy = buggy_unsynced.finalize();
+    race_window_write(&buggy_wrapped);
+    // A proxy-level delete makes `deleted_points` non-empty, which is what makes the search
+    // path consult `deleted_mask` instead of the wrapped segment's live deleted state.
+    buggy_proxy.delete_point(10, 1.into(), &hw_counter).unwrap();
+    let buggy_ids = search_ids(&buggy_proxy);
+    assert!(
+        !buggy_ids.contains(&3.into()),
+        "finalizing before the race the point should be (buggily) dropped, got {buggy_ids:?}",
+    );
+
+    // --- Fixed ordering: finalize AFTER the race write (segment frozen), so the mask covers it ---
+    let fixed_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (fixed_unsynced, fixed_wrapped) = build_unsynced_proxy(fixed_dir.path());
+    race_window_write(&fixed_wrapped);
+    let mut fixed_proxy = fixed_unsynced.finalize();
+    fixed_proxy.delete_point(10, 1.into(), &hw_counter).unwrap();
+    let fixed_ids = search_ids(&fixed_proxy);
+    assert!(
+        fixed_ids.contains(&3.into()),
+        "finalizing after the race the point must be searchable, got {fixed_ids:?}",
+    );
+    assert!(
+        !fixed_ids.contains(&1.into()),
+        "the proxy-deleted point must still be excluded after finalize, got {fixed_ids:?}",
+    );
 }
 
 #[test]
@@ -223,21 +339,31 @@ fn test_read_filter() {
         "blue".to_string().into(),
     )));
 
-    let original_points = original_segment.get().read().read_filtered(
-        None,
-        Some(100),
-        None,
-        &is_stopped,
-        &hw_counter,
-    );
+    let original_points = original_segment
+        .get()
+        .read()
+        .read_filtered(
+            None,
+            Some(100),
+            None,
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::VisibleOnly,
+        )
+        .unwrap();
 
-    let original_points_filtered = original_segment.get().read().read_filtered(
-        None,
-        Some(100),
-        Some(&filter),
-        &is_stopped,
-        &hw_counter,
-    );
+    let original_points_filtered = original_segment
+        .get()
+        .read()
+        .read_filtered(
+            None,
+            Some(100),
+            Some(&filter),
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::VisibleOnly,
+        )
+        .unwrap();
 
     let mut proxy_segment = wrap_proxy(original_segment);
 
@@ -247,9 +373,26 @@ fn test_read_filter() {
         .delete_point(100, 2.into(), &hw_counter)
         .unwrap();
 
-    let proxy_res = proxy_segment.read_filtered(None, Some(100), None, &is_stopped, &hw_counter);
-    let proxy_res_filtered =
-        proxy_segment.read_filtered(None, Some(100), Some(&filter), &is_stopped, &hw_counter);
+    let proxy_res = proxy_segment
+        .read_filtered(
+            None,
+            Some(100),
+            None,
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::VisibleOnly,
+        )
+        .unwrap();
+    let proxy_res_filtered = proxy_segment
+        .read_filtered(
+            None,
+            Some(100),
+            Some(&filter),
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::VisibleOnly,
+        )
+        .unwrap();
 
     assert_eq!(original_points_filtered.len() - 1, proxy_res_filtered.len());
     assert_eq!(original_points.len() - 1, proxy_res.len());
@@ -398,7 +541,7 @@ fn test_point_vector_count() {
     let mut proxy_segment = ProxySegment::new(original_segment);
 
     // We have 5 points by default, assert counts
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 5);
     assert_eq!(segment_info.num_vectors, 5);
 
@@ -406,13 +549,13 @@ fn test_point_vector_count() {
     proxy_segment
         .delete_point(101, 99999.into(), &hw_cell)
         .unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 5);
     assert_eq!(segment_info.num_vectors, 5);
 
     // Delete point 1, counts should decrease by 1
     proxy_segment.delete_point(102, 4.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 4);
     assert_eq!(segment_info.num_vectors, 4);
 }
@@ -420,7 +563,7 @@ fn test_point_vector_count() {
 #[test]
 fn test_point_vector_count_multivec() {
     use segment::segment_constructor::simple_segment_constructor::{
-        VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment,
+        VECTOR1_NAME, VECTOR2_NAME, build_segment_with_two_named_vecs,
     };
     use segment::types::Distance;
 
@@ -428,7 +571,8 @@ fn test_point_vector_count_multivec() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 1;
 
-    let mut original_segment = build_multivec_segment(dir.path(), dim, dim, Distance::Dot).unwrap();
+    let mut original_segment =
+        build_segment_with_two_named_vecs(dir.path(), dim, dim, Distance::Dot).unwrap();
 
     let hw_cell = HardwareCounterCell::new();
 
@@ -460,19 +604,19 @@ fn test_point_vector_count_multivec() {
     let mut proxy_segment = ProxySegment::new(original_segment);
 
     // Assert counts from original segment
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 4);
 
     // Delete nonexistent point, counts should remain the same
     proxy_segment.delete_point(104, 1.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 4);
 
     // Delete point 4, counts should decrease by 1
     proxy_segment.delete_point(105, 4.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 1);
     assert_eq!(segment_info.num_vectors, 2);
 }
@@ -503,4 +647,68 @@ fn test_proxy_segment_flush() {
     // We can never fully persist proxy segment, as list of deleted points is always in-memory only.
     // So we have to keep WAL for deleted points.
     assert!(version_after_delete > flushed_version_2);
+}
+
+#[test]
+fn test_proxy_deferred() {
+    let hw_counter = HardwareCounterCell::new();
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let mut wrapped_segment = build_segment_with_deferred_1(tmp_dir.path());
+
+    let initial_estimation = wrapped_segment.estimate_point_count(None, &hw_counter);
+
+    let initial_deferred_point_count = wrapped_segment.size_info().num_deferred_points.unwrap();
+
+    wrapped_segment
+        .delete_point_internal(3, None, &hw_counter)
+        .unwrap();
+
+    assert_eq!(
+        wrapped_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 1
+    );
+
+    let mut proxy_segment = ProxySegment::new(LockedSegment::new(wrapped_segment));
+
+    assert_eq!(
+        proxy_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 1
+    );
+
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 3);
+
+    proxy_segment
+        .delete_point(7, 5.into(), &hw_counter)
+        .unwrap();
+
+    assert_eq!(
+        proxy_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 2
+    );
+
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 3);
+
+    // We didn't touch normal points so estimation should not change.
+    assert_eq!(
+        proxy_segment.estimate_point_count(None, &hw_counter),
+        initial_estimation
+    );
+
+    // Touch normal points
+    proxy_segment
+        .delete_point(6, 1.into(), &hw_counter)
+        .unwrap();
+
+    // Now we must see a difference in estimation.
+    assert_ne!(
+        proxy_segment.estimate_point_count(None, &hw_counter),
+        initial_estimation
+    );
+
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 2);
 }

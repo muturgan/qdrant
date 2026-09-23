@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter};
 
 use ahash::AHashSet;
-use api::rest::{OrderByInterface, SearchRequestInternal};
+use api::rest::SearchRequestInternal;
 use collection::operations::CollectionUpdateOperations;
 use collection::operations::payload_ops::{PayloadOps, SetPayloadOp};
 use collection::operations::point_ops::{
@@ -12,20 +12,21 @@ use collection::operations::point_ops::{
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     CountRequestInternal, PointRequestInternal, RecommendRequestInternal, ScrollRequestInternal,
-    UpdateStatus,
+    ScrollResult, UpdateStatus,
 };
 use collection::recommendations::recommend_by;
 use collection::shards::replica_set::replica_set_state::{ReplicaSetState, ReplicaState};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use fs_err::File;
 use itertools::Itertools;
-use segment::data_types::order_by::{Direction, OrderBy};
+use segment::data_types::order_by::{Direction, OrderBy, OrderByInterface};
 use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     Condition, ExtendedPointId, FieldCondition, Filter, HasIdCondition, Payload,
     PayloadFieldSchema, PayloadSchemaType, PointIdType, WithPayloadInterface,
 };
 use serde_json::Map;
+use shard::query::{SampleInternal, ScoringQuery, ShardQueryRequest};
 use tempfile::Builder;
 
 use crate::common::{N_SHARDS, load_local_collection, simple_collection_fixture};
@@ -42,10 +43,7 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
     let batch = BatchPersisted {
-        ids: vec![0, 1, 2, 3, 4]
-            .into_iter()
-            .map(|x| x.into())
-            .collect_vec(),
+        ids: vec![0, 1, 2, 3, 4].into_iter().map(u64::into).collect_vec(),
         vectors: BatchVectorStructPersisted::Single(vec![
             vec![1.0, 0.0, 1.0, 1.0],
             vec![1.0, 0.0, 1.0, 0.0],
@@ -93,6 +91,7 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
     let search_res = collection
         .search(
             search_request.into(),
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -171,6 +170,7 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         .search(
             search_request.into(),
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             hw_acc,
@@ -206,6 +206,7 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         .count(
             count_request,
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             hw_acc,
@@ -215,7 +216,6 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
     assert_eq!(count_res.count, 1);
 }
 
-// FIXME: does not work
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collection_loading() {
     test_collection_loading_with_shards(1).await;
@@ -229,10 +229,7 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
         let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
         let batch = BatchPersisted {
-            ids: vec![0, 1, 2, 3, 4]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
+            ids: vec![0, 1, 2, 3, 4].into_iter().map(u64::into).collect_vec(),
             vectors: BatchVectorStructPersisted::Single(vec![
                 vec![1.0, 0.0, 1.0, 1.0],
                 vec![1.0, 0.0, 1.0, 0.0],
@@ -299,6 +296,7 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
     let retrieved = loaded_collection
         .retrieve(
             request,
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -386,7 +384,7 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
     let batch = BatchPersisted {
         ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
             .into_iter()
-            .map(|x| x.into())
+            .map(u64::into)
             .collect_vec(),
         vectors: BatchVectorStructPersisted::Single(vec![
             vec![0.0, 0.0, 1.0, 1.0],
@@ -427,6 +425,7 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
         &collection,
         |_name| async { unreachable!("Should not be called in this test") },
         None,
+        None,
         ShardSelectorInternal::All,
         None,
         hw_acc,
@@ -452,7 +451,7 @@ async fn test_read_api_with_shards(shard_number: u32) {
     let batch = BatchPersisted {
         ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
             .into_iter()
-            .map(|x| x.into())
+            .map(u64::into)
             .collect_vec(),
         vectors: BatchVectorStructPersisted::Single(vec![
             vec![0.0, 0.0, 1.0, 1.0],
@@ -495,6 +494,7 @@ async fn test_read_api_with_shards(shard_number: u32) {
                 order_by: None,
             },
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             HwMeasurementAcc::new(),
@@ -504,6 +504,91 @@ async fn test_read_api_with_shards(shard_number: u32) {
 
     assert_eq!(result.next_page_offset, Some(2.into()));
     assert_eq!(result.points.len(), 2);
+}
+
+/// Scrolling without payload or vectors skips retrieval; the page must still match.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scroll_without_payload_or_vectors() {
+    const KEY: &str = "price";
+
+    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection = simple_collection_fixture(collection_dir.path(), 1).await;
+
+    let batch = BatchPersisted {
+        ids: (0..6).map(u64::into).collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![vec![1.0, 0.0, 0.0, 0.0]; 6]),
+        payloads: Some(
+            (0..6)
+                .map(|i| Some(Payload(Map::from_iter([(KEY.to_string(), i.into())]))))
+                .collect(),
+        ),
+    };
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
+    collection
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            HwMeasurementAcc::new(),
+        )
+        .await
+        .unwrap();
+    collection
+        .create_payload_index_with_wait(
+            KEY.parse().unwrap(),
+            PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+            true,
+            HwMeasurementAcc::new(),
+        )
+        .await
+        .unwrap();
+
+    let order_by = OrderByInterface::Struct(OrderBy {
+        key: KEY.parse().unwrap(),
+        direction: Some(Direction::Desc),
+        start_from: None,
+    });
+    for order_by in [None, Some(order_by)] {
+        let scroll = |with_payload| {
+            collection.scroll_by(
+                ScrollRequestInternal {
+                    offset: None,
+                    limit: Some(4),
+                    filter: None,
+                    with_payload: Some(WithPayloadInterface::Bool(with_payload)),
+                    with_vector: false.into(),
+                    order_by: order_by.clone(),
+                },
+                None,
+                None,
+                &ShardSelectorInternal::All,
+                None,
+                HwMeasurementAcc::new(),
+            )
+        };
+        let full = scroll(true).await.unwrap();
+        let bare = scroll(false).await.unwrap();
+
+        assert_eq!(full.points.len(), 4);
+        assert!(full.points.iter().all(|point| point.payload.is_some()));
+        assert!(
+            bare.points
+                .iter()
+                .all(|point| point.payload.is_none() && point.vector.is_none())
+        );
+        assert_eq!(bare.next_page_offset, full.next_page_offset);
+        let page = |result: &ScrollResult| {
+            result
+                .points
+                .iter()
+                .map(|point| (point.id, point.order_value))
+                .collect_vec()
+        };
+        assert_eq!(page(&bare), page(&full));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -551,7 +636,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
     let batch = BatchPersisted {
         ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
             .into_iter()
-            .map(|x| x.into())
+            .map(u64::into)
             .collect_vec(),
         vectors: BatchVectorStructPersisted::Single(vec![
             vec![0.0, 0.0, 1.0, 1.0],
@@ -635,6 +720,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                     })),
                 },
                 None,
+                None,
                 &ShardSelectorInternal::All,
                 None,
                 HwMeasurementAcc::new(),
@@ -666,6 +752,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                         start_from: None,
                     })),
                 },
+                None,
                 None,
                 &ShardSelectorInternal::All,
                 None,
@@ -708,6 +795,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                     })),
                 },
                 None,
+                None,
                 &ShardSelectorInternal::All,
                 None,
                 HwMeasurementAcc::new(),
@@ -722,7 +810,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
             .collect::<HashSet<_>>();
         let valid_asc_second_page_points = [10, 9, 8, 7, 6]
             .into_iter()
-            .map(|x| x.into())
+            .map(u64::into)
             .collect::<HashSet<ExtendedPointId>>();
         assert_eq!(asc_second_page.points.len(), 5);
         assert!(asc_second_page_points.is_subset(&valid_asc_second_page_points));
@@ -748,6 +836,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                     })),
                 },
                 None,
+                None,
                 &ShardSelectorInternal::All,
                 None,
                 HwMeasurementAcc::new(),
@@ -763,7 +852,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
 
         let valid_desc_second_page_points = [5, 6, 7, 8, 9]
             .into_iter()
-            .map(|x| x.into())
+            .map(u64::into)
             .collect::<HashSet<ExtendedPointId>>();
 
         assert_eq!(desc_second_page.points.len(), 4);
@@ -784,6 +873,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                 with_vector: false.into(),
                 order_by: Some(OrderByInterface::Key(MULTI_VALUE_KEY.parse().unwrap())),
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -821,10 +911,7 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
     let batch = BatchPersisted {
-        ids: vec![0, 1, 2, 3, 4]
-            .into_iter()
-            .map(|x| x.into())
-            .collect_vec(),
+        ids: vec![0, 1, 2, 3, 4].into_iter().map(u64::into).collect_vec(),
         vectors: BatchVectorStructPersisted::Single(vec![
             vec![1.0, 0.0, 1.0, 1.0],
             vec![1.0, 0.0, 1.0, 0.0],
@@ -894,6 +981,7 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
                 order_by: None,
             },
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             HwMeasurementAcc::new(),
@@ -951,4 +1039,72 @@ async fn test_collection_local_load_initializing_not_stuck() {
             assert_eq!(replica_state, &ReplicaState::Active);
         }
     }
+}
+
+/// Regression test for an unauthenticated allocator-abort (SIGABRT) in
+/// `LocalShard::scroll_randomly`. The random-sample path pre-allocated
+/// `HashSet::with_capacity(limit)` directly from the client-supplied `limit`,
+/// which is unbounded by default. A huge `limit` made the up-front allocation
+/// fail and abort the whole process. The pre-allocation is now bounded by the
+/// number of points actually available, so the query returns those points.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_random_sample_huge_limit_does_not_abort() {
+    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+
+    // Single shard: avoids cross-shard undersampling, so the raw `limit` reaches
+    // `scroll_randomly` unchanged.
+    let collection = simple_collection_fixture(collection_dir.path(), 1).await;
+
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2].into_iter().map(u64::into).collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ]),
+        payloads: None,
+    };
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
+    collection
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            HwMeasurementAcc::new(),
+        )
+        .await
+        .unwrap();
+
+    // Unbounded client limit: before the fix this aborted the process in
+    // `HashSet::with_capacity(limit)`.
+    let request = ShardQueryRequest {
+        prefetches: vec![],
+        query: Some(ScoringQuery::Sample(SampleInternal::Random)),
+        filter: None,
+        score_threshold: None,
+        limit: 1_000_000_000_000,
+        offset: 0,
+        params: None,
+        with_vector: false.into(),
+        with_payload: false.into(),
+    };
+
+    let result = collection
+        .query(
+            request,
+            None,
+            None,
+            ShardSelectorInternal::All,
+            None,
+            HwMeasurementAcc::new(),
+        )
+        .await
+        .unwrap();
+
+    // Bounded by the points actually available; the request completes instead of
+    // aborting.
+    assert_eq!(result.len(), 3);
 }

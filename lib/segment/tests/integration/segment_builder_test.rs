@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +12,9 @@ use itertools::Itertools;
 use segment::common::operation_error::OperationError;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, VectorRef, only_default_vector};
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
-use segment::index::hnsw_index::num_rayon_threads;
+use segment::entry::entry_point::{NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry};
+use segment::id_tracker::IdTrackerRead;
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::json_path::JsonPath;
 use segment::segment::Segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
@@ -24,7 +25,7 @@ use segment::types::{
 };
 use serde_json::Value;
 use sparse::common::sparse_vector::SparseVector;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 use uuid::Uuid;
 
 use crate::fixtures::segment::{
@@ -62,7 +63,7 @@ fn test_building_new_segment() {
         .unwrap();
 
     builder
-        .update(&[&segment1, &segment2, &segment2], &stopped)
+        .update(&[&segment1, &segment2, &segment2], &stopped, &hw_counter)
         .unwrap();
 
     // Check what happens if segment building fails here
@@ -141,7 +142,9 @@ fn test_building_new_defragmented_segment() {
 
     builder.set_defragment_keys(vec![defragment_key.clone()]);
 
-    builder.update(&[&segment1, &segment2], &stopped).unwrap();
+    builder
+        .update(&[&segment1, &segment2], &stopped, &hw_counter)
+        .unwrap();
 
     // Check what happens if segment building fails here
 
@@ -197,7 +200,7 @@ fn check_points_defragmented(
 
     let hw_counter = HardwareCounterCell::new();
 
-    for internal_id in id_tracker.iter_internal() {
+    for internal_id in id_tracker.point_mappings().iter_internal() {
         let external_id = id_tracker.external_id(internal_id).unwrap();
         let payload = segment.payload(external_id, &hw_counter).unwrap();
         let values = payload.get_value(defragment_key);
@@ -265,7 +268,7 @@ fn test_building_new_sparse_segment() {
         .unwrap();
 
     builder
-        .update(&[&segment1, &segment2, &segment2], &stopped)
+        .update(&[&segment1, &segment2, &segment2], &stopped, &hw_counter)
         .unwrap();
 
     // Check what happens if segment building fails here
@@ -333,7 +336,8 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
     )
     .unwrap();
 
-    builder.update(&[segment], &stopped).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    builder.update(&[segment], &stopped, &hw_counter).unwrap();
 
     let now = Instant::now();
 
@@ -349,7 +353,7 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
             .unwrap();
     }
 
-    let permit_cpu_count = num_rayon_threads(0);
+    let permit_cpu_count = get_num_indexing_threads(0);
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
     let progress = ProgressTracker::new_for_test();
@@ -357,6 +361,7 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
     let res = builder.build(
         dir.path(),
         Uuid::new_v4(),
+        None,
         permit,
         &stopped,
         &mut rng,
@@ -421,7 +426,9 @@ fn test_building_new_segment_bug_5614() {
         .upsert_point(124, 100.into(), vector_100_high.clone(), &hw_counter)
         .unwrap();
 
-    builder.update(&[&segment1, &segment2], &stopped).unwrap();
+    builder
+        .update(&[&segment1, &segment2], &stopped, &hw_counter)
+        .unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -458,7 +465,7 @@ fn test_building_cancellation() {
 
     let hw_counter = HardwareCounterCell::new();
 
-    for idx in 0..2000 {
+    for idx in 0..15000 {
         baseline_segment
             .upsert_point(
                 1,
@@ -496,7 +503,11 @@ fn test_building_cancellation() {
     let late_stop_delay = time_baseline / 5;
     let (time_long, was_cancelled_later) = estimate_build_time(&segment_2, Some(late_stop_delay));
 
-    let acceptable_stopping_delay = 600; // millis
+    // Timing on CI (especially Windows) can be noisy due to scheduler delays and
+    // coarse timer granularity. Keep a fixed lower bound but scale tolerance for
+    // slower baseline runs. Windows debug builds can take ~1s to observe a stop
+    // signal during the pre-HNSW setup phase.
+    let acceptable_stopping_delay = std::cmp::max(1500, time_baseline / 3); // millis
 
     assert!(was_cancelled_early);
     assert!(
@@ -509,10 +520,220 @@ fn test_building_cancellation() {
         time_long < late_stop_delay + acceptable_stopping_delay,
         "time_later: {time_long}, late_stop_delay: {late_stop_delay}"
     );
+    assert!(
+        time_long < time_baseline,
+        "cancelled build should be faster than baseline: time_later={time_long}, baseline={time_baseline}",
+    );
 
     assert!(
         time_fast < time_long,
         "time_early: {time_fast}, time_later: {time_long}, was_cancelled_later: {was_cancelled_later}",
+    );
+}
+
+/// `SegmentBuilder::update` must reject schema mismatches in both directions
+/// to avoid silently producing a merged segment with the wrong schema.
+///
+/// Direction A — target has a vector the source lacks. The existing check
+/// fires; documents the symmetric case for completeness.
+///
+/// Direction B — source has a vector the target lacks. This is the case the
+/// optimizer-vs-`CreateVectorName(V)` race produces: an optimizer launched
+/// before V was added captures a `target_config` without V, but a concurrent
+/// `CreateVectorName(V)` mutates the source segments to include V. Without
+/// the source-superset check, `update` would silently drop V's data and
+/// emit a broken merged segment at version >= V_opnum, breaking the next
+/// optimization round.
+#[test]
+fn test_segment_builder_rejects_target_with_extra_vector_name() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+
+    let stopped = AtomicBool::new(false);
+    let hw_counter = HardwareCounterCell::new();
+
+    let segment1 = build_segment_1(dir.path());
+
+    let added_vector_name = "added_vec";
+    let mut target_config = segment1.segment_config.clone();
+    target_config.vector_data.insert(
+        added_vector_name.to_owned(),
+        VectorDataConfig {
+            size: 4,
+            distance: Distance::Dot,
+            storage_type: VectorStorageType::default(),
+            index: Indexes::Plain {},
+            quantization_config: None,
+            multivector_config: None,
+            datatype: None,
+        },
+    );
+
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &target_config,
+        &HnswGlobalConfig::default(),
+    )
+    .unwrap();
+
+    let err = builder
+        .update(&[&segment1], &stopped, &hw_counter)
+        .expect_err("merge must reject sources missing a target vector");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing vector name") && msg.contains(added_vector_name),
+        "unexpected error message: {msg}",
+    );
+}
+
+/// Build a source segment that carries the default vector plus `extra_vector_name`, together with a
+/// target schema that lacks `extra_vector_name`. This is the shape both races produce: a source
+/// vector name absent from the optimizer's target. The returned [`TempDir`]s must be kept alive for
+/// the duration of the test.
+fn build_source_with_extra_vector(
+    extra_vector_name: &str,
+    hw_counter: &HardwareCounterCell,
+) -> (Segment, SegmentConfig, Vec<TempDir>) {
+    use segment::segment_constructor::build_segment;
+
+    let source_dir = Builder::new().prefix("segment_source").tempdir().unwrap();
+
+    let template = build_segment_1(source_dir.path());
+    let mut source_config = template.segment_config.clone();
+    source_config.vector_data.insert(
+        extra_vector_name.to_owned(),
+        VectorDataConfig {
+            size: 4,
+            distance: Distance::Dot,
+            storage_type: VectorStorageType::default(),
+            index: Indexes::Plain {},
+            quantization_config: None,
+            multivector_config: None,
+            datatype: None,
+        },
+    );
+    drop(template);
+
+    let source_dir2 = Builder::new().prefix("segment_source2").tempdir().unwrap();
+    let (mut source, _) = build_segment(source_dir2.path(), &source_config, None, true).unwrap();
+    for i in 0..3u64 {
+        let vectors = NamedVectors::from_pairs([
+            (DEFAULT_VECTOR_NAME.to_owned(), vec![0.5, 0.5, 0.5, 0.5]),
+            (extra_vector_name.to_owned(), vec![1.0, 1.0, 1.0, 1.0]),
+        ]);
+        source
+            .upsert_point(10 + i, (100 + i).into(), vectors, hw_counter)
+            .unwrap();
+    }
+
+    // Target schema lacks the extra vector.
+    let mut target_config = source_config;
+    target_config.vector_data.remove(extra_vector_name);
+
+    (source, target_config, vec![source_dir, source_dir2])
+}
+
+#[test]
+fn test_segment_builder_rejects_source_with_extra_vector_name() {
+    // Conservative default: without a live schema (`set_live_vector_names` not called), a source
+    // vector name absent from the target cancels the merge. This covers the
+    // CreateVectorName-vs-optimizer race, where dropping the vector would corrupt the next round.
+    let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+    let stopped = AtomicBool::new(false);
+    let hw_counter = HardwareCounterCell::new();
+    let extra_vector_name = "extra_vec";
+
+    let (source, target_config, _dirs) =
+        build_source_with_extra_vector(extra_vector_name, &hw_counter);
+
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &target_config,
+        &HnswGlobalConfig::default(),
+    )
+    .unwrap();
+
+    let err = builder
+        .update(&[&source], &stopped, &hw_counter)
+        .expect_err("merge must reject a source carrying a vector not in target");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("extra vector name") && msg.contains(extra_vector_name),
+        "unexpected error message: {msg}",
+    );
+}
+
+#[test]
+fn test_segment_builder_drops_deleted_source_vector_name() {
+    // DeleteVectorName recovery: the extra vector is absent from the live collection schema, so the
+    // merge prunes the stale data and succeeds rather than cancelling forever.
+    let build_dir = Builder::new().prefix("segment_build").tempdir().unwrap();
+    let out_dir = Builder::new().prefix("segment_out").tempdir().unwrap();
+    let stopped = AtomicBool::new(false);
+    let hw_counter = HardwareCounterCell::new();
+    let extra_vector_name = "extra_vec";
+
+    let (source, target_config, _dirs) =
+        build_source_with_extra_vector(extra_vector_name, &hw_counter);
+
+    let mut builder = SegmentBuilder::new(
+        build_dir.path(),
+        &target_config,
+        &HnswGlobalConfig::default(),
+    )
+    .unwrap();
+
+    // Live schema has only the default vector — the extra one was deleted from the collection.
+    builder.set_live_vector_names(HashSet::from([DEFAULT_VECTOR_NAME.to_owned()]));
+
+    builder
+        .update(&[&source], &stopped, &hw_counter)
+        .expect("merge should succeed by dropping the deleted source vector");
+
+    let built = builder.build_for_test(out_dir.path());
+    assert!(
+        !built.vector_data.contains_key(extra_vector_name),
+        "built segment must not contain the dropped vector {extra_vector_name}",
+    );
+    assert!(
+        built.vector_data.contains_key(DEFAULT_VECTOR_NAME),
+        "built segment must retain the default vector",
+    );
+}
+
+#[test]
+fn test_segment_builder_rejects_source_when_extra_vector_still_live() {
+    // CreateVectorName race: the extra vector is still present in the live collection schema (it was
+    // just created), only this optimizer's frozen target lags behind. Dropping it would corrupt the
+    // next round, so the merge must cancel even with a live schema set.
+    let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+    let stopped = AtomicBool::new(false);
+    let hw_counter = HardwareCounterCell::new();
+    let extra_vector_name = "extra_vec";
+
+    let (source, target_config, _dirs) =
+        build_source_with_extra_vector(extra_vector_name, &hw_counter);
+
+    let mut builder = SegmentBuilder::new(
+        temp_dir.path(),
+        &target_config,
+        &HnswGlobalConfig::default(),
+    )
+    .unwrap();
+
+    // Live schema still carries the extra vector.
+    builder.set_live_vector_names(HashSet::from([
+        DEFAULT_VECTOR_NAME.to_owned(),
+        extra_vector_name.to_owned(),
+    ]));
+
+    let err = builder
+        .update(&[&source], &stopped, &hw_counter)
+        .expect_err("merge must reject a source whose extra vector is still in the live schema");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("extra vector name") && msg.contains(extra_vector_name),
+        "unexpected error message: {msg}",
     );
 }
 

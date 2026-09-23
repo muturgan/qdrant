@@ -1,27 +1,21 @@
 use std::path::Path;
-use std::sync::Arc;
-#[cfg(feature = "rocksdb")]
-use std::sync::atomic::AtomicBool;
 
-use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
 use common::types::PointOffsetType;
 use itertools::Itertools;
 use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 
-#[cfg(feature = "rocksdb")]
-use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::QueryVector;
-use crate::fixtures::payload_context_fixture::FixtureIdTracker;
-use crate::id_tracker::IdTrackerSS;
+use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
+use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::point_scorer::BatchFilteredSearcher;
+use crate::segment_constructor::batched_reader::merge_from_single_source;
 use crate::vector_storage::query::RecoQuery;
 use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
-#[cfg(feature = "rocksdb")]
-use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
 use crate::vector_storage::sparse::volatile_sparse_vector_storage::new_volatile_sparse_vector_storage;
-use crate::vector_storage::{DEFAULT_STOPPED, Random, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage, VectorStorageEnum, VectorStorageRead};
 
 fn do_test_delete_points(storage: &mut VectorStorageEnum) {
     let points: Vec<SparseVector> = vec![
@@ -36,10 +30,7 @@ fn do_test_delete_points(storage: &mut VectorStorageEnum) {
     .collect();
 
     let delete_mask = [false, false, true, true, false];
-    let id_tracker: Arc<AtomicRefCell<IdTrackerSS>> =
-        Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
-
-    let borrowed_id_tracker = id_tracker.borrow_mut();
+    let id_tracker = create_id_tracker_fixture(points.len());
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -86,11 +77,11 @@ fn do_test_delete_points(storage: &mut VectorStorageEnum) {
     let searcher = BatchFilteredSearcher::new_for_test(
         &[query_vector],
         storage,
-        borrowed_id_tracker.deleted_point_bitslice(),
+        id_tracker.deleted_point_bitslice(),
         5,
     );
     let closest = searcher
-        .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), &DEFAULT_STOPPED)
+        .peek_top_iter([0, 1, 2, 3, 4].iter().cloned(), &DEFAULT_STOPPED)
         .unwrap()
         .into_iter()
         .exactly_one()
@@ -133,12 +124,9 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
     .map(|opt| opt.map(|v| v.try_into().unwrap()))
     .collect();
 
-    let id_tracker: Arc<AtomicRefCell<IdTrackerSS>> =
-        Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
-
     let hw_counter = HardwareCounterCell::new();
 
-    let borrowed_id_tracker = id_tracker.borrow_mut();
+    let id_tracker = create_id_tracker_fixture(points.len());
     {
         let mut storage2 = new_volatile_sparse_vector_storage();
 
@@ -152,13 +140,7 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
             }
         });
 
-        let mut iter = (0..points.len()).map(|i| {
-            let i = i as PointOffsetType;
-            let vec = storage2.get_vector::<Random>(i);
-            let deleted = storage2.is_deleted_vector(i);
-            (vec, deleted)
-        });
-        storage.update_from(&mut iter, &Default::default()).unwrap();
+        merge_from_single_source(storage, &storage2, points.len() as PointOffsetType).unwrap();
     }
 
     assert_eq!(
@@ -181,11 +163,11 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
     let searcher = BatchFilteredSearcher::new_for_test(
         &[query_vector],
         storage,
-        borrowed_id_tracker.deleted_point_bitslice(),
+        id_tracker.deleted_point_bitslice(),
         5,
     );
     let results = searcher
-        .peek_top_iter(&mut [0, 1, 2, 3, 4, 5].iter().cloned(), &DEFAULT_STOPPED)
+        .peek_top_iter([0, 1, 2, 3, 4, 5].iter().cloned(), &DEFAULT_STOPPED)
         .unwrap();
 
     let closest = results.into_iter().exactly_one().unwrap();
@@ -269,23 +251,6 @@ fn do_test_persistence(open: impl Fn(&Path) -> VectorStorageEnum) {
 }
 
 #[test]
-#[cfg(feature = "rocksdb")]
-fn test_delete_points_in_simple_sparse_vector_storage() {
-    let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
-
-    {
-        let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-        let mut storage =
-            open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap();
-        do_test_delete_points(&mut storage);
-        storage.flusher()().unwrap();
-    }
-    let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-    let _storage =
-        open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap();
-}
-
-#[test]
 fn test_delete_points_in_mmap_sparse_vector_storage() {
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
     let mut storage =
@@ -297,23 +262,6 @@ fn test_delete_points_in_mmap_sparse_vector_storage() {
     drop(storage);
 
     let _storage = MmapSparseVectorStorage::open_or_create(dir.path()).unwrap();
-}
-
-#[test]
-#[cfg(feature = "rocksdb")]
-fn test_update_from_delete_points_simple_sparse_vector_storage() {
-    let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
-    {
-        let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-        let mut storage =
-            open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap();
-        do_test_update_from_delete_points(&mut storage);
-        storage.flusher()().unwrap();
-    }
-
-    let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-    let _storage =
-        open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap();
 }
 
 #[test]
@@ -336,14 +284,5 @@ fn test_update_from_delete_points_mmap_sparse_vector_storage() {
 fn test_persistence_in_mmap_sparse_vector_storage() {
     do_test_persistence(|path| {
         VectorStorageEnum::SparseMmap(MmapSparseVectorStorage::open_or_create(path).unwrap())
-    });
-}
-
-#[test]
-#[cfg(feature = "rocksdb")]
-fn test_persistence_in_simple_sparse_vector_storage() {
-    do_test_persistence(|path| {
-        let db = open_db(path, &[DB_VECTOR_CF]).unwrap();
-        open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap()
     });
 }

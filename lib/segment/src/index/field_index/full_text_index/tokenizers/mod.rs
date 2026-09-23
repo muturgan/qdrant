@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::borrow::Cow;
 use std::sync::Arc;
 mod ascii_folding;
@@ -11,6 +15,7 @@ pub use stemmer::Stemmer;
 pub use tokens_processor::TokensProcessor;
 
 use crate::data_types::index::{TextIndexParams, TokenizerType};
+use crate::index::field_index::full_text_index::inverted_index::ARRAY_BOUNDARY_SENTINEL;
 use crate::index::field_index::full_text_index::stop_words::StopwordsFilter;
 
 struct WhiteSpaceTokenizer;
@@ -153,10 +158,15 @@ fn truncate_cow_ref<'a>(inp: &Cow<'a, str>, len: usize) -> Cow<'a, str> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Tokenizer {
     tokenizer_type: TokenizerType,
     tokens_processor: TokensProcessor,
+}
+
+pub enum TokenizerTextKind {
+    Query,
+    Document,
 }
 
 impl Tokenizer {
@@ -169,6 +179,7 @@ impl Tokenizer {
             lowercase,
             ascii_folding,
             on_disk: _,
+            memory: _,
             phrase_matching: _,
             stopwords,
             stemmer,
@@ -183,7 +194,7 @@ impl Tokenizer {
             lowercase,
             ascii_folding,
             stopwords_filter,
-            stemmer.as_ref().map(Stemmer::from_algorithm),
+            stemmer.as_ref().and_then(Stemmer::from_algorithm),
             *min_token_len,
             *max_token_len,
         );
@@ -198,34 +209,37 @@ impl Tokenizer {
         }
     }
 
-    pub fn tokenize_doc<'a, C: FnMut(Cow<'a, str>)>(&'a self, text: &'a str, callback: C) {
-        match self.tokenizer_type {
-            TokenizerType::Whitespace => {
-                WhiteSpaceTokenizer::tokenize(text, &self.tokens_processor, callback)
-            }
-            TokenizerType::Word => WordTokenizer::tokenize(text, &self.tokens_processor, callback),
-            TokenizerType::Multilingual => {
-                MultilingualTokenizer::tokenize(text, &self.tokens_processor, callback)
-            }
-            TokenizerType::Prefix => {
-                PrefixTokenizer::tokenize(text, &self.tokens_processor, callback)
-            }
+    pub fn tokenize<'a, C: FnMut(Cow<'a, str>)>(
+        &self,
+        kind: TokenizerTextKind,
+        text: &'a str,
+        callback: C,
+    ) {
+        let Self {
+            tokenizer_type,
+            tokens_processor: tp,
+        } = self;
+        match tokenizer_type {
+            TokenizerType::Whitespace => WhiteSpaceTokenizer::tokenize(text, tp, callback),
+            TokenizerType::Word => WordTokenizer::tokenize(text, tp, callback),
+            TokenizerType::Multilingual => MultilingualTokenizer::tokenize(text, tp, callback),
+            TokenizerType::Prefix => match kind {
+                TokenizerTextKind::Document => PrefixTokenizer::tokenize(text, tp, callback),
+                TokenizerTextKind::Query => PrefixTokenizer::tokenize_query(text, tp, callback),
+            },
         }
     }
 
-    pub fn tokenize_query<'a, C: FnMut(Cow<'a, str>)>(&'a self, text: &'a str, callback: C) {
-        match self.tokenizer_type {
-            TokenizerType::Whitespace => {
-                WhiteSpaceTokenizer::tokenize(text, &self.tokens_processor, callback)
+    pub fn tokenize_doc<'a, C: FnMut(Cow<'a, str>)>(&'a self, text: &'a str, callback: C) {
+        self.tokenize(TokenizerTextKind::Document, text, callback);
+    }
+
+    pub fn tokenize_query<'a, C: FnMut(Cow<'a, str>)>(&'a self, text: &'a str, mut callback: C) {
+        self.tokenize(TokenizerTextKind::Query, text, |token| {
+            if token != ARRAY_BOUNDARY_SENTINEL {
+                callback(token)
             }
-            TokenizerType::Word => WordTokenizer::tokenize(text, &self.tokens_processor, callback),
-            TokenizerType::Multilingual => {
-                MultilingualTokenizer::tokenize(text, &self.tokens_processor, callback)
-            }
-            TokenizerType::Prefix => {
-                PrefixTokenizer::tokenize_query(text, &self.tokens_processor, callback)
-            }
-        }
+        });
     }
 }
 
@@ -246,6 +260,7 @@ mod tests {
             r#type: Snowball::Snowball,
             language,
         }))
+        .expect("snowball algorithm always yields a stemmer")
     }
 
     #[test]
@@ -404,6 +419,7 @@ mod tests {
         let text = "Hello, Мир!";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Prefix,
             min_token_len: Some(1),
@@ -437,6 +453,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -481,6 +498,7 @@ mod tests {
         for &tokenizer_type in &tokenizer_types {
             let mut tokens = Vec::new();
             let params = TextIndexParams {
+                memory: None,
                 r#type: TextIndexType::Text,
                 tokenizer: tokenizer_type,
                 min_token_len: None,
@@ -515,6 +533,7 @@ mod tests {
         use crate::data_types::index::Language;
 
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -555,6 +574,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog as a test";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -595,6 +615,7 @@ mod tests {
         let mut tokens = Vec::new();
         use crate::data_types::index::Language;
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -632,6 +653,7 @@ mod tests {
         let mut tokens = Vec::new();
         use crate::data_types::index::Language;
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -678,6 +700,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -727,6 +750,7 @@ mod tests {
 
         // ascii_folding disabled (default)
         let params_disabled = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -746,6 +770,7 @@ mod tests {
 
         // ascii_folding enabled
         let params_enabled = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,

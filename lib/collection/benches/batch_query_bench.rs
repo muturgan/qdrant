@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use api::rest::SearchRequestInternal;
+use collection::common::adaptive_handle::AdaptiveSearchHandle;
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
@@ -12,13 +13,13 @@ use collection::operations::universal_query::shard_query::{
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::local_shard::LocalShard;
-use collection::shards::shard_trait::ShardOperation;
+use collection::shards::shard_trait::{ShardOperation, WaitUntil};
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::save_on_disk::SaveOnDisk;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ordered_float::OrderedFloat;
-use rand::rng;
+use rand::rngs::SmallRng;
 use segment::common::reciprocal_rank_fusion::DEFAULT_RRF_K;
 use segment::data_types::vectors::{VectorStructInternal, only_default_vector};
 use segment::fixtures::payload_fixtures::random_vector;
@@ -30,9 +31,6 @@ use shard::search::CoreSearchRequestBatch;
 use tempfile::{Builder, TempDir};
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
-
-#[cfg(not(target_os = "windows"))]
-mod prof;
 
 fn setup() -> (TempDir, LocalShard, Runtime) {
     let storage_dir = Builder::new().prefix("storage").tempdir().unwrap();
@@ -91,7 +89,7 @@ fn setup() -> (TempDir, LocalShard, Runtime) {
             Default::default(),
             payload_index_schema,
             handle.clone(),
-            handle.clone(),
+            AdaptiveSearchHandle::new_fixed(handle.clone()),
             ResourceBudget::default(),
             optimizers_config,
         ))
@@ -100,14 +98,19 @@ fn setup() -> (TempDir, LocalShard, Runtime) {
     let rnd_batch = create_rnd_batch();
 
     handle
-        .block_on(shard.update(rnd_batch.into(), true, None, HwMeasurementAcc::new()))
+        .block_on(shard.update(
+            rnd_batch.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        ))
         .unwrap();
 
     (storage_dir, shard, runtime)
 }
 
 fn create_rnd_batch() -> CollectionUpdateOperations {
-    let mut rng = rng();
+    let mut rng = rand::make_rng::<SmallRng>();
     let num_points = 2000;
     let dim = 100;
     let mut points = Vec::with_capacity(num_points);
@@ -152,7 +155,7 @@ fn some_filters() -> Vec<Option<Filter>> {
 fn batch_search_bench(c: &mut Criterion) {
     let (_tempdir, shard, search_runtime) = setup();
 
-    let search_runtime_handle = search_runtime.handle();
+    let search_runtime_handle = AdaptiveSearchHandle::new_fixed(search_runtime.handle().clone());
 
     let mut group = c.benchmark_group("batch-search-bench");
 
@@ -162,7 +165,7 @@ fn batch_search_bench(c: &mut Criterion) {
         group.bench_function(format!("query-batch-{fid}"), |b| {
             b.iter(|| {
                 search_runtime.block_on(async {
-                    let mut rng = rng();
+                    let mut rng = rand::make_rng::<SmallRng>();
                     let mut searches = Vec::with_capacity(batch_size);
                     for _i in 0..batch_size {
                         let query = random_vector(&mut rng, 100);
@@ -182,7 +185,7 @@ fn batch_search_bench(c: &mut Criterion) {
 
                     let hw_acc = HwMeasurementAcc::new();
                     let result = shard
-                        .query_batch(Arc::new(searches), search_runtime_handle, None, hw_acc)
+                        .query_batch(Arc::new(searches), &search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());
@@ -193,7 +196,7 @@ fn batch_search_bench(c: &mut Criterion) {
         group.bench_function(format!("search-batch-{fid}"), |b| {
             b.iter(|| {
                 search_runtime.block_on(async {
-                    let mut rng = rng();
+                    let mut rng = rand::make_rng::<SmallRng>();
                     let mut searches = Vec::with_capacity(batch_size);
                     for _i in 0..batch_size {
                         let query = random_vector(&mut rng, 100);
@@ -213,7 +216,7 @@ fn batch_search_bench(c: &mut Criterion) {
                     let hw_acc = HwMeasurementAcc::new();
                     let search_query = CoreSearchRequestBatch { searches };
                     let result = shard
-                        .core_search(Arc::new(search_query), search_runtime_handle, None, hw_acc)
+                        .core_search(Arc::new(search_query), &search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());
@@ -232,7 +235,7 @@ fn batch_search_bench(c: &mut Criterion) {
 fn batch_rrf_query_bench(c: &mut Criterion) {
     let (_tempdir, shard, search_runtime) = setup();
 
-    let search_runtime_handle = search_runtime.handle();
+    let search_runtime_handle = AdaptiveSearchHandle::new_fixed(search_runtime.handle().clone());
 
     let mut group = c.benchmark_group("batch-rrf-bench");
 
@@ -242,7 +245,7 @@ fn batch_rrf_query_bench(c: &mut Criterion) {
         group.bench_function(format!("hybrid-query-batch-{fid}"), |b| {
             b.iter(|| {
                 search_runtime.block_on(async {
-                    let mut rng = rng();
+                    let mut rng = rand::make_rng::<SmallRng>();
                     let mut searches = Vec::with_capacity(batch_size);
                     for _i in 0..batch_size {
                         let query1 = random_vector(&mut rng, 100);
@@ -283,7 +286,7 @@ fn batch_rrf_query_bench(c: &mut Criterion) {
 
                     let hw_acc = HwMeasurementAcc::new();
                     let result = shard
-                        .query_batch(Arc::new(searches), search_runtime_handle, None, hw_acc)
+                        .query_batch(Arc::new(searches), &search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());
@@ -302,7 +305,7 @@ fn batch_rrf_query_bench(c: &mut Criterion) {
 fn batch_rescore_bench(c: &mut Criterion) {
     let (_tempdir, shard, search_runtime) = setup();
 
-    let search_runtime_handle = search_runtime.handle();
+    let search_runtime_handle = AdaptiveSearchHandle::new_fixed(search_runtime.handle().clone());
 
     let mut group = c.benchmark_group("batch-rescore-bench");
 
@@ -312,7 +315,7 @@ fn batch_rescore_bench(c: &mut Criterion) {
         group.bench_function(format!("rescore-query-batch-{fid}"), |b| {
             b.iter(|| {
                 search_runtime.block_on(async {
-                    let mut rng = rng();
+                    let mut rng = rand::make_rng::<SmallRng>();
                     let mut searches = Vec::with_capacity(batch_size);
                     for _i in 0..batch_size {
                         let query1 = random_vector(&mut rng, 100);
@@ -340,7 +343,7 @@ fn batch_rescore_bench(c: &mut Criterion) {
 
                     let hw_acc = HwMeasurementAcc::new();
                     let result = shard
-                        .query_batch(Arc::new(searches), search_runtime_handle, None, hw_acc)
+                        .query_batch(Arc::new(searches), &search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());

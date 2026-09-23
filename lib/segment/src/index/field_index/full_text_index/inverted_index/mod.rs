@@ -1,8 +1,8 @@
 pub(super) mod immutable_inverted_index;
 pub mod immutable_postings_enum;
-pub(super) mod mmap_inverted_index;
 pub(super) mod mutable_inverted_index;
 pub(super) mod mutable_inverted_index_builder;
+pub(super) mod on_disk_inverted_index;
 mod positions;
 mod posting_list;
 mod postings_iterator;
@@ -10,9 +10,9 @@ mod postings_iterator;
 use std::cmp::min;
 use std::collections::HashMap;
 
-use ahash::AHashSet;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::UserData;
 use itertools::Itertools;
 
 use crate::common::operation_error::OperationResult;
@@ -21,6 +21,13 @@ use crate::index::query_estimator::expected_should_estimation;
 use crate::types::{FieldCondition, Match, PayloadKeyType};
 
 pub type TokenId = u32;
+
+/// Sentinel string inserted between tokens of consecutive array elements.
+/// When registered as a normal vocab token it occupies a position in the
+/// document, preventing phrase queries from matching across element boundaries.
+/// No tokenizer will ever produce this string, so it can never appear in a
+/// user query.
+pub const ARRAY_BOUNDARY_SENTINEL: &str = "\x00";
 
 /// Contains the set of tokens that are in a document.
 ///
@@ -39,6 +46,11 @@ impl TokenSet {
 
     pub fn tokens(&self) -> &[TokenId] {
         &self.0
+    }
+
+    /// Heap memory usage in bytes.
+    pub fn heap_bytes(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<TokenId>()
     }
 
     pub fn inner(self) -> Vec<TokenId> {
@@ -66,14 +78,6 @@ impl TokenSet {
             return false;
         }
         subset.0.iter().any(|token| self.contains(token))
-    }
-}
-
-impl From<AHashSet<TokenId>> for TokenSet {
-    fn from(tokens: AHashSet<TokenId>) -> Self {
-        let sorted_unique = tokens.into_iter().sorted_unstable().collect();
-
-        Self(sorted_unique)
     }
 }
 
@@ -112,13 +116,20 @@ impl Document {
         &self.0
     }
 
+    /// Heap memory usage in bytes.
+    pub fn heap_bytes(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<TokenId>()
+    }
+
     pub fn to_token_set(&self) -> TokenSet {
         self.0.iter().copied().collect()
     }
 
     /// Checks if the current document contains the given phrase.
     ///
-    /// Returns false if the phrase is empty
+    /// Returns false if the phrase is empty.
+    /// Boundary sentinels naturally prevent matches across array elements
+    /// because the query never contains them.
     pub fn has_phrase(&self, phrase: &Document) -> bool {
         let doc = self.0.as_slice();
         let phrase = phrase.0.as_slice();
@@ -214,17 +225,20 @@ pub trait InvertedIndex {
         &'a self,
         query: ParsedQuery,
         hw_counter: &'a HardwareCounterCell,
-    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a>;
+    ) -> OperationResult<Box<dyn Iterator<Item = PointOffsetType> + 'a>>;
 
-    fn get_posting_len(&self, token_id: TokenId, hw_counter: &HardwareCounterCell)
-    -> Option<usize>;
+    fn get_posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<usize>>;
 
     fn estimate_cardinality(
         &self,
         query: &ParsedQuery,
         condition: &FieldCondition,
         hw_counter: &HardwareCounterCell,
-    ) -> CardinalityEstimation {
+    ) -> OperationResult<CardinalityEstimation> {
         match query {
             ParsedQuery::AllTokens(tokens) => {
                 self.estimate_has_subset_cardinality(tokens, condition, hw_counter)
@@ -243,31 +257,31 @@ pub trait InvertedIndex {
         tokens: &TokenSet,
         condition: &FieldCondition,
         hw_counter: &HardwareCounterCell,
-    ) -> CardinalityEstimation {
+    ) -> OperationResult<CardinalityEstimation> {
         let points_count = self.points_count();
 
         let posting_lengths: Option<Vec<usize>> = tokens
             .tokens()
             .iter()
             .map(|&vocab_idx| self.get_posting_len(vocab_idx, hw_counter))
-            .collect();
+            .collect::<OperationResult<Option<Vec<usize>>>>()?;
         if posting_lengths.is_none() || points_count == 0 {
             // There are unseen tokens -> no matches
-            return CardinalityEstimation::exact(0)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(0)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
         let postings = posting_lengths.unwrap();
         if postings.is_empty() {
             // Empty request -> no matches
-            return CardinalityEstimation::exact(0)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(0)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
         // Smallest posting is the largest possible cardinality
         let smallest_posting = postings.iter().min().copied().unwrap();
 
         if postings.len() == 1 {
-            return CardinalityEstimation::exact(smallest_posting)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(smallest_posting)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
 
         let expected_frac: f64 = postings
@@ -275,12 +289,12 @@ pub trait InvertedIndex {
             .map(|posting| *posting as f64 / points_count as f64)
             .product();
         let exp = (expected_frac * points_count as f64) as usize;
-        CardinalityEstimation {
+        Ok(CardinalityEstimation {
             primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
             min: 0, // ToDo: make better estimation
             exp,
             max: smallest_posting,
-        }
+        })
     }
 
     fn estimate_has_any_cardinality(
@@ -288,39 +302,39 @@ pub trait InvertedIndex {
         tokens: &TokenSet,
         condition: &FieldCondition,
         hw_counter: &HardwareCounterCell,
-    ) -> CardinalityEstimation {
+    ) -> OperationResult<CardinalityEstimation> {
         let points_count = self.points_count();
 
-        let posting_lengths: Vec<_> = tokens
+        let posting_lengths: Vec<usize> = tokens
             .tokens()
             .iter()
-            .filter_map(|&vocab_idx| self.get_posting_len(vocab_idx, hw_counter))
-            .collect();
+            .filter_map(|&vocab_idx| self.get_posting_len(vocab_idx, hw_counter).transpose())
+            .collect::<OperationResult<Vec<usize>>>()?;
 
         if posting_lengths.is_empty() {
             // Empty request -> no matches
-            return CardinalityEstimation::exact(0)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(0)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
 
         // At least one posting is the largest possible cardinality
         let largest_posting = posting_lengths.iter().max().copied().unwrap();
 
         if posting_lengths.len() == 1 {
-            return CardinalityEstimation::exact(largest_posting)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(largest_posting)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
 
         let sum: usize = posting_lengths.iter().sum();
 
         let exp = expected_should_estimation(posting_lengths.into_iter(), points_count);
 
-        CardinalityEstimation {
+        Ok(CardinalityEstimation {
             primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
             min: largest_posting,
             exp,
             max: min(sum, points_count),
-        }
+        })
     }
 
     fn estimate_has_phrase_cardinality(
@@ -328,53 +342,57 @@ pub trait InvertedIndex {
         phrase: &Document,
         condition: &FieldCondition,
         hw_counter: &HardwareCounterCell,
-    ) -> CardinalityEstimation {
+    ) -> OperationResult<CardinalityEstimation> {
         if phrase.is_empty() {
-            return CardinalityEstimation::exact(0)
-                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone())));
+            return Ok(CardinalityEstimation::exact(0)
+                .with_primary_clause(PrimaryCondition::Condition(Box::new(condition.clone()))));
         }
 
         // Start with same cardinality estimation as has_subset
         let tokenset = phrase.to_token_set();
         let subset_estimation =
-            self.estimate_has_subset_cardinality(&tokenset, condition, hw_counter);
+            self.estimate_has_subset_cardinality(&tokenset, condition, hw_counter)?;
 
         // But we can restrict it by considering the phrase length
         let phrase_sq = phrase.len() * phrase.len();
 
-        CardinalityEstimation {
+        Ok(CardinalityEstimation {
             primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
             min: subset_estimation.min / phrase_sq,
             exp: subset_estimation.exp / phrase_sq,
             max: subset_estimation.max / phrase_sq,
-        }
+        })
     }
 
-    fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_;
+    fn for_each_vocab_with_postings_len(
+        &self,
+        f: impl FnMut(&str, usize) -> OperationResult<()>,
+    ) -> OperationResult<()>;
 
-    fn payload_blocks(
+    fn for_each_payload_block(
         &self,
         threshold: usize,
         key: PayloadKeyType,
-    ) -> impl Iterator<Item = PayloadBlockCondition> + '_ {
-        let map_filter_condition = move |(token, postings_len): (&str, usize)| {
-            if postings_len >= threshold {
-                Some(PayloadBlockCondition {
-                    condition: FieldCondition::new_match(key.clone(), Match::new_text(token)),
-                    cardinality: postings_len,
-                })
-            } else {
-                None
-            }
-        };
-
+        f: &mut dyn FnMut(PayloadBlockCondition) -> OperationResult<()>,
+    ) -> OperationResult<()> {
         // It might be very hard to predict possible combinations of conditions,
         // so we only build it for individual tokens
-        self.vocab_with_postings_len_iter()
-            .filter_map(map_filter_condition)
+        self.for_each_vocab_with_postings_len(|token, postings_len| {
+            if postings_len >= threshold {
+                f(PayloadBlockCondition {
+                    condition: FieldCondition::new_match(key.clone(), Match::new_text(token)),
+                    cardinality: postings_len,
+                })?;
+            }
+            Ok(())
+        })
     }
 
-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool;
+    fn check_match(
+        &self,
+        parsed_query: &ParsedQuery,
+        point_id: PointOffsetType,
+    ) -> OperationResult<bool>;
 
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
 
@@ -382,21 +400,29 @@ pub trait InvertedIndex {
 
     fn points_count(&self) -> usize;
 
-    fn get_token_id(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId>;
+    /// Resolve token -> token_id and call the closure for each token_id.
+    fn for_each_token_id<'a, U: UserData>(
+        &self,
+        tokens: impl Iterator<Item = (U, &'a str)>,
+        hw_counter: &HardwareCounterCell,
+        f: impl FnMut(U, Option<TokenId>),
+    ) -> OperationResult<()>;
 }
 
 #[cfg(test)]
 mod tests {
 
+    use common::bitvec::BitVec;
     use common::counter::hardware_counter::HardwareCounterCell;
-    use rand::Rng;
+    use common::universal_io::{MmapFs, Populate};
+    use rand::RngExt;
     use rand::seq::SliceRandom;
     use rstest::rstest;
 
     use super::{Document, InvertedIndex, ParsedQuery, TokenId, TokenSet};
     use crate::index::field_index::full_text_index::inverted_index::immutable_inverted_index::ImmutableInvertedIndex;
-    use crate::index::field_index::full_text_index::inverted_index::mmap_inverted_index::MmapInvertedIndex;
     use crate::index::field_index::full_text_index::inverted_index::mutable_inverted_index::MutableInvertedIndex;
+    use crate::index::field_index::full_text_index::inverted_index::on_disk_inverted_index::OnDiskInvertedIndex;
 
     fn generate_word() -> String {
         let mut rng = rand::rng();
@@ -416,26 +442,35 @@ mod tests {
     }
 
     /// Tries to parse a query. If there is an unknown id to a token, returns `None`
-    fn to_parsed_query(
-        query: Vec<String>,
-        token_to_id: impl Fn(String) -> Option<TokenId>,
-    ) -> Option<ParsedQuery> {
-        let tokens = query
-            .into_iter()
-            .map(token_to_id)
-            .collect::<Option<TokenSet>>()?;
+    fn to_parsed_query(token_ids: &[Option<TokenId>]) -> Option<ParsedQuery> {
+        let tokens = token_ids.iter().copied().collect::<Option<TokenSet>>()?;
         Some(ParsedQuery::AllTokens(tokens))
     }
 
-    fn to_parsed_query_any(
-        query: Vec<String>,
-        token_to_id: impl Fn(String) -> Option<TokenId>,
-    ) -> Option<ParsedQuery> {
-        let tokens = query
-            .into_iter()
-            .map(token_to_id)
-            .collect::<Option<TokenSet>>()?;
+    fn to_parsed_query_any(token_ids: &[Option<TokenId>]) -> Option<ParsedQuery> {
+        let tokens = token_ids.iter().copied().collect::<Option<TokenSet>>()?;
         Some(ParsedQuery::AnyTokens(tokens))
+    }
+
+    fn parse_all<I: InvertedIndex>(
+        queries: &[Vec<String>],
+        index: &I,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<Option<ParsedQuery>> {
+        queries
+            .iter()
+            .flat_map(|query| {
+                let mut ids = vec![None; query.len()];
+                index
+                    .for_each_token_id(
+                        query.iter().map(String::as_str).enumerate(),
+                        hw_counter,
+                        |i, id| ids[i] = id,
+                    )
+                    .unwrap();
+                [to_parsed_query(&ids), to_parsed_query_any(&ids)]
+            })
+            .collect()
     }
 
     fn mutable_inverted_index(
@@ -525,18 +560,30 @@ mod tests {
 
         let hw_counter = HardwareCounterCell::new();
 
-        MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
-        let mmap = MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching)
-            .unwrap()
-            .unwrap();
+        OnDiskInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
+        let empty_deleted = BitVec::new();
+        let mmap: OnDiskInvertedIndex = OnDiskInvertedIndex::open(
+            &MmapFs,
+            mmap_dir.path().into(),
+            Populate::No,
+            phrase_matching,
+            &empty_deleted,
+        )
+        .unwrap()
+        .unwrap();
 
-        let imm_mmap = ImmutableInvertedIndex::from(&mmap);
+        let imm_mmap = ImmutableInvertedIndex::try_from(&mmap).unwrap();
 
         // Check same vocabulary
-        for (token, token_id) in immutable.vocab.iter() {
-            assert_eq!(mmap.get_token_id(token, &hw_counter), Some(*token_id));
-            assert_eq!(imm_mmap.get_token_id(token, &hw_counter), Some(*token_id));
-        }
+        let assert_same_id = |expected: TokenId, actual: Option<TokenId>| {
+            assert_eq!(actual, Some(expected));
+        };
+        let vocab_iter = || immutable.vocab.iter().map(|(t, id)| (*id, t.as_str()));
+        mmap.for_each_token_id(vocab_iter(), &hw_counter, assert_same_id)
+            .unwrap();
+        imm_mmap
+            .for_each_token_id(vocab_iter(), &hw_counter, assert_same_id)
+            .unwrap();
 
         // Check same postings
         for token_id in 0..immutable.postings.len() as TokenId {
@@ -559,24 +606,27 @@ mod tests {
             assert_eq!(mutable_ids, imm_mmap_ids);
         }
 
+        let mmap_counts = mmap
+            .storage
+            .point_to_tokens_count
+            .read_whole()
+            .unwrap()
+            .into_owned();
         for (point_id, count) in immutable.point_to_tokens_count.iter().enumerate() {
             // Check same deleted points
             assert_eq!(
-                mmap.storage.deleted_points.get(point_id).unwrap(),
-                *count == 0,
+                mmap.storage.deleted_points.is_active(point_id as u32),
+                *count != 0,
                 "point_id: {point_id}",
             );
 
             // Check same count
-            assert_eq!(
-                *mmap.storage.point_to_tokens_count.get(point_id).unwrap(),
-                *count
-            );
+            assert_eq!(mmap_counts[point_id], *count);
             assert_eq!(imm_mmap.point_to_tokens_count[point_id], *count);
         }
 
         // Check same points count
-        assert_eq!(immutable.points_count, mmap.active_points_count);
+        assert_eq!(immutable.points_count, mmap.points_count());
         assert_eq!(immutable.points_count, imm_mmap.points_count);
     }
 
@@ -591,53 +641,25 @@ mod tests {
         let mut mut_index = mutable_inverted_index(indexed_count, deleted_count, phrase_matching);
 
         let immutable = ImmutableInvertedIndex::from(mut_index.clone());
-        MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
-        let mut mmap_index =
-            MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching)
-                .unwrap()
-                .unwrap();
+        OnDiskInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
+        let empty_deleted = BitVec::new();
+        let mut mmap_index = OnDiskInvertedIndex::open(
+            &MmapFs,
+            mmap_dir.path().into(),
+            Populate::No,
+            phrase_matching,
+            &empty_deleted,
+        )
+        .unwrap()
+        .unwrap();
 
-        let mut imm_mmap_index = ImmutableInvertedIndex::from(&mmap_index);
+        let mut imm_mmap_index = ImmutableInvertedIndex::try_from(&mmap_index).unwrap();
 
         let queries: Vec<_> = (0..100).map(|_| generate_query()).collect();
 
-        let mut_parsed_queries: Vec<_> = queries
-            .iter()
-            .cloned()
-            .flat_map(|query| {
-                vec![
-                    to_parsed_query(query.clone(), |token| mut_index.vocab.get(&token).copied()),
-                    to_parsed_query_any(query, |token| mut_index.vocab.get(&token).copied()),
-                ]
-            })
-            .collect();
-        let mmap_parsed_queries: Vec<_> = queries
-            .iter()
-            .cloned()
-            .flat_map(|query| {
-                vec![
-                    to_parsed_query(query.clone(), |token| {
-                        mmap_index.get_token_id(&token, &hw_counter)
-                    }),
-                    to_parsed_query_any(query, |token| {
-                        mmap_index.get_token_id(&token, &hw_counter)
-                    }),
-                ]
-            })
-            .collect();
-        let imm_mmap_parsed_queries: Vec<_> = queries
-            .into_iter()
-            .flat_map(|query| {
-                vec![
-                    to_parsed_query(query.clone(), |token| {
-                        imm_mmap_index.get_token_id(&token, &hw_counter)
-                    }),
-                    to_parsed_query_any(query, |token| {
-                        imm_mmap_index.get_token_id(&token, &hw_counter)
-                    }),
-                ]
-            })
-            .collect();
+        let mut_parsed_queries = parse_all(&queries, &mut_index, &hw_counter);
+        let mmap_parsed_queries = parse_all(&queries, &mmap_index, &hw_counter);
+        let imm_mmap_parsed_queries = parse_all(&queries, &imm_mmap_index, &hw_counter);
 
         check_query_congruence(
             &mut_parsed_queries,
@@ -676,7 +698,7 @@ mod tests {
         mmap_parsed_queries: &[Option<ParsedQuery>],
         imm_mmap_parsed_queries: &[Option<ParsedQuery>],
         mut_index: &MutableInvertedIndex,
-        mmap_index: &MmapInvertedIndex,
+        mmap_index: &OnDiskInvertedIndex,
         imm_mmap_index: &ImmutableInvertedIndex,
         hw_counter: &HardwareCounterCell,
     ) {
@@ -695,10 +717,17 @@ mod tests {
                 // In this case both queries would filter to an empty set of documents.
                 continue;
             };
-            let mut_filtered = mut_index.filter(mut_query, hw_counter).collect::<Vec<_>>();
-            let imm_filtered = mmap_index.filter(imm_query, hw_counter).collect::<Vec<_>>();
+            let mut_filtered = mut_index
+                .filter(mut_query, hw_counter)
+                .unwrap()
+                .collect::<Vec<_>>();
+            let imm_filtered = mmap_index
+                .filter(imm_query, hw_counter)
+                .unwrap()
+                .collect::<Vec<_>>();
             let imm_mmap_filtered = imm_mmap_index
                 .filter(imm_mmap_query, hw_counter)
+                .unwrap()
                 .collect::<Vec<_>>();
 
             assert_eq!(mut_filtered, imm_filtered);

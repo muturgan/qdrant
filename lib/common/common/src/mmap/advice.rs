@@ -2,9 +2,12 @@
 //! and [`memmap2::Advice`].
 
 use std::hint::black_box;
-use std::io;
 use std::num::Wrapping;
+use std::path::Path;
+use std::{io, slice};
 
+#[cfg(unix)]
+use memmap2::UncheckedAdvice;
 use serde::Deserialize;
 
 /// Global [`Advice`] value, to trivially set [`Advice`] value
@@ -98,63 +101,201 @@ pub fn madvise(madviseable: &impl Madviseable, advice: Advice) -> io::Result<()>
 /// over [`memmap2::Mmap::advise`] and [`memmap2::MmapMut::advise`].
 pub trait Madviseable {
     /// Advise OS how given memory map will be accessed. On non-Unix platforms this is a no-op.
-    fn madvise(&self, advice: Advice) -> io::Result<()>;
-
-    fn populate(&self);
-}
-
-impl Madviseable for memmap2::Mmap {
     fn madvise(&self, advice: Advice) -> io::Result<()> {
         #[cfg(unix)]
-        self.advise(advice.into())?;
+        self.advise_impl(advice.into())?;
+
         #[cfg(not(unix))]
-        log::debug!("Ignore {advice:?} on this platform");
+        log::debug!("Madvice {advice:?} is ignored on non-unix platforms");
+
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn advise_impl(&self, advice: memmap2::Advice) -> io::Result<()>;
+
     fn populate(&self) {
+        // Low-memory mode `no_populate` suppresses mmap prefault globally.
+        // Pages will be faulted in on demand when queries touch them.
+        if crate::low_memory::low_memory_mode().skip_populate() {
+            return;
+        }
+
         #[cfg(target_os = "linux")]
-        if *POPULATE_READ_IS_SUPPORTED {
-            match self.advise(memmap2::Advice::PopulateRead) {
-                Ok(()) => return,
-                Err(err) => log::warn!(
-                    "Failed to populate with MADV_POPULATE_READ: {err}. \
-                     Falling back to naive approach."
-                ),
+        {
+            use std::sync::LazyLock;
+
+            /// True if `MADV_POPULATE_READ` is supported (added in Linux 5.14)
+            static POPULATE_READ_IS_SUPPORTED: LazyLock<bool> =
+                LazyLock::new(|| memmap2::Advice::PopulateRead.is_supported());
+
+            if *POPULATE_READ_IS_SUPPORTED {
+                match self.advise_impl(memmap2::Advice::PopulateRead) {
+                    Ok(()) => return,
+                    Err(err) => log::warn!(
+                        "Failed to populate with MADV_POPULATE_READ: {err}. \
+                         Falling back to naive approach."
+                    ),
+                }
             }
         }
+
+        self.populate_simple_impl();
+    }
+
+    fn populate_simple_impl(&self);
+
+    /// Hint to the OS that pages backing this memory map can be reclaimed.
+    ///
+    /// Uses `madvise(MADV_PAGEOUT)` on Linux 5.4+, which reclaims resident
+    /// memory while keeping the mapping valid. Not all pages are reclaimed:
+    /// dirty file-backed pages are kept (only kswapd may write them back, not
+    /// this direct-reclaim context), as are pages mapped by more than one page
+    /// table — see [`Madviseable::drop_page_tables`] for that case.
+    /// On older kernels or non-Linux platforms this is a no-op, since there is
+    /// no portable userspace equivalent.
+    fn clear_cache(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::LazyLock;
+
+            /// True if `MADV_PAGEOUT` is supported (added in Linux 5.4).
+            /// Probed by calling `madvise` with a zero-length range, which
+            /// validates the advice value without touching any memory.
+            ///
+            /// As shown in madvise man pages:
+            /// > `madvise(0, 0, advice)` will return zero iff advice is supported by the kernel
+            /// > and can be relied on to probe for support.
+            static PAGEOUT_IS_SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
+                let res =
+                    unsafe { nix::libc::madvise(std::ptr::null_mut(), 0, nix::libc::MADV_PAGEOUT) };
+                res == 0
+            });
+
+            if *PAGEOUT_IS_SUPPORTED {
+                self.pageout_impl();
+            }
+        }
+    }
+
+    /// Zap this mapping's page-table entries with `madvise(MADV_DONTNEED)`.
+    /// Pages stay in the page cache, dirty ones included, and refault on the
+    /// next access.
+    ///
+    /// # Safety
+    ///
+    /// See [`UncheckedAdvice::DontNeed`]/[`memmap2::Mmap::unchecked_advise`].
+    /// The mapping must be `MAP_SHARED` and file-backed. On a private or
+    /// anonymous mapping this discards the data.
+    unsafe fn drop_page_tables(&self, diag_path: &Path) {
+        #[cfg(not(unix))]
+        let _ = diag_path;
+
+        #[cfg(unix)]
+        if let Err(e) = unsafe { self.unchecked_advise_impl(UncheckedAdvice::DontNeed) } {
+            log::warn!("Failed to call madvise(MADV_DONTNEED) for {diag_path:?}: {e}");
+        }
+    }
+
+    /// Like [`Madviseable::advise_impl`], but for [`UncheckedAdvice`] values.
+    ///
+    /// # Safety
+    ///
+    /// See [`UncheckedAdvice`]/[`memmap2::Mmap::unchecked_advise`].
+    #[cfg(unix)]
+    unsafe fn unchecked_advise_impl(&self, advice: UncheckedAdvice) -> io::Result<()>;
+
+    #[cfg(target_os = "linux")]
+    fn pageout_impl(&self);
+}
+
+/// Issue `madvise(MADV_PAGEOUT)` for the given memory region.
+///
+/// Mmap base addresses are always page-aligned, so callers do not need to
+/// adjust the slice. The kernel reclaims resident memory while keeping the
+/// mapping valid; dirty file-backed pages are skipped, not written back.
+#[cfg(target_os = "linux")]
+fn pageout_slice(slice: &[u8]) {
+    if slice.is_empty() {
+        return;
+    }
+    let res = unsafe {
+        nix::libc::madvise(
+            slice.as_ptr() as *mut _,
+            slice.len(),
+            nix::libc::MADV_PAGEOUT,
+        )
+    };
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        log::warn!("Failed to call madvise(MADV_PAGEOUT): {err}");
+    }
+}
+
+impl Madviseable for memmap2::Mmap {
+    #[cfg(unix)]
+    fn advise_impl(&self, advice: memmap2::Advice) -> io::Result<()> {
+        self.advise(advice)
+    }
+
+    fn populate_simple_impl(&self) {
         populate_simple(self);
+    }
+
+    #[cfg(unix)]
+    unsafe fn unchecked_advise_impl(&self, advice: UncheckedAdvice) -> io::Result<()> {
+        unsafe { self.unchecked_advise(advice) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pageout_impl(&self) {
+        pageout_slice(self);
     }
 }
 
 impl Madviseable for memmap2::MmapMut {
-    fn madvise(&self, advice: Advice) -> io::Result<()> {
-        #[cfg(unix)]
-        self.advise(advice.into())?;
-        #[cfg(not(unix))]
-        log::debug!("Ignore {advice:?} on this platform");
-        Ok(())
+    #[cfg(unix)]
+    fn advise_impl(&self, advice: memmap2::Advice) -> io::Result<()> {
+        self.advise(advice)
     }
 
-    fn populate(&self) {
-        #[cfg(target_os = "linux")]
-        if *POPULATE_READ_IS_SUPPORTED {
-            match self.advise(memmap2::Advice::PopulateRead) {
-                Ok(()) => return,
-                Err(err) => log::warn!(
-                    "Failed to populate with MADV_POPULATE_READ: {err}. \
-                     Falling back to naive approach."
-                ),
-            }
-        }
+    fn populate_simple_impl(&self) {
         populate_simple(self);
+    }
+
+    #[cfg(unix)]
+    unsafe fn unchecked_advise_impl(&self, advice: UncheckedAdvice) -> io::Result<()> {
+        unsafe { self.unchecked_advise(advice) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pageout_impl(&self) {
+        pageout_slice(self);
     }
 }
 
-/// True if `MADV_POPULATE_READ` is supported (added in Linux 5.14).
-#[cfg(target_os = "linux")]
-static POPULATE_READ_IS_SUPPORTED: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| memmap2::Advice::PopulateRead.is_supported());
+impl Madviseable for memmap2::MmapRaw {
+    #[cfg(unix)]
+    fn advise_impl(&self, advice: memmap2::Advice) -> io::Result<()> {
+        self.advise(advice)
+    }
+
+    fn populate_simple_impl(&self) {
+        let mmap = unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) };
+        populate_simple(mmap);
+    }
+
+    #[cfg(unix)]
+    unsafe fn unchecked_advise_impl(&self, advice: UncheckedAdvice) -> io::Result<()> {
+        unsafe { self.unchecked_advise(advice) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pageout_impl(&self) {
+        let mmap = unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) };
+        pageout_slice(mmap);
+    }
+}
 
 /// On older Linuxes and non-Unix platforms, we just read every 512th byte to
 /// populate the page cache. This is not as efficient as `madvise(2)` with
@@ -182,7 +323,7 @@ fn populate_simple(slice: &[u8]) {
 /// Note: if the region fits within a single page, this function is a no-op.
 #[cfg(unix)]
 pub fn will_need_multiple_pages(region: &[u8]) {
-    let Some(page_mask) = *PAGE_SIZE_MASK else {
+    let Some(page_mask) = page_size().map(|s| s - 1) else {
         return;
     };
 
@@ -211,22 +352,28 @@ pub fn will_need_multiple_pages(region: &[u8]) {
 #[cfg(not(unix))]
 pub fn will_need_multiple_pages(_region: &[u8]) {}
 
-/// Page size mask. Typically 0xfff for 4KiB pages.
+/// Returns the system page size in bytes, or `None` if it could not be determined.
+///
+/// Cached after first call. Typically 4096 on x86_64, 16384 on aarch64 macOS.
 #[cfg(unix)]
-static PAGE_SIZE_MASK: std::sync::LazyLock<Option<usize>> =
-    std::sync::LazyLock::new(|| get_page_mask().inspect_err(|err| log::warn!("{err}")).ok());
+pub fn page_size() -> Option<usize> {
+    *CACHED_PAGE_SIZE
+}
+
+/// System page size. Must be a power of two.
+#[cfg(unix)]
+static CACHED_PAGE_SIZE: std::sync::LazyLock<Option<usize>> =
+    std::sync::LazyLock::new(|| get_page_size().inspect_err(|err| log::warn!("{err}")).ok());
 
 #[cfg(unix)]
-fn get_page_mask() -> Result<usize, String> {
+fn get_page_size() -> Result<usize, String> {
     let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
         .map_err(|err| format!("Failed to get page size: {err}"))?
         .ok_or_else(|| "sysconf(PAGE_SIZE) returned None".to_string())?;
     let page_size = usize::try_from(page_size)
         .map_err(|_| format!("Failed to convert page size {page_size} to usize"))?;
     if !page_size.is_power_of_two() {
-        // Assuming that page size is a power of two (which is true for all
-        // known platforms) simplifies computations.
         return Err(format!("Page size {page_size} is not a power of two"));
     }
-    Ok(page_size - 1)
+    Ok(page_size)
 }

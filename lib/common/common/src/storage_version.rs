@@ -1,11 +1,10 @@
-use std::io::{Read, Write};
+use std::io::{Error, Result, Write};
 use std::path::Path;
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
-use fs_err::File;
 use semver::Version;
 
-use crate::fs::{FileOperationResult, FileStorageError};
+use crate::universal_io::{OkNotFound as _, UioResult, UniversalReadFs, read_whole_via};
 
 pub const VERSION_FILE: &str = "version.info";
 
@@ -22,32 +21,24 @@ pub trait StorageVersion {
 
     /// Loads and parses the version from the given directory.
     /// Returns `None` if the version file is not found.
-    fn load(dir_path: &Path) -> FileOperationResult<Option<Version>> {
+    fn load_universal<Fs: UniversalReadFs>(fs: &Fs, dir_path: &Path) -> UioResult<Option<Version>> {
         let version_file = dir_path.join(VERSION_FILE);
-        let mut contents = String::new();
-        let mut file = match File::open(&version_file) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(err) => return Err(err.into()),
-        };
-        file.read_to_string(&mut contents)?;
-        let version = contents.parse().map_err(|err| {
-            FileStorageError::generic(format!(
-                "Can't parse version from {version_file:?}, error: {err}"
-            ))
-        })?;
-        Ok(Some(version))
+        read_whole_via(fs, &version_file, |bytes| {
+            std::str::from_utf8(&bytes)
+                .map_err(Error::other)?
+                .parse::<Version>()
+                .map_err(|err| {
+                    Error::other(format!("Can't parse version from {version_file:?}: {err}")).into()
+                })
+        })
+        .ok_not_found()
     }
 
-    fn save(dir_path: &Path) -> FileOperationResult<()> {
+    fn save(dir_path: &Path) -> Result<()> {
         let version_file = dir_path.join(VERSION_FILE);
         let af = AtomicFile::new(&version_file, AllowOverwrite);
         let current_version = Self::current_raw();
         af.write(|f| f.write_all(current_version.as_bytes()))
-            .map_err(|err| {
-                FileStorageError::generic(format!("Can't write {version_file:?}, error: {err}"))
-            })
+            .map_err(|err| Error::other(format!("Can't write {version_file:?}: {err}")))
     }
 }

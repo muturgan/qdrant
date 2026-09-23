@@ -1,7 +1,4 @@
-use shard::operations::payload_ops::PayloadOps;
-use shard::operations::point_ops::PointOperations;
-use shard::operations::vector_ops::VectorOperations;
-use shard::operations::{CollectionUpdateOperations, FieldIndexOperations};
+use shard::operations::CollectionUpdateOperations;
 
 use crate::content_manager::collection_meta_ops::CollectionMetaOperations;
 
@@ -11,33 +8,8 @@ pub trait AuditableOperation {
 
 impl AuditableOperation for CollectionUpdateOperations {
     fn operation_name(&self) -> &'static str {
-        match self {
-            CollectionUpdateOperations::PointOperation(op) => match op {
-                PointOperations::UpsertPoints(_) => "upsert_points",
-                PointOperations::UpsertPointsConditional(_) => "upsert_points_conditional",
-                PointOperations::DeletePoints { .. } => "delete_points",
-                PointOperations::DeletePointsByFilter(_) => "delete_points_by_filter",
-                PointOperations::SyncPoints(_) => "sync_points",
-            },
-            CollectionUpdateOperations::VectorOperation(op) => match op {
-                VectorOperations::UpdateVectors(_) => "update_vectors",
-                VectorOperations::DeleteVectors(_, _) => "delete_vectors",
-                VectorOperations::DeleteVectorsByFilter(_, _) => "delete_vectors_by_filter",
-            },
-            CollectionUpdateOperations::PayloadOperation(op) => match op {
-                PayloadOps::SetPayload(_) => "set_payload",
-                PayloadOps::DeletePayload(_) => "delete_payload",
-                PayloadOps::ClearPayload { .. } => "clear_payload",
-                PayloadOps::ClearPayloadByFilter(_) => "clear_payload_by_filter",
-                PayloadOps::OverwritePayload(_) => "overwrite_payload",
-            },
-            CollectionUpdateOperations::FieldIndexOperation(op) => match op {
-                FieldIndexOperations::CreateIndex(_) => "create_field_index",
-                FieldIndexOperations::DeleteIndex(_) => "delete_field_index",
-            },
-            #[cfg(feature = "staging")]
-            CollectionUpdateOperations::StagingOperation(_) => "debug",
-        }
+        // Delegate to the canonical mapping defined next to the enum in the `shard` crate.
+        CollectionUpdateOperations::operation_name(self)
     }
 }
 
@@ -55,9 +27,12 @@ impl AuditableOperation for CollectionMetaOperations {
             CollectionMetaOperations::DropShardKey(_) => "drop_shard_key",
             CollectionMetaOperations::CreatePayloadIndex(_) => "create_payload_index",
             CollectionMetaOperations::DropPayloadIndex(_) => "drop_payload_index",
+            CollectionMetaOperations::CreateNamedVector(_) => "create_named_vector",
+            CollectionMetaOperations::DeleteNamedVector(_) => "delete_named_vector",
             CollectionMetaOperations::Nop { .. } => "nop",
             #[cfg(feature = "staging")]
-            CollectionMetaOperations::TestSlowDown(_) => "debug",
+            CollectionMetaOperations::TestSlowDown(_)
+            | CollectionMetaOperations::TestTransientError(_) => "debug",
         }
     }
 }

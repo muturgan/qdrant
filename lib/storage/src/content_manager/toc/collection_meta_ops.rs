@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use collection::collection::AbortReshardingScope;
 use collection::collection_state;
 use collection::config::ShardingMethod;
 use collection::events::{CollectionDeletedEvent, IndexCreatedEvent};
@@ -122,10 +123,28 @@ impl TableOfContent {
                     .await
                     .map(|()| true)
             }
+            CollectionMetaOperations::CreateNamedVector(create_named_vector) => {
+                log::debug!("Create named vector {create_named_vector:?}");
+                self.create_named_vector(create_named_vector)
+                    .await
+                    .map(|()| true)
+            }
+            CollectionMetaOperations::DeleteNamedVector(delete_named_vector) => {
+                log::debug!("Delete named vector {delete_named_vector:?}");
+                self.delete_named_vector(delete_named_vector)
+                    .await
+                    .map(|()| true)
+            }
             #[cfg(feature = "staging")]
             CollectionMetaOperations::TestSlowDown(test_slow_down) => {
                 test_slow_down.execute(self.this_peer_id).await;
                 Ok(true)
+            }
+            #[cfg(feature = "staging")]
+            CollectionMetaOperations::TestTransientError(test_transient_error) => {
+                test_transient_error
+                    .execute(self.this_peer_id)
+                    .map(|()| true)
             }
         }
     }
@@ -190,8 +209,12 @@ impl TableOfContent {
         collection.print_warnings().await;
 
         // Recreate optimizers
+        //
+        // This runs in the background and does not block: this path is reached from consensus, and
+        // stopping the existing optimizers can take a long time (in-flight optimizations are
+        // awaited), which would otherwise stall the consensus loop and can take down a cluster.
         if recreate_optimizers {
-            collection.recreate_optimizers_blocking().await?;
+            collection.recreate_optimizers_background();
         }
         Ok(true)
     }
@@ -215,7 +238,9 @@ impl TableOfContent {
         let removed_opt = self.collections.write().await.remove(collection_name);
         if let Some(removed) = removed_opt {
             if let Some(state) = removed.resharding_state().await
-                && let Err(err) = removed.abort_resharding(state.key(), true).await
+                && let Err(err) = removed
+                    .abort_resharding(state.key(), true, AbortReshardingScope::default())
+                    .await
             {
                 log::error!(
                     "Failed to abort resharding {} when deleting collection {collection_name}: \
@@ -393,7 +418,9 @@ impl TableOfContent {
             }
 
             ReshardingOperation::Abort(key) => {
-                collection.abort_resharding(key, false).await?;
+                collection
+                    .abort_resharding(key, false, AbortReshardingScope::default())
+                    .await?;
             }
         }
 
@@ -510,6 +537,10 @@ impl TableOfContent {
 
                 let transfer_key = transfer_restart.key();
 
+                // The record must exist. A restart updates the record in place, never
+                // removing it, so a missing record means a stale duplicate restart —
+                // reject it. A restart to an unchanged method is not rejected here; it
+                // is an idempotent no-op inside `restart_shard_transfer`.
                 let Some(old_transfer) = transfer::helpers::get_transfer(&transfer_key, &transfers)
                 else {
                     return Err(StorageError::bad_request(format!(
@@ -518,40 +549,68 @@ impl TableOfContent {
                     )));
                 };
 
-                if old_transfer.method == Some(transfer_restart.method) {
-                    return Err(StorageError::bad_request(format!(
-                        "Cannot restart transfer for shard {} from {} to {}, its configuration did not change",
-                        transfer_restart.shard_id, transfer_restart.from, transfer_restart.to,
-                    )));
-                }
-
-                // Abort and start transfer
-                Box::pin(self.handle_transfer(
-                    collection_id.clone(),
-                    ShardTransferOperations::Abort {
-                        transfer: transfer_restart.key(),
-                        reason: "restart transfer".into(),
-                    },
-                ))
-                .await?;
-
+                // The replacement record: preserve the old sync flag, drop
+                // to_shard_id and any filter, switch to the new method.
                 let new_transfer = ShardTransfer {
                     shard_id: transfer_restart.shard_id,
                     to_shard_id: None,
                     from: transfer_restart.from,
                     to: transfer_restart.to,
-                    sync: old_transfer.sync, // Preserve sync flag from the old transfer
+                    sync: old_transfer.sync,
                     method: Some(transfer_restart.method),
                     filter: None,
                 };
 
-                Box::pin(
-                    self.handle_transfer(
-                        collection_id,
-                        ShardTransferOperations::Start(new_transfer),
-                    ),
-                )
-                .await?;
+                let on_finish = {
+                    let collection_id = collection_id.clone();
+                    let transfer = new_transfer.clone();
+                    let proposal_sender = proposal_sender.clone();
+                    async move {
+                        let operation =
+                            ConsensusOperations::finish_transfer(collection_id, transfer);
+
+                        if let Err(error) = proposal_sender.send(operation) {
+                            log::error!("Can't report transfer progress to consensus: {error}");
+                        };
+                    }
+                };
+
+                let on_failure = {
+                    let collection_id = collection_id.clone();
+                    let transfer = new_transfer.clone();
+                    async move {
+                        if let Err(error) =
+                            proposal_sender.send(ConsensusOperations::abort_transfer(
+                                collection_id,
+                                transfer,
+                                "transmission failed",
+                            ))
+                        {
+                            log::error!("Can't report transfer progress to consensus: {error}");
+                        };
+                    }
+                };
+
+                let shard_consensus = match self.toc_dispatcher.lock().as_ref() {
+                    Some(consensus) => Box::new(consensus.clone()),
+                    None => {
+                        return Err(StorageError::service_error(
+                            "Can't handle transfer, this is a single node deployment",
+                        ));
+                    }
+                };
+
+                let temp_dir = self.optional_temp_or_storage_temp_path()?;
+                collection
+                    .restart_shard_transfer(
+                        transfer_key,
+                        new_transfer,
+                        shard_consensus,
+                        temp_dir,
+                        on_finish,
+                        on_failure,
+                    )
+                    .await?;
             }
             ShardTransferOperations::Finish(transfer) => {
                 // Validate transfer exists to prevent double handling
@@ -564,7 +623,7 @@ impl TableOfContent {
             }
             ShardTransferOperations::RecoveryToPartial(transfer)
             | ShardTransferOperations::SnapshotRecovered(transfer) => {
-                // Validate transfer exists to prevent double handling
+                // Validate transfer exists
                 transfer::helpers::validate_transfer_exists(
                     &transfer,
                     &collection.state().await.transfers,
@@ -589,7 +648,15 @@ impl TableOfContent {
 
                 match current_state {
                     ReplicaState::PartialSnapshot | ReplicaState::Recovery => (),
-                    _ => {
+                    ReplicaState::Active
+                    | ReplicaState::Dead
+                    | ReplicaState::Partial
+                    | ReplicaState::Initializing
+                    | ReplicaState::Listener
+                    | ReplicaState::Resharding
+                    | ReplicaState::ReshardingScaleDown
+                    | ReplicaState::ActiveRead
+                    | ReplicaState::ManualRecovery => {
                         return Err(StorageError::bad_input(format!(
                             "Replica {} of {collection_id}:{} has unexpected {current_state:?} \
                              (expected {:?} or {:?})",
@@ -623,7 +690,7 @@ impl TableOfContent {
                 )?;
                 log::warn!("Aborting shard transfer: {reason}");
                 collection
-                    .abort_shard_transfer_and_resharding(transfer, None)
+                    .abort_shard_transfer_and_resharding(transfer)
                     .await?;
             }
         };
@@ -712,6 +779,28 @@ impl TableOfContent {
             .await?
             .drop_payload_index(operation.field_name)
             .await?;
+        Ok(())
+    }
+
+    async fn create_named_vector(&self, operation: CreateNamedVector) -> Result<(), StorageError> {
+        let collection_hw_acc = HwMeasurementAcc::new_with_metrics_drain(
+            self.get_collection_hw_metrics(operation.collection_name.clone()),
+        );
+
+        self.get_collection_unchecked(&operation.collection_name)
+            .await?
+            .create_named_vector(operation.vector_name, operation.config, collection_hw_acc)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn delete_named_vector(&self, operation: DeleteNamedVector) -> Result<(), StorageError> {
+        self.get_collection_unchecked(&operation.collection_name)
+            .await?
+            .delete_named_vector(operation.vector_name)
+            .await?;
+
         Ok(())
     }
 }

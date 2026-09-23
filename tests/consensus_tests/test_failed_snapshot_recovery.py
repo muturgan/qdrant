@@ -78,7 +78,11 @@ def recover_shard(peer_api_uri, collection_name):
                 "shard_id": shard_id
             }
         })
-    assert r.status_code == 200
+    # The cluster recovery loop may start the same transfer between the
+    # transfers-empty check and this call; treat that race as success.
+    if r.status_code == 400 and "already involved in transfer" in r.text:
+        return
+    assert r.status_code == 200, r.text
 
 def first_segment_name(peer_storage: str, collection_name: str) -> str:
     # get first segment name from storage
@@ -181,11 +185,12 @@ def test_corrupted_snapshot_recovery(tmp_path: pathlib.Path):
 
     # Kill last peer
     p = processes.pop()
+    restart_port = p.p2p_port
     p.kill()
     sleep(1) # Give killed peer time to release WAL lock
 
     # Restart same peer
-    peer_api_uris[-1] = start_peer(peer_dirs[-1], f"peer_{N_PEERS}_restarted.log", bootstrap_uri)
+    peer_api_uris[-1] = start_peer(peer_dirs[-1], f"peer_{N_PEERS}_restarted.log", bootstrap_uri, port=restart_port)
 
     # Assert the node does not crash when starting with data from corrupted snapshot
     try:
@@ -200,9 +205,10 @@ def test_corrupted_snapshot_recovery(tmp_path: pathlib.Path):
         # Sometimes restart is fast and flag is deleted immediately because we initiate a transfer
         assert flag_exists
 
-    # Initiate transfer from another peer to recover the shard.
-    # This part checks that dummy shard can be recovered with shard transfer.
-    recover_shard(peer_api_uris[-1], collection_name=COLLECTION_NAME)
+        # Initiate transfer from another peer to recover the shard.
+        # This part checks that dummy shard can be recovered with shard transfer.
+        # recover_shard also tolerates a 400 if the recovery loop raced us.
+        recover_shard(peer_api_uris[-1], collection_name=COLLECTION_NAME)
 
     # Assert storage does not contain initialized flag when transfer is started
     print("Checking that the shard initializing flag was removed after recovery")
@@ -297,13 +303,14 @@ def test_dirty_shard_handling_with_active_replicas(tmp_path: pathlib.Path, trans
 
     # Kill last peer
     p = processes.pop()
+    restart_port = p.p2p_port
     p.kill()
     sleep(1) # Give killed peer time to release WAL lock
 
     # Restart same peer
     peer_api_uris[-1] = start_peer(
         peer_dirs[-1], f"peer_{N_PEERS}_restarted.log", bootstrap_uri,
-        extra_env=extra_env
+        port=restart_port, extra_env=extra_env
     )
 
     # Upsert one point to mark dummy replica as dead, that will trigger recovery transfer
@@ -326,13 +333,14 @@ def test_dirty_shard_handling_with_active_replicas(tmp_path: pathlib.Path, trans
 
     # Kill again after transfer starts (shard initializing flag has been deleted and shard is empty)
     p = processes.pop()
+    restart_port = p.p2p_port
     p.kill()
     sleep(1) # Give killed peer time to release WAL lock
 
     # Restart same peer again
     peer_api_uris[-1] = start_peer(
         peer_dirs[-1], f"peer_{N_PEERS}_restarted_again.log", bootstrap_uri,
-        extra_env=extra_env
+        port=restart_port, extra_env=extra_env
     )
 
     wait_for_same_commit(peer_api_uris=peer_api_uris)
@@ -341,7 +349,8 @@ def test_dirty_shard_handling_with_active_replicas(tmp_path: pathlib.Path, trans
     wait_for_collection_shard_transfers_count(peer_api_uris[-1], COLLECTION_NAME, 0)
 
     # Wait for all replicas to be active on the receiving peer
-    wait_for_all_replicas_active(peer_api_uris[-1], COLLECTION_NAME)
+    # Must have at least one replica on the last peer (replica may temporarily disappear when peer is restarted during snapshot recovery)
+    wait_for_all_replicas_active(peer_api_uris[-1], COLLECTION_NAME, min_local_replicas=1)
 
     # Assert that the local shard is active and not empty
     try:

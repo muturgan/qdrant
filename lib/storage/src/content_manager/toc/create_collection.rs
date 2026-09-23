@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -33,6 +37,7 @@ impl TableOfContent {
             shard_number,
             sharding_method,
             on_disk_payload,
+            payload,
             hnsw_config: hnsw_config_diff,
             wal_config: wal_config_diff,
             optimizers_config: optimizers_config_diff,
@@ -115,19 +120,18 @@ impl TableOfContent {
         if let Some(vectors_defaults) = vectors_defaults {
             match &mut vectors {
                 VectorsConfig::Single(s) => {
-                    if let Some(on_disk_default) = vectors_defaults.on_disk {
-                        s.on_disk.get_or_insert(on_disk_default);
-                    }
+                    apply_vector_placement_defaults(s, vectors_defaults);
                 }
                 VectorsConfig::Multi(m) => {
-                    for (_, vec_params) in m.iter_mut() {
-                        if let Some(on_disk_default) = vectors_defaults.on_disk {
-                            vec_params.on_disk.get_or_insert(on_disk_default);
-                        }
+                    for vec_params in m.values_mut() {
+                        apply_vector_placement_defaults(vec_params, vectors_defaults);
                     }
                 }
             };
         }
+
+        let payload =
+            apply_payload_placement_defaults(payload, on_disk_payload, self.storage_config.payload);
 
         let collection_params = CollectionParams {
             vectors,
@@ -135,16 +139,13 @@ impl TableOfContent {
             shard_number: NonZeroU32::new(shard_number)
                 .ok_or_else(|| StorageError::bad_input("`shard_number` cannot be 0"))?,
             sharding_method,
-            on_disk_payload: on_disk_payload.unwrap_or(self.storage_config.on_disk_payload),
+            on_disk_payload: Some(on_disk_payload.unwrap_or(self.storage_config.on_disk_payload)),
+            payload,
             replication_factor: NonZeroU32::new(replication_factor).ok_or_else(|| {
-                StorageError::BadInput {
-                    description: "`replication_factor` cannot be 0".to_string(),
-                }
+                StorageError::bad_input("`replication_factor` cannot be 0".to_string())
             })?,
             write_consistency_factor: NonZeroU32::new(write_consistency_factor).ok_or_else(
-                || StorageError::BadInput {
-                    description: "`write_consistency_factor` cannot be 0".to_string(),
-                },
+                || StorageError::bad_input("`write_consistency_factor` cannot be 0".to_string()),
             )?,
             read_fan_out_factor: None,
             read_fan_out_delay_ms: None,
@@ -230,7 +231,7 @@ impl TableOfContent {
                 self.consensus_proposal_sender.clone(),
                 collection_name.to_string(),
             ),
-            Some(self.search_runtime.handle().clone()),
+            Some(self.adaptive_search_handle.clone()),
             Some(self.update_runtime.handle().clone()),
             self.optimizer_resource_budget.clone(),
             self.storage_config.optimizers_overwrite.clone(),

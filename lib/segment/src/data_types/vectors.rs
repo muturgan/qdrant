@@ -19,7 +19,7 @@ use crate::common::utils::transpose_map_into_named_vector;
 use crate::data_types::segment_record::NamedVectorsOwned;
 use crate::types::{VectorName, VectorNameBuf};
 use crate::vector_storage::query::{
-    ContextQuery, DiscoveryQuery, NaiveFeedbackQuery, RecoQuery, TransformInto,
+    ContextQuery, DiscoverQuery, NaiveFeedbackQuery, RecoQuery, TransformInto,
 };
 
 /// How many dimensions of a sparse vector are considered to be a single unit for cost estimation.
@@ -264,6 +264,9 @@ pub type TypedDenseVector<T> = Vec<T>;
 pub type DenseVector = TypedDenseVector<VectorElementType>;
 
 /// Type for multi dense vector
+pub type MultiDenseVector = Vec<DenseVector>;
+
+/// Type for multi dense vector
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct TypedMultiDenseVector<T> {
     pub flattened_vectors: TypedDenseVector<T>, // vectors are flattened into a single vector
@@ -273,18 +276,15 @@ pub struct TypedMultiDenseVector<T> {
 impl<T> TypedMultiDenseVector<T> {
     pub fn try_from_flatten(vectors: Vec<T>, dim: usize) -> Result<Self, OperationError> {
         if dim == 0 {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot have zero dimension".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot have zero dimension",
+            ));
         }
         if !vectors.len().is_multiple_of(dim) || vectors.is_empty() {
-            return Err(OperationError::ValidationError {
-                description: format!(
-                    "Invalid multi-vector length: {}, expected multiple of {}",
-                    vectors.len(),
-                    dim
-                ),
-            });
+            return Err(OperationError::validation_error(format!(
+                "Invalid multi-vector length: {}, expected multiple of {dim}",
+                vectors.len()
+            )));
         }
 
         Ok(TypedMultiDenseVector {
@@ -295,15 +295,15 @@ impl<T> TypedMultiDenseVector<T> {
 
     pub fn try_from_matrix(matrix: Vec<Vec<T>>) -> Result<Self, OperationError> {
         if matrix.is_empty() {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot be empty".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot be empty",
+            ));
         }
         let dim = matrix[0].len();
         if dim == 0 {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot have zero dimension".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot have zero dimension",
+            ));
         }
         // assert all vectors have the same dimension
         if let Some(bad_vec) = matrix.iter().find(|v| v.len() != dim) {
@@ -421,6 +421,15 @@ pub struct TypedMultiDenseVectorRef<'a, T> {
 }
 
 impl<'a, T: PrimitiveVectorElement> TypedMultiDenseVectorRef<'a, T> {
+    pub fn new(flattened_vectors: &'a [T], dim: usize) -> Self {
+        debug_assert_eq!(flattened_vectors.len() % dim, 0);
+
+        Self {
+            flattened_vectors,
+            dim,
+        }
+    }
+
     /// Slices the multi vector into the underlying individual vectors
     pub fn multi_vectors(self) -> impl Iterator<Item = &'a [T]> {
         self.flattened_vectors.chunks_exact(self.dim)
@@ -716,19 +725,6 @@ impl Named for NamedVectorStruct {
 }
 
 impl NamedVectorStruct {
-    pub fn new_from_vector(vector: VectorInternal, name: impl Into<VectorNameBuf>) -> Self {
-        let name = name.into();
-        match vector {
-            VectorInternal::Dense(vector) => NamedVectorStruct::Dense(NamedVector { name, vector }),
-            VectorInternal::Sparse(vector) => {
-                NamedVectorStruct::Sparse(NamedSparseVector { name, vector })
-            }
-            VectorInternal::MultiDense(vector) => {
-                NamedVectorStruct::MultiDense(NamedMultiDenseVector { name, vector })
-            }
-        }
-    }
-
     pub fn get_vector(&self) -> VectorRef<'_> {
         match self {
             NamedVectorStruct::Default(v) => v.as_slice().into(),
@@ -845,27 +841,27 @@ pub enum QueryVector {
     Nearest(VectorInternal),
     RecommendBestScore(RecoQuery<VectorInternal>),
     RecommendSumScores(RecoQuery<VectorInternal>),
-    Discovery(DiscoveryQuery<VectorInternal>),
+    Discover(DiscoverQuery<VectorInternal>),
     Context(ContextQuery<VectorInternal>),
     FeedbackNaive(NaiveFeedbackQuery<VectorInternal>),
 }
 
 impl TransformInto<QueryVector, VectorInternal, VectorInternal> for QueryVector {
-    fn transform<F>(self, mut f: F) -> OperationResult<QueryVector>
-    where
-        F: FnMut(VectorInternal) -> OperationResult<VectorInternal>,
-    {
+    fn transform(
+        self,
+        f: &dyn Fn(VectorInternal) -> OperationResult<VectorInternal>,
+    ) -> OperationResult<QueryVector> {
         match self {
             QueryVector::Nearest(v) => f(v).map(QueryVector::Nearest),
             QueryVector::RecommendBestScore(v) => {
-                Ok(QueryVector::RecommendBestScore(v.transform(&mut f)?))
+                Ok(QueryVector::RecommendBestScore(v.transform(f)?))
             }
             QueryVector::RecommendSumScores(v) => {
-                Ok(QueryVector::RecommendSumScores(v.transform(&mut f)?))
+                Ok(QueryVector::RecommendSumScores(v.transform(f)?))
             }
-            QueryVector::Discovery(v) => Ok(QueryVector::Discovery(v.transform(&mut f)?)),
-            QueryVector::Context(v) => Ok(QueryVector::Context(v.transform(&mut f)?)),
-            QueryVector::FeedbackNaive(v) => Ok(QueryVector::FeedbackNaive(v.transform(&mut f)?)),
+            QueryVector::Discover(v) => Ok(QueryVector::Discover(v.transform(f)?)),
+            QueryVector::Context(v) => Ok(QueryVector::Context(v.transform(f)?)),
+            QueryVector::FeedbackNaive(v) => Ok(QueryVector::FeedbackNaive(v.transform(f)?)),
         }
     }
 }

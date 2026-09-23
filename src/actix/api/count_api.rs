@@ -7,13 +7,14 @@ use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
 use super::CollectionPath;
+use super::routing_token::ActixRoutingToken;
 use crate::actix::api::read_params::ReadParams;
 use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
 use crate::common::query::do_count_points;
 use crate::settings::ServiceConfig;
 
-#[post("/collections/{name}/points/count")]
+#[post("/collections/{collection_name}/points/count")]
 async fn count_points(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
@@ -21,6 +22,7 @@ async fn count_points(
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
     ActixAuth(auth): ActixAuth,
+    ActixRoutingToken(routing_token): ActixRoutingToken,
 ) -> impl Responder {
     let CountRequest {
         count_request,
@@ -30,7 +32,7 @@ async fn count_points(
     let pass = match check_strict_mode(
         &count_request,
         params.timeout_as_secs(),
-        &collection.name,
+        &collection.collection_name,
         &dispatcher,
         &auth,
     )
@@ -47,7 +49,7 @@ async fn count_points(
 
     let request_hw_counter = get_request_hardware_counter(
         &dispatcher,
-        collection.name.clone(),
+        collection.collection_name.clone(),
         service_config.hardware_reporting(),
         None,
     );
@@ -56,9 +58,10 @@ async fn count_points(
 
     let result = do_count_points(
         dispatcher.toc(&auth, &pass),
-        &collection.name,
+        &collection.collection_name,
         count_request,
         params.consistency,
+        routing_token,
         params.timeout(),
         shard_selector,
         auth,

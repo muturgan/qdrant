@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -7,17 +11,16 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
 use common::progress_tracker::ProgressTracker;
 use common::types::{PointOffsetType, TelemetryDetail};
-use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
 use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, PayloadIndexRead, VectorIndexRead};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::segment_constructor::VectorIndexBuildArgs;
@@ -36,7 +39,7 @@ fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rng: &mut R, dim: usize
 
 #[rstest]
 #[case::nearest(QueryVariant::Nearest, 32, 5)]
-#[case::discovery(QueryVariant::Discovery, 128, 10)] // tests that check better precision are in `hnsw_discover_test.rs`
+#[case::discover(QueryVariant::Discover, 128, 10)] // tests that check better precision are in `hnsw_discover_test.rs`
 #[case::reco_best_score(QueryVariant::RecoBestScore, 64, 10)]
 #[case::reco_sum_scores(QueryVariant::RecoSumScores, 64, 10)]
 fn test_filterable_hnsw(
@@ -95,6 +98,7 @@ fn _test_filterable_hnsw(
     let payload_index_ptr = segment.payload_index.clone();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,
@@ -116,10 +120,16 @@ fn _test_filterable_hnsw(
         )
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
-    let blocks = borrowed_payload_index
-        .payload_blocks(&JsonPath::new(int_key), indexing_threshold)
-        .collect_vec();
-    for block in blocks.iter() {
+    let mut blocks = Vec::new();
+    borrowed_payload_index
+        .with_view(|v| {
+            v.for_each_payload_block(&JsonPath::new(int_key), indexing_threshold, &mut |block| {
+                blocks.push(block);
+                Ok(())
+            })
+        })
+        .unwrap();
+    for block in &blocks {
         assert!(
             block.condition.range.is_some(),
             "only range conditions should be generated for this type of payload"
@@ -130,7 +140,9 @@ fn _test_filterable_hnsw(
     let px = payload_index_ptr.borrow();
     for block in &blocks {
         let filter = Filter::new_must(Condition::Field(block.condition.clone()));
-        let points = px.query_points(&filter, &hw_counter, &stopped);
+        let points = px
+            .with_view(|v| v.query_points(&filter, &hw_counter, &stopped))
+            .unwrap();
         for point in points {
             coverage.insert(point, coverage.get(&point).unwrap_or(&0) + 1);
         }
@@ -279,6 +291,7 @@ fn test_hnsw_search_top_zero(#[case] num_vectors: u64, #[case] full_scan_thresho
     let payload_index_ptr = segment.payload_index.clone();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold: full_scan_threshold_kb,
@@ -300,10 +313,16 @@ fn test_hnsw_search_top_zero(#[case] num_vectors: u64, #[case] full_scan_thresho
         )
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
-    let blocks = borrowed_payload_index
-        .payload_blocks(&JsonPath::new(int_key), indexing_threshold)
-        .collect_vec();
-    for block in blocks.iter() {
+    let mut blocks = Vec::new();
+    borrowed_payload_index
+        .with_view(|v| {
+            v.for_each_payload_block(&JsonPath::new(int_key), indexing_threshold, &mut |block| {
+                blocks.push(block);
+                Ok(())
+            })
+        })
+        .unwrap();
+    for block in &blocks {
         assert!(
             block.condition.range.is_some(),
             "only range conditions should be generated for this type of payload"

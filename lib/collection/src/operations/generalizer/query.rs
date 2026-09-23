@@ -1,6 +1,6 @@
 use segment::data_types::vectors::{MultiDenseVectorInternal, NamedQuery, VectorInternal};
 use segment::vector_storage::query::{
-    ContextPair, ContextQuery, DiscoveryQuery, FeedbackItem, NaiveFeedbackCoefficients,
+    ContextPair, ContextQuery, DiscoverQuery, FeedbackItem, NaiveFeedbackCoefficients,
     NaiveFeedbackQuery, RecoQuery,
 };
 use shard::query::query_enum::QueryEnum;
@@ -40,7 +40,7 @@ impl Generalizer for ShardQueryRequest {
             score_threshold: *score_threshold,
             limit: *limit,
             offset: *offset,
-            params: *params,
+            params: params.clone(),
             with_vector: with_vector.clone(),
             with_payload: with_payload.clone(),
         }
@@ -64,7 +64,7 @@ impl Generalizer for ShardPrefetch {
             filter: filter.clone(),
             score_threshold: *score_threshold,
             limit: *limit,
-            params: *params,
+            params: params.clone(),
         }
     }
 }
@@ -157,9 +157,9 @@ impl Generalizer for VectorInternal {
     }
 }
 
-impl<T: Generalizer> Generalizer for DiscoveryQuery<T> {
+impl<T: Generalizer> Generalizer for DiscoverQuery<T> {
     fn remove_details(&self) -> Self {
-        let DiscoveryQuery { target, pairs } = self;
+        let DiscoverQuery { target, pairs } = self;
         Self {
             target: target.remove_details(),
             pairs: pairs.iter().map(|p| p.remove_details()).collect(),

@@ -4,6 +4,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::save_on_disk::SaveOnDisk;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, PayloadFieldSchema};
+use shard::files::PAYLOAD_INDEX_CONFIG_FILE;
 pub use shard::payload_index_schema::PayloadIndexSchema;
 
 use crate::collection::Collection;
@@ -11,8 +12,7 @@ use crate::operations::types::{CollectionResult, UpdateResult};
 use crate::operations::universal_query::formula::ExpressionInternal;
 use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
 use crate::problems::unindexed_field;
-
-pub const PAYLOAD_INDEX_CONFIG_FILE: &str = "payload_index.json";
+use crate::shards::shard_trait::WaitUntil;
 
 impl Collection {
     pub(crate) fn payload_index_file(collection_path: &Path) -> PathBuf {
@@ -64,7 +64,7 @@ impl Collection {
             }),
         );
 
-        self.update_all_local(create_index_operation, wait, hw_acc)
+        self.update_all_local(create_index_operation, WaitUntil::from(wait), hw_acc, false)
             .await
     }
 
@@ -83,8 +83,9 @@ impl Collection {
         let result = self
             .update_all_local(
                 delete_index_operation,
-                false,
+                WaitUntil::from(false),
                 HwMeasurementAcc::disposable(), // Unmeasured API
+                false,
             )
             .await?;
 

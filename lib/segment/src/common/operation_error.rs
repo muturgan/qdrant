@@ -1,13 +1,15 @@
 use std::backtrace::Backtrace;
 use std::collections::TryReserveError;
 use std::io::{Error as IoError, ErrorKind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use atomicwrites::Error as AtomicIoError;
-use common::fs::FileStorageError;
+use blobstore::error::BlobstoreError;
+use common::bitpacking_ordered::DecompressionError;
 use common::mmap::Error as MmapError;
-use gridstore::error::GridstoreError;
+use common::universal_io::{IsNotFound, UniversalIoError};
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
@@ -24,6 +26,18 @@ pub enum OperationError {
         expected_dim: usize,
         received_dim: usize,
     },
+    /// A storage-native (raw byte) vector blob that is incompatible with the
+    /// target storage (wrong length, undecodable, or out-of-range contents).
+    /// Classified as user error (maps to `BadInput`), not `ServiceError`, so a
+    /// malformed blob that reached the WAL is skipped on replay instead of
+    /// crash-looping recovery.
+    #[error("{description}")]
+    MalformedVectorBlob { description: String },
+    /// A stored-encoding payload blob that does not parse. User error for the same reason
+    /// as [`Self::MalformedVectorBlob`]: it arrives from a peer and is parsed on apply, so
+    /// a bad one has to be skipped on replay instead of crash-looping recovery.
+    #[error("{description}")]
+    MalformedPayloadBlob { description: String },
     #[error("Not existing vector name error: {received_name}")]
     VectorNameNotExists { received_name: VectorNameBuf },
     #[error("No point with id {missed_point_id}")]
@@ -46,6 +60,11 @@ pub enum OperationError {
     },
     #[error("Inconsistent storage: {description}")]
     InconsistentStorage { description: String },
+    /// An essential storage file is missing. Distinguished from `ServiceError` so a
+    /// read-only follower can tell "segment removed by the leader mid-reload"
+    /// (re-check the manifest) from real corruption (escalate).
+    #[error("Storage file not found: {}", path.display())]
+    FileNotFound { path: PathBuf },
     #[error("Out of memory, free: {free}, {description}")]
     OutOfMemory { description: String, free: u64 },
     #[error("Operation cancelled: {description}")]
@@ -76,10 +95,13 @@ pub enum OperationError {
     },
     #[error("The expression {expression} produced a non-finite number")]
     NonFiniteNumber { expression: String },
-
-    // ToDo: Remove after RocksDB is deprecated
-    #[error("RocksDB column family {name} not found")]
-    RocksDbColumnFamilyNotFound { name: String },
+    /// All appendable segments reached `max_segment_size`, so there is no valid destination for
+    /// new or moved points. Recoverable by provisioning a fresh appendable segment and re-applying
+    /// the operation; already-applied points are skipped by their point version.
+    #[error(
+        "All appendable segments reached the maximum segment size of {max_segment_size_bytes} bytes"
+    )]
+    OutOfAppendableCapacity { max_segment_size_bytes: usize },
 }
 
 impl OperationError {
@@ -124,12 +146,50 @@ impl OperationError {
         }
     }
 
+    pub fn malformed_vector_blob(description: impl Into<String>) -> Self {
+        Self::MalformedVectorBlob {
+            description: description.into(),
+        }
+    }
+
     pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
         Self::Timeout {
             description: format!(
                 "Operation '{}' timed out after {timeout:?}",
                 operation.into(),
             ),
+        }
+    }
+}
+
+/// `FileNotFound` only ever originates from sources that carry a structured path
+/// ([`UniversalIoError::NotFound`], [`MmapError::MissingFile`]); a raw io NotFound is a
+/// plain `ServiceError` — universal-io wraps not-found at the call site
+/// (`UniversalIoError::extract_not_found`), so classify there, not here.
+impl IsNotFound for OperationError {
+    fn is_not_found(&self) -> bool {
+        match self {
+            Self::FileNotFound { .. } => true,
+            Self::WrongVectorDimension { .. }
+            | Self::MalformedVectorBlob { .. }
+            | Self::MalformedPayloadBlob { .. }
+            | Self::VectorNameNotExists { .. }
+            | Self::PointIdError { .. }
+            | Self::TypeError { .. }
+            | Self::TypeInferenceError { .. }
+            | Self::ServiceError { .. }
+            | Self::InconsistentStorage { .. }
+            | Self::OutOfMemory { .. }
+            | Self::Cancelled { .. }
+            | Self::Timeout { .. }
+            | Self::ValidationError { .. }
+            | Self::WrongSparse
+            | Self::WrongMulti
+            | Self::MissingRangeIndexForOrderBy { .. }
+            | Self::MissingMapIndexForFacet { .. }
+            | Self::VariableTypeError { .. }
+            | Self::NonFiniteNumber { .. }
+            | Self::OutOfAppendableCapacity { .. } => false,
         }
     }
 }
@@ -144,72 +204,124 @@ pub struct SegmentFailedState {
 
 impl From<ThreadPoolBuildError> for OperationError {
     fn from(error: ThreadPoolBuildError) -> Self {
-        OperationError::ServiceError {
-            description: format!("{error}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(error.to_string())
     }
 }
 
-impl From<FileStorageError> for OperationError {
-    fn from(err: FileStorageError) -> Self {
+impl From<DecompressionError> for OperationError {
+    fn from(err: DecompressionError) -> Self {
         Self::service_error(err.to_string())
     }
 }
 
 impl From<MmapError> for OperationError {
     fn from(err: MmapError) -> Self {
-        Self::service_error(err.to_string())
+        match err {
+            // `MissingFile` is the only mmap error with a structured path; an io NotFound
+            // is deliberately left as a service error (see `IsNotFound for OperationError`).
+            MmapError::MissingFile(path) => Self::FileNotFound { path: path.into() },
+            err @ (MmapError::SizeExact(..)
+            | MmapError::SizeLess(..)
+            | MmapError::SizeMultiple(..)
+            | MmapError::Io(_)) => Self::service_error(err.to_string()),
+        }
+    }
+}
+
+impl From<UniversalIoError> for OperationError {
+    fn from(err: UniversalIoError) -> Self {
+        match err {
+            UniversalIoError::Io(err) => Self::from(err),
+            UniversalIoError::Mmap(err) => Self::from(err),
+
+            UniversalIoError::NotFound { path } => Self::FileNotFound { path },
+            UniversalIoError::UnchangedOpen { .. } => Self::Cancelled {
+                description: err.to_string(),
+            },
+
+            UniversalIoError::Bincode(_)
+            | UniversalIoError::BytemuckCast(_)
+            | UniversalIoError::ZerocopySize(_)
+            | UniversalIoError::IoUringNotSupported(_)
+            | UniversalIoError::OutOfBounds { .. }
+            | UniversalIoError::InvalidFileIndex { .. }
+            | UniversalIoError::Uninitialized { .. }
+            | UniversalIoError::QueueIsFull
+            | UniversalIoError::AppendOffsetConflict { .. }
+            | UniversalIoError::AppendRewriteRequired { .. }
+            | UniversalIoError::AppendEntityTooSmall { .. }
+            | UniversalIoError::AppendEtagMismatch { .. }
+            | UniversalIoError::S3(_)
+            | UniversalIoError::S3Config { .. }
+            | UniversalIoError::TaskPanicked(_) => Self::service_error(err.to_string()),
+        }
+    }
+}
+
+impl<Src, Dst: ?Sized> From<zerocopy::SizeError<Src, Dst>> for OperationError
+where
+    zerocopy::SizeError<Src, Dst>: std::fmt::Display,
+{
+    fn from(err: zerocopy::SizeError<Src, Dst>) -> Self {
+        Self::service_error(format!("Zerocopy size error: {err}"))
+    }
+}
+
+impl<A, S, V> From<zerocopy::ConvertError<A, S, V>> for OperationError
+where
+    zerocopy::ConvertError<A, S, V>: std::fmt::Display,
+{
+    fn from(err: zerocopy::ConvertError<A, S, V>) -> Self {
+        Self::service_error(format!("Zerocopy convert error: {err}"))
     }
 }
 
 impl From<serde_cbor::Error> for OperationError {
     fn from(err: serde_cbor::Error) -> Self {
-        OperationError::service_error(format!("Failed to parse data: {err}"))
+        Self::service_error(format!("Failed to parse data: {err}"))
     }
 }
 
 impl<E> From<AtomicIoError<E>> for OperationError {
     fn from(err: AtomicIoError<E>) -> Self {
         match err {
-            AtomicIoError::Internal(io_err) => OperationError::from(io_err),
-            AtomicIoError::User(_user_err) => {
-                OperationError::service_error("Unknown atomic write error")
-            }
+            AtomicIoError::Internal(io_err) => Self::from(io_err),
+            AtomicIoError::User(_user_err) => Self::service_error("Unknown atomic write error"),
         }
     }
 }
 
 impl From<IoError> for OperationError {
     fn from(err: IoError) -> Self {
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         match err.kind() {
             ErrorKind::OutOfMemory => {
                 let free_memory = Mem::new().available_memory_bytes();
-                OperationError::OutOfMemory {
+                Self::OutOfMemory {
                     description: format!("IO Error: {err}"),
                     free: free_memory,
                 }
             }
-            _ => OperationError::service_error(format!("IO Error: {err}")),
+            _ => Self::service_error(format!("IO Error: {err}")),
         }
     }
 }
 
 impl From<serde_json::Error> for OperationError {
     fn from(err: serde_json::Error) -> Self {
-        OperationError::service_error(format!("Json error: {err}"))
+        Self::service_error(format!("Json error: {err}"))
     }
 }
 
 impl From<fs_extra::error::Error> for OperationError {
     fn from(err: fs_extra::error::Error) -> Self {
-        OperationError::service_error(format!("File system error: {err}"))
+        Self::service_error(format!("File system error: {err}"))
     }
 }
 
 impl From<geohash::GeohashError> for OperationError {
     fn from(err: geohash::GeohashError) -> Self {
-        OperationError::service_error(format!("Geohash error: {err}"))
+        Self::service_error(format!("Geohash error: {err}"))
     }
 }
 
@@ -219,11 +331,11 @@ impl From<quantization::EncodingError> for OperationError {
             quantization::EncodingError::IOError(err)
             | quantization::EncodingError::EncodingError(err)
             | quantization::EncodingError::ArgumentsError(err) => {
-                OperationError::service_error(format!("Quantization encoding error: {err}"))
+                Self::service_error(format!("Quantization encoding error: {err}"))
             }
-            quantization::EncodingError::Stopped => OperationError::Cancelled {
-                description: PROCESS_CANCELLED_BY_SERVICE_MESSAGE.to_string(),
-            },
+            quantization::EncodingError::Stopped => {
+                Self::cancelled(PROCESS_CANCELLED_BY_SERVICE_MESSAGE)
+            }
         }
     }
 }
@@ -231,26 +343,50 @@ impl From<quantization::EncodingError> for OperationError {
 impl From<TryReserveError> for OperationError {
     fn from(err: TryReserveError) -> Self {
         let free_memory = Mem::new().available_memory_bytes();
-        OperationError::OutOfMemory {
+        Self::OutOfMemory {
             description: format!("Failed to reserve memory: {err}"),
             free: free_memory,
         }
     }
 }
 
-impl From<GridstoreError> for OperationError {
-    fn from(err: GridstoreError) -> Self {
+impl From<BlobstoreError> for OperationError {
+    fn from(err: BlobstoreError) -> Self {
         match err {
-            GridstoreError::ServiceError { description } => {
-                Self::service_error(format!("Gridstore error: {description}"))
+            BlobstoreError::ServiceError { description } => {
+                Self::service_error(format!("Blobstore error: {description}"))
             }
-            GridstoreError::FlushCancelled => Self::Cancelled {
-                description: "Gridstore flushing was cancelled".to_string(),
-            },
-            GridstoreError::Io(_) | GridstoreError::Mmap(_) | GridstoreError::SerdeJson(_) => {
+            BlobstoreError::FlushCancelled => Self::cancelled("Blobstore flushing was cancelled"),
+            BlobstoreError::Io(_) | BlobstoreError::Mmap(_) | BlobstoreError::SerdeJson(_) => {
                 Self::service_error(err.to_string())
             }
-            GridstoreError::ValidationError { message } => Self::validation_error(message),
+            BlobstoreError::ValidationError { message } => Self::validation_error(message),
+            BlobstoreError::UnsupportedOperation { .. } => Self::service_error(err.to_string()),
+            BlobstoreError::UniversalIo(err) => match err {
+                UniversalIoError::NotFound { path } => Self::FileNotFound { path },
+                err @ (UniversalIoError::Io(_)
+                | UniversalIoError::Mmap(_)
+                | UniversalIoError::Bincode(_)
+                | UniversalIoError::BytemuckCast(_)
+                | UniversalIoError::ZerocopySize(_)
+                | UniversalIoError::IoUringNotSupported(_)
+                | UniversalIoError::OutOfBounds { .. }
+                | UniversalIoError::InvalidFileIndex { .. }
+                | UniversalIoError::Uninitialized { .. }
+                | UniversalIoError::UnchangedOpen { .. }
+                | UniversalIoError::QueueIsFull
+                | UniversalIoError::AppendOffsetConflict { .. }
+                | UniversalIoError::AppendRewriteRequired { .. }
+                | UniversalIoError::AppendEntityTooSmall { .. }
+                | UniversalIoError::AppendEtagMismatch { .. }
+                | UniversalIoError::S3(_)
+                | UniversalIoError::S3Config { .. }
+                | UniversalIoError::TaskPanicked(_)) => {
+                    Self::service_error(format!("Gridstore IO error: {err}"))
+                }
+            },
+            BlobstoreError::PageNotFound { .. } => Self::service_error(err.to_string()),
+            BlobstoreError::ValueNotFound { .. } => Self::service_error(err.to_string()),
         }
     }
 }
@@ -267,6 +403,7 @@ pub type OperationResult<T> = Result<T, OperationError>;
 pub fn get_service_error<T>(err: &OperationResult<T>) -> Option<OperationError> {
     match err {
         Ok(_) => None,
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         Err(error) => match error {
             OperationError::ServiceError { .. } => Some(error.clone()),
             _ => None,
@@ -280,10 +417,8 @@ pub struct CancelledError;
 pub type CancellableResult<T> = Result<T, CancelledError>;
 
 impl From<CancelledError> for OperationError {
-    fn from(CancelledError: CancelledError) -> Self {
-        OperationError::Cancelled {
-            description: PROCESS_CANCELLED_BY_SERVICE_MESSAGE.to_string(),
-        }
+    fn from(_cancelled_error: CancelledError) -> Self {
+        Self::cancelled(PROCESS_CANCELLED_BY_SERVICE_MESSAGE)
     }
 }
 
@@ -301,11 +436,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_not_found_classification() {
+        // Structured not-found sources classify as `FileNotFound` and keep the path.
+        let err = OperationError::from(UniversalIoError::NotFound {
+            path: "segments/0/deleted.bin".into(),
+        });
+        assert!(err.is_not_found());
+        assert!(err.to_string().contains("segments/0/deleted.bin"));
+
+        let err = OperationError::from(MmapError::MissingFile("matrix.dat".to_string()));
+        assert!(err.is_not_found());
+        assert!(err.to_string().contains("matrix.dat"));
+
+        let err = OperationError::from(BlobstoreError::UniversalIo(UniversalIoError::NotFound {
+            path: "page_0.dat".into(),
+        }));
+        assert!(err.is_not_found());
+        assert!(err.to_string().contains("page_0.dat"));
+
+        // A raw io NotFound has no structured path; it stays a service error —
+        // universal-io wraps not-found at the call site (`extract_not_found`).
+        let io_err = IoError::new(ErrorKind::NotFound, "no such file");
+        assert!(!OperationError::from(io_err).is_not_found());
+
+        // Non-not-found io errors are unaffected.
+        let io_err = IoError::new(ErrorKind::PermissionDenied, "denied");
+        let err = OperationError::from(UniversalIoError::Io(io_err));
+        assert!(!err.is_not_found());
+    }
+
+    #[test]
     fn test_timeout_error_formatting() {
         // Test sub-second timeout (500ms)
         let timeout = Duration::from_millis(500);
         let error = OperationError::timeout(timeout, "test operation");
-        let error_msg = format!("{error}");
+        let error_msg = error.to_string();
         assert!(
             error_msg.contains("500ms"),
             "Expected '500ms' but got: {error_msg}"
@@ -314,7 +479,7 @@ mod tests {
         // Test exact second timeout (1000ms = 1s)
         let timeout = Duration::from_millis(1000);
         let error = OperationError::timeout(timeout, "test operation");
-        let error_msg = format!("{error}");
+        let error_msg = error.to_string();
         assert!(
             error_msg.contains("1s"),
             "Expected '1s' but got: {error_msg}"
@@ -323,7 +488,7 @@ mod tests {
         // Test multi-second timeout with sub-second precision (2500ms = 2.5s)
         let timeout = Duration::from_millis(2500);
         let error = OperationError::timeout(timeout, "test operation");
-        let error_msg = format!("{error}");
+        let error_msg = error.to_string();
         assert!(
             error_msg.contains("2.5s"),
             "Expected '2.5s' but got: {error_msg}"
@@ -332,7 +497,7 @@ mod tests {
         // Test large timeout (60000ms = 60s)
         let timeout = Duration::from_millis(60000);
         let error = OperationError::timeout(timeout, "test operation");
-        let error_msg = format!("{error}");
+        let error_msg = error.to_string();
         assert!(
             error_msg.contains("60s"),
             "Expected '60s' but got: {error_msg}"

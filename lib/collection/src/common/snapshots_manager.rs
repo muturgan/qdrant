@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
+use common::defaults::APP_USER_AGENT;
 use common::tempfile_ext::MaybeTempPath;
 use fs_err as fs;
 use fs_err::tokio as tokio_fs;
-use object_store::ObjectStoreExt;
+use http::HeaderValue;
 use object_store::aws::AmazonS3Builder;
+use object_store::{ClientOptions, ObjectStoreExt};
 use serde::Deserialize;
 use tempfile::TempPath;
 use tokio::io::AsyncWriteExt;
@@ -56,7 +58,24 @@ pub enum SnapshotStorageManager {
     // AZURE(SnapshotStorageCloud),
 }
 
+/// Assert a snapshot name is a plain file name, not a path.
+///
+/// Backends join it onto a snapshots directory, and `Path::join` drops the base if it is absolute.
+fn validate_snapshot_name(snapshot_name: &str) -> CollectionResult<()> {
+    if Path::new(snapshot_name).file_name() != Some(snapshot_name.as_ref()) {
+        return Err(CollectionError::not_found(format!(
+            "Snapshot {snapshot_name}"
+        )));
+    }
+
+    Ok(())
+}
+
 impl SnapshotStorageManager {
+    /// Create a snapshot storage manager from the configured backend.
+    ///
+    /// S3-compatible storage clients identify themselves with the Qdrant user
+    /// agent so object-store providers can attribute snapshot traffic.
     pub fn new(snapshots_config: &SnapshotsConfig) -> CollectionResult<Self> {
         match snapshots_config.snapshots_storage {
             SnapshotsStorageConfig::Local => {
@@ -64,6 +83,11 @@ impl SnapshotStorageManager {
             }
             SnapshotsStorageConfig::S3 => {
                 let mut builder = AmazonS3Builder::from_env();
+                // Identify Qdrant to Amazon S3 and other S3-compatible backends.
+                if let Ok(user_agent) = HeaderValue::from_str(APP_USER_AGENT.as_str()) {
+                    builder = builder
+                        .with_client_options(ClientOptions::new().with_user_agent(user_agent));
+                }
                 if let Some(s3_config) = &snapshots_config.s3_config {
                     builder = builder.with_bucket_name(&s3_config.bucket);
 
@@ -154,11 +178,14 @@ impl SnapshotStorageManager {
         }
     }
 
+    /// Get the storage path for a collection snapshot, confined to `snapshots_path`
     pub fn get_snapshot_path(
         &self,
         snapshots_path: &Path,
         snapshot_name: &str,
     ) -> CollectionResult<PathBuf> {
+        validate_snapshot_name(snapshot_name)?;
+
         match self {
             SnapshotStorageManager::LocalFS(_storage_impl) => {
                 SnapshotStorageLocalFS::get_snapshot_path(snapshots_path, snapshot_name)
@@ -169,11 +196,14 @@ impl SnapshotStorageManager {
         }
     }
 
+    /// Get the storage path for a full snapshot, confined to `snapshots_path`
     pub fn get_full_snapshot_path(
         &self,
         snapshots_path: &Path,
         snapshot_name: &str,
     ) -> CollectionResult<PathBuf> {
+        validate_snapshot_name(snapshot_name)?;
+
         match self {
             SnapshotStorageManager::LocalFS(_storage_impl) => {
                 SnapshotStorageLocalFS::get_full_snapshot_path(snapshots_path, snapshot_name)
@@ -224,6 +254,7 @@ impl SnapshotStorageLocalFS {
             tokio_fs::remove_file(checksum_path),
         );
 
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         delete_snapshot.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 CollectionError::not_found(format!("Snapshot {snapshot_path:?}"))
@@ -258,6 +289,11 @@ impl SnapshotStorageLocalFS {
         Ok(snapshots)
     }
 
+    /// Stores a snapshot in local storage and writes its checksum first.
+    ///
+    /// The checksum file is explicitly flushed and closed before moving the
+    /// snapshot into place, so checksum readers do not observe a partially
+    /// written checksum file.
     async fn store_file(
         &self,
         source_path: &Path,
@@ -279,20 +315,27 @@ impl SnapshotStorageLocalFS {
         // We can't move right away, because snapshot folder can be on another mounting point.
         // We can't copy to the target location directly, because copy is not atomic.
         // So we copy to the final location with a temporary name and then rename atomically.
-        let target_path_tmp = TempPath::from_path(target_path.with_extension("tmp"));
+        let target_path_tmp = TempPath::try_from_path(target_path.with_extension("tmp"))?;
 
-        // compute and store the file's checksum before the final snapshot file is saved
-        // to avoid making snapshot available without checksum
+        // Write checksum to a temporary path first. We only promote it to the
+        // final checksum path after the snapshot itself is persisted.
         let checksum_path = get_checksum_path(target_path);
+        let checksum_path_tmp = TempPath::try_from_path(checksum_path.with_extension("tmp"))?;
         let checksum = hash_file(source_path).await?;
-        let checksum_file = TempPath::from_path(&checksum_path);
-        let mut file = tokio_fs::File::create(checksum_path.as_path()).await?;
+        let mut file = tokio_fs::File::create(&checksum_path_tmp).await?;
         file.write_all(checksum.as_bytes()).await?;
+        file.flush().await?;
+        drop(file);
 
         move_file(&source_path, &target_path_tmp).await?;
         target_path_tmp.persist(target_path).map_err(|e| e.error)?;
 
-        checksum_file.keep()?;
+        if let Err(err) = checksum_path_tmp.persist(&checksum_path) {
+            // Snapshot persisted but checksum promotion failed: rollback to
+            // avoid leaving partial state.
+            let _ = tokio_fs::remove_file(target_path).await;
+            return Err(err.error.into());
+        }
         get_snapshot_description(target_path).await
     }
 
@@ -423,11 +466,14 @@ impl SnapshotStorageCloud {
         Ok(())
     }
 
+    /// `snapshot_name` must pass [`validate_snapshot_name`] first: unlike the local filesystem,
+    /// object storage has no `canonicalize` to confine the key afterwards.
     fn get_snapshot_path(snapshots_path: &Path, snapshot_name: &str) -> PathBuf {
         let absolute_snapshot_dir = snapshots_path;
         absolute_snapshot_dir.join(snapshot_name)
     }
 
+    /// `snapshot_name` must pass [`validate_snapshot_name`] first.
     fn get_full_snapshot_path(snapshots_path: &Path, snapshot_name: &str) -> PathBuf {
         let absolute_snapshot_dir = snapshots_path;
         absolute_snapshot_dir.join(snapshot_name)
@@ -458,6 +504,7 @@ impl SnapshotStorageCloud {
         snapshot_path: &Path,
     ) -> CollectionResult<SnapshotStream> {
         let snapshot_path = snapshot_storage_ops::trim_dot_slash(snapshot_path)?;
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         let download = self.client.get(&snapshot_path).await.map_err(|e| match e {
             object_store::Error::NotFound { path, source } => {
                 CollectionError::not_found(format!("Snapshot {path} does not exist: {source}"))
@@ -465,5 +512,146 @@ impl SnapshotStorageCloud {
             _ => CollectionError::service_error(format!("Failed to get {snapshot_path}: {e}")),
         })?;
         Ok(SnapshotStream::new_stream(download.into_stream(), None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Snapshot names that escape the snapshots directory.
+    const TRAVERSING_NAMES: &[&str] = &[
+        "/snapshots/other-collection/victim.snapshot",
+        "/etc/passwd",
+        "other-collection/victim.snapshot",
+        "../other-collection/victim.snapshot",
+        "./victim.snapshot",
+        "..",
+        ".",
+        "",
+    ];
+
+    fn s3_manager() -> SnapshotStorageManager {
+        SnapshotStorageManager::new(&SnapshotsConfig {
+            snapshots_storage: SnapshotsStorageConfig::S3,
+            s3_config: Some(S3Config {
+                bucket: "test-bucket".into(),
+                region: Some("us-east-1".into()),
+                access_key: Some("test-access-key".into()),
+                secret_key: Some("test-secret-key".into()),
+                endpoint_url: Some("http://localhost:9000".into()),
+            }),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_snapshot_name_accepts_plain_file_names() {
+        for name in ["my.snapshot", "collection-2024-01-01-00-00-00.snapshot"] {
+            validate_snapshot_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_snapshot_name_rejects_paths() {
+        for name in TRAVERSING_NAMES {
+            assert!(
+                matches!(
+                    validate_snapshot_name(name),
+                    Err(CollectionError::NotFound { .. }),
+                ),
+                "snapshot name {name:?} escapes the snapshots directory and must be rejected",
+            );
+        }
+    }
+
+    /// GHSA-p9c2-9vq2-gxh8: an unchecked name let a caller scoped to one collection read and
+    /// delete any object in the bucket.
+    #[test]
+    fn object_storage_rejects_traversing_snapshot_name() {
+        let manager = s3_manager();
+        let snapshots_path = Path::new("snapshots/my-collection");
+
+        for name in TRAVERSING_NAMES {
+            assert!(
+                matches!(
+                    manager.get_snapshot_path(snapshots_path, name),
+                    Err(CollectionError::NotFound { .. }),
+                ),
+                "snapshot name {name:?} escapes the collection prefix and must be rejected",
+            );
+            assert!(
+                matches!(
+                    manager.get_full_snapshot_path(Path::new("snapshots"), name),
+                    Err(CollectionError::NotFound { .. }),
+                ),
+                "snapshot name {name:?} escapes the snapshots prefix and must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn object_storage_keeps_plain_snapshot_name_under_prefix() {
+        let manager = s3_manager();
+        let snapshots_path = Path::new("snapshots/my-collection");
+
+        assert_eq!(
+            manager
+                .get_snapshot_path(snapshots_path, "my.snapshot")
+                .unwrap(),
+            Path::new("snapshots/my-collection/my.snapshot"),
+        );
+        assert_eq!(
+            manager
+                .get_full_snapshot_path(Path::new("snapshots"), "full.snapshot")
+                .unwrap(),
+            Path::new("snapshots/full.snapshot"),
+        );
+    }
+
+    #[test]
+    fn local_storage_rejects_traversing_snapshot_name() {
+        let manager = SnapshotStorageManager::new(&SnapshotsConfig {
+            snapshots_storage: SnapshotsStorageConfig::Local,
+            s3_config: None,
+        })
+        .unwrap();
+
+        let snapshots_dir = tempfile::Builder::new().tempdir().unwrap();
+        let snapshots_path = snapshots_dir.path();
+
+        // Traversal target
+        let other_collection = snapshots_path.join("other-collection");
+        fs::create_dir_all(&other_collection).unwrap();
+        fs::write(other_collection.join("victim.snapshot"), b"victim").unwrap();
+
+        // The caller's own collection
+        let my_collection = snapshots_path.join("my-collection");
+        fs::create_dir_all(&my_collection).unwrap();
+        fs::write(my_collection.join("my.snapshot"), b"mine").unwrap();
+
+        for name in TRAVERSING_NAMES {
+            assert!(
+                matches!(
+                    manager.get_snapshot_path(&my_collection, name),
+                    Err(CollectionError::NotFound { .. }),
+                ),
+                "snapshot name {name:?} escapes the collection directory and must be rejected",
+            );
+        }
+
+        // Reaching into a collection directory is not a full snapshot either
+        assert!(matches!(
+            manager.get_full_snapshot_path(snapshots_path, "other-collection/victim.snapshot"),
+            Err(CollectionError::NotFound { .. }),
+        ));
+
+        // An ordinary name still resolves
+        assert_eq!(
+            manager
+                .get_snapshot_path(&my_collection, "my.snapshot")
+                .unwrap(),
+            fs::canonicalize(my_collection.join("my.snapshot")).unwrap(),
+        );
     }
 }

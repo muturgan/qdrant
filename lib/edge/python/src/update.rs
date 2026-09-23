@@ -1,35 +1,15 @@
 use bytemuck::TransparentWrapperAlloc as _;
 use derive_more::Into;
 use pyo3::prelude::*;
+use segment::data_types::modifier::Modifier;
 use segment::json_path::JsonPath;
-use segment::types::{Filter, Payload, VectorNameBuf};
+use segment::types::{
+    Distance, Filter, MultiVectorConfig, Payload, VectorNameBuf, VectorStorageDatatype,
+};
 use shard::operations::point_ops::{PointIdsList, PointInsertOperationsInternal, UpdateMode};
-use shard::operations::{CollectionUpdateOperations, payload_ops, point_ops, vector_ops};
+use shard::operations::*;
 
 use crate::*;
-
-/// Defines the mode of the upsert operation
-#[pyclass(name = "UpdateMode", eq, eq_int, from_py_object)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PyUpdateMode {
-    /// Default mode - insert new points, update existing points
-    #[default]
-    Upsert = 0,
-    /// Only insert new points, do not update existing points
-    InsertOnly = 1,
-    /// Only update existing points, do not insert new points
-    UpdateOnly = 2,
-}
-
-impl From<PyUpdateMode> for UpdateMode {
-    fn from(mode: PyUpdateMode) -> Self {
-        match mode {
-            PyUpdateMode::Upsert => UpdateMode::Upsert,
-            PyUpdateMode::InsertOnly => UpdateMode::InsertOnly,
-            PyUpdateMode::UpdateOnly => UpdateMode::UpdateOnly,
-        }
-    }
-}
 
 #[pyclass(name = "UpdateOperation", from_py_object)]
 #[derive(Clone, Debug, Into)]
@@ -217,5 +197,94 @@ impl PyUpdateOperation {
         });
 
         Self(CollectionUpdateOperations::PayloadOperation(operation))
+    }
+
+    #[staticmethod]
+    pub fn create_field_index(field_name: PyJsonPath, schema: PyPayloadFieldSchema) -> Self {
+        let operation = FieldIndexOperations::CreateIndex(CreateIndex {
+            field_name: JsonPath::from(field_name),
+            field_schema: Some(PayloadFieldSchema::from(schema)),
+        });
+
+        Self(CollectionUpdateOperations::FieldIndexOperation(operation))
+    }
+
+    #[staticmethod]
+    pub fn delete_field_index(field_name: PyJsonPath) -> Self {
+        let operation = FieldIndexOperations::DeleteIndex(JsonPath::from(field_name));
+        Self(CollectionUpdateOperations::FieldIndexOperation(operation))
+    }
+
+    /// Create a new dense named vector on the collection.
+    #[staticmethod]
+    #[pyo3(signature = (vector_name, size, distance, multivector_config=None, datatype=None))]
+    pub fn create_dense_vector(
+        vector_name: String,
+        size: usize,
+        distance: PyDistance,
+        multivector_config: Option<PyMultiVectorConfig>,
+        datatype: Option<PyVectorStorageDatatype>,
+    ) -> Self {
+        let config = vector_name_ops::VectorNameConfig::dense(vector_name_ops::DenseVectorConfig {
+            size,
+            distance: Distance::from(distance),
+            multivector_config: multivector_config.map(MultiVectorConfig::from),
+            datatype: datatype.map(VectorStorageDatatype::from),
+        });
+        let operation = VectorNameOperations::CreateVectorName(CreateVectorName {
+            vector_name,
+            config,
+        });
+        Self(CollectionUpdateOperations::VectorNameOperation(operation))
+    }
+
+    /// Create a new sparse named vector on the collection.
+    #[staticmethod]
+    #[pyo3(signature = (vector_name, modifier=None, datatype=None))]
+    pub fn create_sparse_vector(
+        vector_name: String,
+        modifier: Option<PyModifier>,
+        datatype: Option<PyVectorStorageDatatype>,
+    ) -> Self {
+        let config =
+            vector_name_ops::VectorNameConfig::sparse(vector_name_ops::SparseVectorConfig {
+                modifier: modifier.map(Modifier::from),
+                datatype: datatype.map(VectorStorageDatatype::from),
+            });
+        let operation = VectorNameOperations::CreateVectorName(CreateVectorName {
+            vector_name,
+            config,
+        });
+        Self(CollectionUpdateOperations::VectorNameOperation(operation))
+    }
+
+    /// Delete a named vector from the collection.
+    #[staticmethod]
+    pub fn delete_vector_name(vector_name: String) -> Self {
+        let operation = VectorNameOperations::DeleteVectorName(DeleteVectorName { vector_name });
+        Self(CollectionUpdateOperations::VectorNameOperation(operation))
+    }
+}
+
+/// Defines the mode of the upsert operation
+#[pyclass(name = "UpdateMode", eq, eq_int, from_py_object)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PyUpdateMode {
+    /// Default mode - insert new points, update existing points
+    #[default]
+    Upsert = 0,
+    /// Only insert new points, do not update existing points
+    InsertOnly = 1,
+    /// Only update existing points, do not insert new points
+    UpdateOnly = 2,
+}
+
+impl From<PyUpdateMode> for UpdateMode {
+    fn from(mode: PyUpdateMode) -> Self {
+        match mode {
+            PyUpdateMode::Upsert => UpdateMode::Upsert,
+            PyUpdateMode::InsertOnly => UpdateMode::InsertOnly,
+            PyUpdateMode::UpdateOnly => UpdateMode::UpdateOnly,
+        }
     }
 }

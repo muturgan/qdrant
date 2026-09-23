@@ -1,36 +1,39 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::{error, result};
 
 use common::counter::hardware_counter::HardwareCounterCell;
-#[cfg(target_os = "linux")]
-use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::seq::IteratorRandom;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rstest::rstest;
 
 use super::utils::sampler;
 use crate::data_types::vectors::{QueryVector, VectorElementType};
-use crate::fixtures::payload_context_fixture::FixtureIdTracker;
+use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use crate::fixtures::query_fixtures::QueryVariant;
-use crate::id_tracker::id_tracker_base::IdTracker;
+use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::segment_constructor::batched_reader::merge_from_single_source;
 use crate::types::{
     BinaryQuantizationConfig, Distance, ProductQuantizationConfig, QuantizationConfig,
     ScalarQuantizationConfig,
 };
+use crate::vector_storage::VectorStorageEnum;
 #[cfg(target_os = "linux")]
-use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+use crate::vector_storage::dense::dense_vector_storage::open_dense_vector_storage_with_uring;
 use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
 use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectors, QuantizedVectorsStorageType,
 };
-use crate::vector_storage::vector_storage_base::VectorStorage;
-use crate::vector_storage::{Random, VectorStorageEnum};
+use crate::vector_storage::vector_storage_base::VectorStorageRead;
 
 const DIMS: usize = 128;
 const NUM_POINTS: usize = 600;
@@ -63,19 +66,12 @@ fn ram_storage(_dir: &Path) -> VectorStorageEnum {
 
 #[cfg(target_os = "linux")]
 fn async_memmap_storage(dir: &std::path::Path) -> VectorStorageEnum {
-    open_memmap_vector_storage_with_async_io(
-        dir,
-        DIMS,
-        DISTANCE,
-        true,
-        AdviceSetting::Global,
-        false,
-    )
-    .unwrap()
+    open_dense_vector_storage_with_uring(dir, DIMS, DISTANCE, false, true).unwrap()
 }
 
 fn scalar_u8() -> WithQuantization {
     let config = ScalarQuantizationConfig {
+        memory: None,
         r#type: crate::types::ScalarType::Int8,
         quantile: Some(0.5),
         always_ram: Some(true),
@@ -91,6 +87,7 @@ fn scalar_u8() -> WithQuantization {
 
 fn product_x4() -> WithQuantization {
     let config = ProductQuantizationConfig {
+        memory: None,
         compression: crate::types::CompressionRatio::X4,
         always_ram: Some(true),
     }
@@ -104,6 +101,7 @@ fn product_x4() -> WithQuantization {
 
 fn binary() -> WithQuantization {
     let config = BinaryQuantizationConfig {
+        memory: None,
         always_ram: Some(true),
         encoding: None,
         query_encoding: None,
@@ -138,10 +136,10 @@ fn scoring_equivalency(
         DIMS,
         &mut raw_storage,
         NUM_POINTS,
-        &mut gen_sampler(&mut rng.clone()),
+        &mut gen_sampler(&mut rng),
     )?;
 
-    let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
+    let mut id_tracker = create_id_tracker_fixture(NUM_POINTS);
     super::utils::delete_random_vectors(
         &mut rng,
         &mut raw_storage,
@@ -153,13 +151,11 @@ fn scoring_equivalency(
 
     let mut other_storage = other_storage(other_dir.path());
 
-    let mut iter = (0..NUM_POINTS).map(|i| {
-        let i = i as PointOffsetType;
-        let vec = raw_storage.get_vector::<Random>(i);
-        let deleted = raw_storage.is_deleted_vector(i);
-        (vec, deleted)
-    });
-    other_storage.update_from(&mut iter, &Default::default())?;
+    merge_from_single_source(
+        &mut other_storage,
+        &raw_storage,
+        NUM_POINTS as PointOffsetType,
+    )?;
 
     let quant_dir = tempfile::Builder::new().prefix("quant-storage").tempdir()?;
     let quantized_vectors = if let Some(config) = &quant_config {
@@ -194,8 +190,7 @@ fn scoring_equivalency(
             HardwareCounterCell::new(),
         )?;
 
-        let points =
-            (0..other_storage.total_vector_count() as _).choose_multiple(&mut rng, SAMPLE_SIZE);
+        let points = (0..other_storage.total_vector_count() as _).sample(&mut rng, SAMPLE_SIZE);
 
         let scores = scorer.score_points(&mut points.clone(), 0).collect_vec();
         let other_scores = other_scorer
@@ -247,11 +242,17 @@ fn scoring_equivalency(
 }
 
 #[rstest]
+// `test_attr(ignore = ...)` is required so rstest forwards `#[ignore]` to each
+// generated per-case function. Product-quant cases alone take ~130s on Windows CI.
+#[cfg_attr(
+    target_os = "windows",
+    test_attr(ignore = "slow on Windows, not OS-specific")
+)]
 fn compare_scoring_equivalency(
     #[values(
         QueryVariant::RecoBestScore,
         QueryVariant::RecoSumScores,
-        QueryVariant::Discovery,
+        QueryVariant::Discover,
         QueryVariant::Context
     )]
     query_variant: QueryVariant,
@@ -268,7 +269,7 @@ fn async_compare_scoring_equivalency(
     #[values(
         QueryVariant::RecoBestScore,
         QueryVariant::RecoSumScores,
-        QueryVariant::Discovery,
+        QueryVariant::Discover,
         QueryVariant::Context
     )]
     query_variant: QueryVariant,

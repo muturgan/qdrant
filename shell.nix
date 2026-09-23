@@ -35,17 +35,20 @@ mkShell {
     pkgs.rustPlatform.bindgenHook # for bindgen deps
 
     # For tests and tools
+    pkgs.ast-grep # used in lib/edge/publish/amalgamate.py
     pkgs.cargo-nextest # mentioned in .github/workflows/rust.yml
     pkgs.ccache # mentioned in shellHook
     pkgs.curl # used in ./tests
     pkgs.glsl_analyzer # language server for editing *.comp files
     pkgs.gnuplot # optional runtime dep for criterion
     pkgs.jq # used in ./tests and ./tools
+    pkgs.just # for lib/edge/Justfile
     pkgs.maturin # mentioned in lib/edge/python/README.md
-    pkgs.nixfmt-rfc-style # to format this file
+    pkgs.nixfmt # to format this file
     pkgs.npins # used in tools/nix/update.py
     pkgs.python3 # used in ./tests, ./tools, lib/edge
     pkgs.sccache # mentioned in shellHook
+    pkgs.unzip # used in tools/sync-web-ui.sh
     pkgs.uv # used in tests
     pkgs.vulkan-tools # mentioned in .github/workflows/rust-gpu.yml
     pkgs.wget # used in tests/storage-compat

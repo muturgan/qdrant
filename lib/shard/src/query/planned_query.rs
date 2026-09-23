@@ -127,8 +127,10 @@ impl PlannedQuery {
             params,
         } = request;
 
-        // Adjust limit so that we have enough results when we cut off the offset at a higher level
-        let limit = limit + offset;
+        // Adjust limit so that we have enough results when we cut off the offset at a higher level.
+        // Use saturating_add so an unbounded user-supplied limit/offset cannot overflow
+        // (debug panic / release wraparound to a tiny limit) — it clamps to usize::MAX instead.
+        let limit = limit.saturating_add(offset);
 
         // Adjust with_vector based on the root query variant
         let with_vector = match &query {
@@ -191,8 +193,28 @@ impl PlannedQuery {
                 rescore: query.clone().unwrap(),
                 limit,
                 score_threshold: score_threshold.map(OrderedFloat),
-                params,
+                params: params.clone(),
             })),
+        };
+
+        // A scroll leaf is the final result and retrieves payload and vectors once, for the
+        // merged page, so it can fetch them itself instead of resolving the ids again afterwards.
+        // A search leaf fetches them per segment before merging, which multiplies the I/O by
+        // the segment count, so it stays bare and the root plan retrieves for the final result.
+        // See: <https://github.com/qdrant/qdrant/pull/6279>
+        let leaf_fetches = match &query {
+            None | Some(ScoringQuery::OrderBy(_)) | Some(ScoringQuery::Sample(_)) => true,
+            Some(ScoringQuery::Vector(_))
+            | Some(ScoringQuery::Fusion(_))
+            | Some(ScoringQuery::Formula(_))
+            | Some(ScoringQuery::Mmr(_)) => false,
+        };
+        let requested = (with_vector, with_payload);
+        let nothing = (WithVector::from(false), WithPayloadInterface::from(false));
+        let ((leaf_with_vector, leaf_with_payload), (with_vector, with_payload)) = if leaf_fetches {
+            (requested, nothing)
+        } else {
+            (nothing, requested)
         };
 
         // Everything must come from a single source.
@@ -204,6 +226,8 @@ impl PlannedQuery {
             params,
             score_threshold,
             filter,
+            leaf_with_vector,
+            leaf_with_payload,
         )?];
 
         // Root-level query without prefetches means we won't do any extra rescoring
@@ -251,7 +275,7 @@ impl PlannedQuery {
                     ))),
                     limit: *candidates_limit,
                     score_threshold: score_threshold.map(OrderedFloat),
-                    params,
+                    params: params.clone(),
                 };
 
                 let collection_level = RescoreParams {
@@ -332,6 +356,8 @@ fn recurse_prefetches(
                 params,
                 score_threshold.map(OrderedFloat::into_inner),
                 filter,
+                WithVector::from(false),
+                WithPayloadInterface::from(false),
             )?
         } else {
             // This has nested prefetches. Recurse into them
@@ -367,6 +393,7 @@ fn recurse_prefetches(
 /// does not act over prefetched points and will be executed over the segments directly.
 ///
 /// Only `Source::SearchesIdx` or `Source::ScrollsIdx` variants are returned.
+#[expect(clippy::too_many_arguments)]
 fn leaf_source_from_scoring_query(
     core_searches: &mut Vec<CoreSearchRequest>,
     scrolls: &mut Vec<QueryScrollRequestInternal>,
@@ -375,6 +402,8 @@ fn leaf_source_from_scoring_query(
     params: Option<SearchParams>,
     score_threshold: Option<f32>,
     filter: Option<Filter>,
+    with_vector: WithVector,
+    with_payload: WithPayloadInterface,
 ) -> OperationResult<Source> {
     let source = match query {
         Some(ScoringQuery::Vector(query_enum)) => {
@@ -384,8 +413,8 @@ fn leaf_source_from_scoring_query(
                 params,
                 limit,
                 offset: 0,
-                with_vector: Some(WithVector::from(false)),
-                with_payload: Some(WithPayloadInterface::from(false)),
+                with_vector: Some(with_vector),
+                with_payload: Some(with_payload),
                 score_threshold,
             };
 
@@ -403,8 +432,8 @@ fn leaf_source_from_scoring_query(
             let scroll = QueryScrollRequestInternal {
                 scroll_order: ScrollOrder::ByField(order_by),
                 filter,
-                with_vector: WithVector::from(false),
-                with_payload: WithPayloadInterface::from(false),
+                with_vector,
+                with_payload,
                 limit,
             };
 
@@ -422,8 +451,8 @@ fn leaf_source_from_scoring_query(
             let scroll = QueryScrollRequestInternal {
                 scroll_order: ScrollOrder::Random,
                 filter,
-                with_vector: WithVector::from(false),
-                with_payload: WithPayloadInterface::from(false),
+                with_vector,
+                with_payload,
                 limit,
             };
 
@@ -444,8 +473,8 @@ fn leaf_source_from_scoring_query(
                 query,
                 filter,
                 score_threshold,
-                with_vector: Some(WithVector::from(false)),
-                with_payload: Some(WithPayloadInterface::from(false)),
+                with_vector: Some(with_vector),
+                with_payload: Some(with_payload),
                 offset: 0,
                 params,
                 limit: candidates_limit,
@@ -460,8 +489,8 @@ fn leaf_source_from_scoring_query(
             let scroll = QueryScrollRequestInternal {
                 scroll_order: Default::default(),
                 filter,
-                with_vector: WithVector::from(false),
-                with_payload: WithPayloadInterface::from(false),
+                with_vector,
+                with_payload,
                 limit,
             };
 

@@ -3,10 +3,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use api::rest::OrderByInterface;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
+use segment::data_types::order_by::OrderByInterface;
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{
     Distance, ExtendedPointId, Payload, PayloadFieldSchema, PayloadSchemaType, SearchParams,
@@ -33,6 +33,7 @@ use crate::shards::collection_shard_distribution::CollectionShardDistribution;
 use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_trait::WaitUntil;
 
 const DIM: u64 = 4;
 const PEER_ID: u64 = 1;
@@ -138,7 +139,7 @@ async fn fixture() -> Collection {
             ])),
         ));
         shard
-            .update_local(op, true, None, HwMeasurementAcc::new(), false)
+            .update_local(op, WaitUntil::Visible, None, HwMeasurementAcc::new(), false)
             .await
             .expect("failed to insert points");
     }
@@ -170,6 +171,7 @@ async fn test_scroll_dedup() {
                 order_by: None,
             },
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             HwMeasurementAcc::new(),
@@ -198,6 +200,7 @@ async fn test_scroll_dedup() {
                 order_by: Some(OrderByInterface::Key("num".parse().unwrap())),
             },
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             HwMeasurementAcc::new(),
@@ -219,6 +222,7 @@ async fn test_scroll_dedup() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 async fn test_retrieve_dedup() {
     let collection = fixture().await;
 
@@ -232,6 +236,7 @@ async fn test_retrieve_dedup() {
                 with_payload: Some(false.into()),
                 with_vector: false.into(),
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -251,6 +256,7 @@ async fn test_retrieve_dedup() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 async fn test_search_dedup() {
     let collection = fixture().await;
 
@@ -270,6 +276,7 @@ async fn test_search_dedup() {
                 with_vector: None,
                 score_threshold: None,
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,

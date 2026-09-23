@@ -2,17 +2,18 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use criterion::{Criterion, criterion_group, criterion_main};
-use quantization::encoded_storage::{TestEncodedStorage, TestEncodedStorageBuilder};
+use quantization::encoded_storage::TestEncodedStorageBuilder;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-use quantization::encoded_vectors_pq::EncodedVectorsPQ;
-use rand::Rng;
+use quantization::encoded_vectors_pq::{self, EncodedVectorsPQ};
+use rand::RngExt;
+use rand::rngs::SmallRng;
 
 fn encode_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode");
 
     let vectors_count = 100_000;
     let vector_dim = 1024;
-    let mut rng = rand::rng();
+    let mut rng = rand::make_rng::<SmallRng>();
     let mut list: Vec<f32> = Vec::new();
     for _ in 0..vectors_count {
         let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
@@ -26,7 +27,7 @@ fn encode_bench(c: &mut Criterion) {
         invert: false,
     };
     let quantized_vector_size =
-        EncodedVectorsPQ::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters, 2);
+        encoded_vectors_pq::get_quantized_vector_size(&vector_parameters, 2);
     let pq_encoded = EncodedVectorsPQ::encode(
         (0..vectors_count).map(|i| &list[i * vector_dim..(i + 1) * vector_dim]),
         TestEncodedStorageBuilder::new(None, quantized_vector_size),
@@ -48,7 +49,7 @@ fn encode_bench(c: &mut Criterion) {
 
     group.bench_function("score random access pq", |b| {
         b.iter(|| {
-            let random_idx = rand::random::<u32>() % vectors_count as u32;
+            let random_idx = rng.random_range(0..vectors_count as u32);
             total += pq_encoded.score_point(&encoded_query, random_idx, &hardware_counter);
         });
     });

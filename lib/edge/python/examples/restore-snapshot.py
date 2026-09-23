@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
+# See lib/edge/publish/examples/src/bin/restore-snapshot.rs for the equivalent Rust example.
+
 import os
 import requests
 import shutil
 import json
 
-from common import DATA_DIRECTORY
+from common import DATA_DIR
 
 from qdrant_edge import *
 
@@ -30,10 +33,10 @@ def download_snapshot(url: str, dest_folder: str):
                 f.write(chunk)
     return local_filename
 
-snapshot_path = download_snapshot(SNAPSHOT_URL, DATA_DIRECTORY)
+snapshot_path = download_snapshot(SNAPSHOT_URL, DATA_DIR)
 print(f"Snapshot downloaded to: {snapshot_path}")
 
-recovered_path = os.path.join(DATA_DIRECTORY, "restored_shard")
+recovered_path = os.path.join(DATA_DIR, "restored_shard")
 print(f"Restoring shard from snapshot to: {recovered_path}")
 if os.path.exists(recovered_path):
     print("Removing existing recovered shard directory...")
@@ -41,7 +44,7 @@ if os.path.exists(recovered_path):
 
 EdgeShard.unpack_snapshot(snapshot_path, recovered_path)
 
-shard = EdgeShard(recovered_path, None)
+shard = EdgeShard.load(recovered_path)
 
 points = shard.retrieve(point_ids=[1, 2, 3], with_vector=False, with_payload=True)
 
@@ -50,7 +53,7 @@ for point in points:
 
 print("Manifest of restored shard:", json.dumps(shard.snapshot_manifest(), indent=2))
 
-partial_snapshot_path = download_snapshot(PARTIAL_SNAPSHOT_URL, DATA_DIRECTORY)
+partial_snapshot_path = download_snapshot(PARTIAL_SNAPSHOT_URL, DATA_DIR)
 
 shard.update_from_snapshot(partial_snapshot_path)
 

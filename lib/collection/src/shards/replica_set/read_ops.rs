@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::types::DeferredBehavior;
 use futures::FutureExt as _;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::types::*;
@@ -12,15 +13,16 @@ use shard::search::CoreSearchRequestBatch;
 
 use super::ShardReplicaSet;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::routing::RoutingToken;
 use crate::operations::types::*;
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 
 impl ShardReplicaSet {
-    #[allow(clippy::too_many_arguments)]
     pub async fn scroll_by(
         &self,
         request: Arc<ScrollRequestInternal>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         local_only: bool,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -40,6 +42,7 @@ impl ShardReplicaSet {
                 .boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await
@@ -56,6 +59,7 @@ impl ShardReplicaSet {
         read_consistency: Option<ReadConsistency>,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let with_payload_interface = Arc::new(with_payload_interface.clone());
         let with_vector = Arc::new(with_vector.clone());
@@ -81,12 +85,15 @@ impl ShardReplicaSet {
                             &search_runtime,
                             timeout,
                             hw_acc,
+                            deferred_behavior,
                         )
                         .await
                 }
                 .boxed()
             },
             read_consistency,
+            // Local-only read: replica routing does not apply.
+            None,
             true,
         )
         .await
@@ -96,6 +103,7 @@ impl ShardReplicaSet {
         &self,
         request: Arc<CoreSearchRequestBatch>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         local_only: bool,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -113,18 +121,22 @@ impl ShardReplicaSet {
                 .boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn count(
         &self,
         request: Arc<CountRequestInternal>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         timeout: Option<Duration>,
         local_only: bool,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<CountResult> {
         self.execute_and_resolve_read_operation(
             |shard| {
@@ -133,12 +145,19 @@ impl ShardReplicaSet {
                 let hw_measurement_acc_clone = hw_measurement_acc.clone();
                 async move {
                     shard
-                        .count(request, &search_runtime, timeout, hw_measurement_acc_clone)
+                        .count(
+                            request,
+                            &search_runtime,
+                            timeout,
+                            hw_measurement_acc_clone,
+                            deferred_behavior,
+                        )
                         .await
                 }
                 .boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await
@@ -151,6 +170,7 @@ impl ShardReplicaSet {
         with_payload: &WithPayload,
         with_vector: &WithVector,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         timeout: Option<Duration>,
         local_only: bool,
         hw_measurement_acc: HwMeasurementAcc,
@@ -176,12 +196,14 @@ impl ShardReplicaSet {
                             &search_runtime,
                             timeout,
                             hw_acc,
+                            DeferredBehavior::VisibleOnly,
                         )
                         .await
                 }
                 .boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await
@@ -190,6 +212,8 @@ impl ShardReplicaSet {
     pub async fn info(&self, local_only: bool) -> CollectionResult<CollectionInfo> {
         self.execute_read_operation(
             |shard| async move { shard.info().await }.boxed(),
+            // Collection info read: replica routing does not apply.
+            None,
             local_only,
         )
         .await
@@ -200,6 +224,7 @@ impl ShardReplicaSet {
         request: Arc<CountRequestInternal>,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
+        deferred_behavior: DeferredBehavior,
     ) -> CollectionResult<Option<CountResult>> {
         let local = self.local.read().await;
         match &*local {
@@ -209,7 +234,13 @@ impl ShardReplicaSet {
                 Ok(Some(
                     shard
                         .get()
-                        .count(request, &search_runtime, timeout, hw_measurement_acc)
+                        .count(
+                            request,
+                            &search_runtime,
+                            timeout,
+                            hw_measurement_acc,
+                            deferred_behavior,
+                        )
                         .await?,
                 ))
             }
@@ -220,6 +251,7 @@ impl ShardReplicaSet {
         &self,
         requests: Arc<Vec<ShardQueryRequest>>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         local_only: bool,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -237,6 +269,7 @@ impl ShardReplicaSet {
                 .boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await
@@ -246,6 +279,7 @@ impl ShardReplicaSet {
         &self,
         request: Arc<FacetParams>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         local_only: bool,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -259,6 +293,7 @@ impl ShardReplicaSet {
                 async move { shard.facet(request, &search_runtime, timeout, hw_acc).await }.boxed()
             },
             read_consistency,
+            routing_token,
             local_only,
         )
         .await

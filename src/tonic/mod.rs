@@ -23,6 +23,7 @@ use ::api::grpc::qdrant::qdrant_internal_server::QdrantInternalServer;
 use ::api::grpc::qdrant::qdrant_server::{Qdrant, QdrantServer};
 use ::api::grpc::qdrant::shard_snapshots_server::ShardSnapshotsServer;
 use ::api::grpc::qdrant::snapshots_server::SnapshotsServer;
+use ::api::grpc::qdrant::storage_read_server::StorageReadServer;
 use ::api::grpc::qdrant::{HealthCheckReply, HealthCheckRequest};
 use ::api::rest::models::VersionInfo;
 use collection::operations::verification::new_unchecked_verification_pass;
@@ -48,6 +49,17 @@ use crate::tonic::api::points_api::PointsService;
 use crate::tonic::api::points_internal_api::PointsInternalService;
 use crate::tonic::api::qdrant_internal_api::QdrantInternalService;
 use crate::tonic::api::snapshots_api::{ShardSnapshotsService, SnapshotsService};
+use crate::tonic::api::storage_read_api::StorageReadService;
+use crate::tonic::api::telemetry_wrapper::{
+    PointsTelemetryWrapper, ShardSnapshotsTelemetryWrapper, SnapshotsTelemetryWrapper,
+};
+
+// Compile-time storage backend selection for StorageRead gRPC service.
+// On Linux, uses io_uring for optimal async I/O; falls back to mmap elsewhere.
+#[cfg(target_os = "linux")]
+type StorageBackend = common::universal_io::IoUringFile;
+#[cfg(not(target_os = "linux"))]
+type StorageBackend = common::universal_io::MmapFile;
 
 #[derive(Default)]
 pub struct QdrantService {}
@@ -113,22 +125,25 @@ pub fn init(
         let collections_service = CollectionsService::new(dispatcher.clone());
         let points_service = PointsService::new(dispatcher.clone(), settings.service.clone());
         let snapshot_service = SnapshotsService::new(dispatcher.clone());
+        let storage_read_service = StorageReadService::<StorageBackend>::new(dispatcher.clone())
+            .map_err(io::Error::other)?;
 
         // Only advertise the public services. By default, all services in QDRANT_DESCRIPTOR_SET
         // will be advertised, so explicitly list the services to be included.
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(QDRANT_DESCRIPTOR_SET)
-            .with_service_name("qdrant.Collections")
-            .with_service_name("qdrant.Points")
-            .with_service_name("qdrant.Snapshots")
-            .with_service_name("qdrant.Qdrant")
-            .with_service_name("grpc.health.v1.Health")
-            .build()
-            .unwrap();
+        let reflection_service_v1 = reflection_service().build_v1().unwrap();
+        let reflection_service_v1alpha = reflection_service().build_v1alpha().unwrap();
 
         log::info!("Qdrant gRPC listening on {grpc_port}");
 
-        let mut server = Server::builder();
+        let mut server = Server::builder()
+            // Use a high limit for pending accept reset streams.
+            // We can have a huge number of reset/dropped HTTP2 streams when there are
+            // a lot of clients dropping connections. This internally causes a
+            // GOAWAY/ENHANCE_YOUR_CALM error.
+            // We prefer to keep more pending reset streams even though this may be expensive,
+            // versus an internal error that is very hard to handle.
+            // More info: <https://github.com/qdrant/qdrant/issues/1907>
+            .http2_max_pending_accept_reset_streams(Some(1024));
 
         if settings.service.enable_tls {
             log::info!("TLS enabled for gRPC API (TTL not supported)");
@@ -163,7 +178,8 @@ pub fn init(
 
         server
             .layer(middleware_layer)
-            .add_service(reflection_service)
+            .add_service(reflection_service_v1)
+            .add_service(reflection_service_v1alpha)
             .add_service(
                 QdrantServer::new(qdrant_service)
                     .send_compressed(CompressionEncoding::Gzip)
@@ -177,19 +193,25 @@ pub fn init(
                     .max_decoding_message_size(usize::MAX),
             )
             .add_service(
-                PointsServer::new(points_service)
+                PointsServer::new(PointsTelemetryWrapper::new(points_service))
                     .send_compressed(CompressionEncoding::Gzip)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(usize::MAX),
             )
             .add_service(
-                SnapshotsServer::new(snapshot_service)
+                SnapshotsServer::new(SnapshotsTelemetryWrapper::new(snapshot_service))
                     .send_compressed(CompressionEncoding::Gzip)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(usize::MAX),
             )
             .add_service(
                 HealthServer::new(health_service)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(usize::MAX),
+            )
+            .add_service(
+                StorageReadServer::new(storage_read_service)
                     .send_compressed(CompressionEncoding::Gzip)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(usize::MAX),
@@ -202,6 +224,17 @@ pub fn init(
     })?;
 
     Ok(())
+}
+
+fn reflection_service() -> tonic_reflection::server::Builder<'static> {
+    tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(QDRANT_DESCRIPTOR_SET)
+        .with_service_name("qdrant.Collections")
+        .with_service_name("qdrant.Points")
+        .with_service_name("qdrant.Snapshots")
+        .with_service_name("qdrant.Qdrant")
+        .with_service_name("grpc.health.v1.Health")
+        .with_service_name("qdrant.StorageRead")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,8 +259,18 @@ pub fn init_internal(
     runtime
         .block_on(async {
             let socket = SocketAddr::from((host.parse::<IpAddr>().unwrap(), internal_grpc_port));
-
             let qdrant_service = QdrantService::default();
+            // Only enforce authentication on the internal API when the operator
+            // explicitly opts in. The API key is still forwarded unconditionally
+            // on outgoing internal requests, so the cluster keeps working
+            // across a rolling upgrade while `enforce_internal_auth` is false.
+            let internal_auth_layer = if settings.service.enforce_internal_auth.unwrap_or_default()
+            {
+                AuthKeys::try_create(&settings.service, toc.clone()).map(auth::AuthLayer::new)
+            } else {
+                None
+            };
+
             let points_internal_service =
                 PointsInternalService::new(toc.clone(), settings.service.clone());
             let qdrant_internal_service =
@@ -263,6 +306,7 @@ pub fn init_internal(
                 .layer(tonic_telemetry::TonicTelemetryLayer::new(
                     tonic_telemetry_collector,
                 ))
+                .option_layer(internal_auth_layer)
                 .into_inner();
 
             server
@@ -292,10 +336,12 @@ pub fn init_internal(
                         .max_decoding_message_size(usize::MAX),
                 )
                 .add_service(
-                    ShardSnapshotsServer::new(shard_snapshots_service)
-                        .send_compressed(CompressionEncoding::Gzip)
-                        .accept_compressed(CompressionEncoding::Gzip)
-                        .max_decoding_message_size(usize::MAX),
+                    ShardSnapshotsServer::new(ShardSnapshotsTelemetryWrapper::new(
+                        shard_snapshots_service,
+                    ))
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(usize::MAX),
                 )
                 .add_service(
                     RaftServer::new(raft_service)

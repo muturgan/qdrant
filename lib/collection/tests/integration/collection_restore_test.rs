@@ -1,3 +1,5 @@
+#![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
 use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
@@ -38,7 +40,7 @@ async fn test_collection_reloading_with_shards(shard_number: u32) {
         let insert_points =
             CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
                 PointInsertOperationsInternal::PointsBatch(BatchPersisted {
-                    ids: vec![0, 1].into_iter().map(|x| x.into()).collect_vec(),
+                    ids: vec![0, 1].into_iter().map(u64::into).collect_vec(),
                     vectors: BatchVectorStructPersisted::Single(vec![
                         vec![1.0, 0.0, 1.0, 1.0],
                         vec![1.0, 0.0, 1.0, 0.0],
@@ -93,7 +95,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
         let insert_points =
             CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
                 PointInsertOperationsInternal::PointsBatch(BatchPersisted {
-                    ids: vec![0, 1].into_iter().map(|x| x.into()).collect_vec(),
+                    ids: vec![0, 1].into_iter().map(u64::into).collect_vec(),
                     vectors: BatchVectorStructPersisted::Single(vec![
                         vec![1.0, 0.0, 1.0, 1.0],
                         vec![1.0, 0.0, 1.0, 0.0],
@@ -133,6 +135,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
                 with_vector: true.into(),
                 order_by: None,
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -227,6 +230,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 order_by: None,
             },
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             HwMeasurementAcc::new(),
@@ -265,6 +269,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 with_vector: false.into(),
                 order_by: None,
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,

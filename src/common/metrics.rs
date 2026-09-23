@@ -7,6 +7,7 @@ use prometheus::TextEncoder;
 use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use segment::common::operation_time_statistics::OperationDurationStatistics;
 use shard::PeerId;
+use storage::quota::{QuotaExceeded, QuotaTelemetry};
 use storage::types::ConsensusThreadStatus;
 
 use super::telemetry_ops::hardware::HardwareTelemetry;
@@ -27,31 +28,32 @@ use crate::common::telemetry_ops::requests_telemetry::{
 ///
 /// This array *must* be sorted.
 const REST_ENDPOINT_WHITELIST: &[&str] = &[
-    "/collections/{name}/index",
-    "/collections/{name}/points",
-    "/collections/{name}/points/batch",
-    "/collections/{name}/points/count",
-    "/collections/{name}/points/delete",
-    "/collections/{name}/points/discover",
-    "/collections/{name}/points/discover/batch",
-    "/collections/{name}/points/facet",
-    "/collections/{name}/points/payload",
-    "/collections/{name}/points/payload/clear",
-    "/collections/{name}/points/payload/delete",
-    "/collections/{name}/points/query",
-    "/collections/{name}/points/query/batch",
-    "/collections/{name}/points/query/groups",
-    "/collections/{name}/points/recommend",
-    "/collections/{name}/points/recommend/batch",
-    "/collections/{name}/points/recommend/groups",
-    "/collections/{name}/points/scroll",
-    "/collections/{name}/points/search",
-    "/collections/{name}/points/search/batch",
-    "/collections/{name}/points/search/groups",
-    "/collections/{name}/points/search/matrix/offsets",
-    "/collections/{name}/points/search/matrix/pairs",
-    "/collections/{name}/points/vectors",
-    "/collections/{name}/points/vectors/delete",
+    "/collections/{collection_name}/index",
+    "/collections/{collection_name}/points",
+    "/collections/{collection_name}/points/batch",
+    "/collections/{collection_name}/points/count",
+    "/collections/{collection_name}/points/delete",
+    "/collections/{collection_name}/points/discover",
+    "/collections/{collection_name}/points/discover/batch",
+    "/collections/{collection_name}/points/facet",
+    "/collections/{collection_name}/points/payload",
+    "/collections/{collection_name}/points/payload/clear",
+    "/collections/{collection_name}/points/payload/delete",
+    "/collections/{collection_name}/points/query",
+    "/collections/{collection_name}/points/query/batch",
+    "/collections/{collection_name}/points/query/groups",
+    "/collections/{collection_name}/points/recommend",
+    "/collections/{collection_name}/points/recommend/batch",
+    "/collections/{collection_name}/points/recommend/groups",
+    "/collections/{collection_name}/points/scroll",
+    "/collections/{collection_name}/points/search",
+    "/collections/{collection_name}/points/search/batch",
+    "/collections/{collection_name}/points/search/groups",
+    "/collections/{collection_name}/points/search/matrix/offsets",
+    "/collections/{collection_name}/points/search/matrix/pairs",
+    "/collections/{collection_name}/points/vectors",
+    "/collections/{collection_name}/points/vectors/delete",
+    "/collections/{collection_name}/vectors/{vector_name}",
 ];
 
 /// Whitelist for GRPC endpoints in metrics output.
@@ -62,8 +64,10 @@ const REST_ENDPOINT_WHITELIST: &[&str] = &[
 const GRPC_ENDPOINT_WHITELIST: &[&str] = &[
     "/qdrant.Points/ClearPayload",
     "/qdrant.Points/Count",
+    "/qdrant.Points/CreateVectorName",
     "/qdrant.Points/Delete",
     "/qdrant.Points/DeletePayload",
+    "/qdrant.Points/DeleteVectorName",
     "/qdrant.Points/Discover",
     "/qdrant.Points/DiscoverBatch",
     "/qdrant.Points/Facet",
@@ -147,12 +151,48 @@ impl MetricsProvider for TelemetryData {
         if let Some(mem) = &self.memory {
             mem.add_metrics(metrics, prefix);
         }
+        if let Some(quota) = &self.quota {
+            quota.add_metrics(metrics, prefix);
+        }
 
         #[cfg(target_os = "linux")]
         match procfs_metrics::ProcFsMetrics::collect() {
             Ok(procfs_provider) => procfs_provider.add_metrics(metrics, prefix),
             Err(err) => log::warn!("Error reading procfs infos: {err:?}"),
         };
+    }
+}
+
+impl MetricsProvider for QuotaTelemetry {
+    fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
+        let QuotaExceeded {
+            resident_memory,
+            disk_usage,
+        } = self.exceeded;
+
+        // One series per capped resource, and none for a resource with no limit:
+        // a series that can never reach 1 reads as "healthy" and would silently
+        // carry an alert that cannot fire. So the quota being disabled, or a
+        // resource being left uncapped, shows up as an absent series rather than
+        // a reassuring zero.
+        let series = [("memory", resident_memory), ("disk", disk_usage)]
+            .into_iter()
+            .filter_map(|(resource, exceeded)| {
+                let exceeded = exceeded?;
+                Some(gauge(
+                    f64::from(u8::from(exceeded)),
+                    &[("resource", resource)],
+                ))
+            })
+            .collect();
+
+        metrics.push_metric(metric_family(
+            "quota_exceeded",
+            "whether this node is at or over the configured quota for a resource",
+            MetricType::GAUGE,
+            series,
+            prefix,
+        ));
     }
 }
 
@@ -171,6 +211,30 @@ impl MetricsProvider for AppBuildTelemetry {
         self.features
             .iter()
             .for_each(|f| f.add_metrics(metrics, prefix));
+
+        if let Some(audit) = &self.audit
+            && let Some(size) = audit.dir_size_bytes
+        {
+            metrics.push_metric(metric_family(
+                "audit_log_dir_size_bytes",
+                "size of the audit log directory on disk in bytes",
+                MetricType::GAUGE,
+                vec![gauge(size as f64, &[])],
+                prefix,
+            ));
+        }
+
+        if let Some(system) = &self.system
+            && let Some(cpu_cores_used) = system.cpu_cores_used
+        {
+            metrics.push_metric(metric_family(
+                "cpu_cores_used",
+                "average number of CPU cores used by this process over roughly the last two seconds",
+                MetricType::GAUGE,
+                vec![gauge(f64::from(cpu_cores_used), &[])],
+                prefix,
+            ));
+        }
     }
 }
 
@@ -231,6 +295,7 @@ impl CollectionsTelemetry {
 
         // Update queue
         let mut update_queue_length = Vec::with_capacity(num_collections);
+        let mut deferred_points_count = Vec::with_capacity(num_collections);
 
         for collection in self.collections.iter().flatten() {
             let collection = match collection {
@@ -258,7 +323,7 @@ impl CollectionsTelemetry {
                 // - in stage 2 (migrate points) of resharding up we don't rely on the replica
                 //   to be available yet. In this stage, these replicas will have the `Resharding`
                 //   state.
-                // - in stage 3 (replicate) of resharding up we activate the the replica and
+                // - in stage 3 (replicate) of resharding up we activate the replica and
                 //   replicate to match the configuration replication factor. From this point on we
                 //   do rely on the replica to be available. Now one replica will be `Active`, and
                 //   the other replicas will be in a transfer state. No replica will have `Resharding`
@@ -368,16 +433,25 @@ impl CollectionsTelemetry {
             ));
 
             // Update queue
-            let total_queue_length: usize = collection
+            let (total_queue_length, total_deferred_count): (usize, usize) = collection
                 .shards
                 .iter()
                 .flatten()
                 .filter_map(|shard| shard.local.as_ref())
                 .filter_map(|local| local.update_queue.as_ref())
-                .map(|uq| uq.length)
-                .sum();
+                .map(|uq| (uq.length, uq.deferred_points))
+                .fold((0, 0), |(acc_queue, acc_deferred), (queue, deferred)| {
+                    (
+                        acc_queue + queue,
+                        acc_deferred + deferred.unwrap_or_default(),
+                    )
+                });
 
             update_queue_length.push(gauge(total_queue_length as f64, &[("id", &collection.id)]));
+            deferred_points_count.push(gauge(
+                total_deferred_count as f64,
+                &[("id", &collection.id)],
+            ));
         }
 
         for snapshot_telemetry in self.snapshots.iter().flatten() {
@@ -527,6 +601,14 @@ impl CollectionsTelemetry {
             update_queue_length,
             prefix,
         ));
+
+        metrics.push_metric(metric_family(
+            "collection_update_queue_deferred_points",
+            "number of points currently hidden during read operations as they're not yet optimized",
+            MetricType::GAUGE,
+            deferred_points_count,
+            prefix,
+        ));
     }
 }
 
@@ -644,54 +726,113 @@ impl MetricsProvider for RequestsTelemetry {
 
 impl MetricsProvider for WebApiTelemetry {
     fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
-        let mut builder = OperationDurationMetricsBuilder::default();
-        for (endpoint, responses) in &self.responses {
-            let Some((method, endpoint)) = endpoint.split_once(' ') else {
-                continue;
-            };
-            // Endpoint must be whitelisted
-            if REST_ENDPOINT_WHITELIST.binary_search(&endpoint).is_err() {
-                continue;
+        // Mode decision: when `per_collection_responses` is populated (i.e. per_collection
+        // was requested via query parameter), we render per-collection metrics with a
+        // `collection` label and skip global ones.
+        if self.per_collection_responses.is_empty() {
+            // Global mode: render global metrics as before
+            let mut builder = OperationDurationMetricsBuilder::default();
+            for (endpoint, responses) in &self.responses {
+                let Some((method, endpoint)) = endpoint.split_once(' ') else {
+                    continue;
+                };
+                if REST_ENDPOINT_WHITELIST.binary_search(&endpoint).is_err() {
+                    continue;
+                }
+                for (status, stats) in responses {
+                    builder.add(
+                        stats,
+                        &[
+                            ("method", method),
+                            ("endpoint", endpoint),
+                            ("status", &status.to_string()),
+                        ],
+                        *status == REST_TIMINGS_FOR_STATUS,
+                    );
+                }
             }
-            for (status, stats) in responses {
-                builder.add(
-                    stats,
-                    &[
-                        ("method", method),
-                        ("endpoint", endpoint),
-                        ("status", &status.to_string()),
-                    ],
-                    *status == REST_TIMINGS_FOR_STATUS,
-                );
+            builder.build(prefix, "rest", metrics);
+        } else {
+            // Per-collection mode: render per-collection metrics with `collection` label
+            let mut builder = OperationDurationMetricsBuilder::default();
+            for (collection, methods) in &self.per_collection_responses {
+                for (endpoint, responses) in methods {
+                    let Some((method, endpoint)) = endpoint.split_once(' ') else {
+                        continue;
+                    };
+                    if REST_ENDPOINT_WHITELIST.binary_search(&endpoint).is_err() {
+                        continue;
+                    }
+                    for (status, stats) in responses {
+                        builder.add(
+                            stats,
+                            &[
+                                ("method", method),
+                                ("endpoint", endpoint),
+                                ("status", &status.to_string()),
+                                ("collection", collection),
+                            ],
+                            *status == REST_TIMINGS_FOR_STATUS,
+                        );
+                    }
+                }
             }
+            builder.build(prefix, "rest", metrics);
         }
-        builder.build(prefix, "rest", metrics);
     }
 }
 
 impl MetricsProvider for GrpcTelemetry {
     fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
-        let mut builder = OperationDurationMetricsBuilder::default();
-        for (endpoint, responses) in &self.responses {
-            // Endpoint must be whitelisted
-            if GRPC_ENDPOINT_WHITELIST
-                .binary_search(&endpoint.as_str())
-                .is_err()
-            {
-                continue;
+        // Same mode-switching logic as WebApiTelemetry::add_metrics — see comment there.
+        if self.per_collection_responses.is_empty() {
+            // Global mode: render global metrics as before
+            let mut builder = OperationDurationMetricsBuilder::default();
+            for (endpoint, responses) in &self.responses {
+                if GRPC_ENDPOINT_WHITELIST
+                    .binary_search(&endpoint.as_str())
+                    .is_err()
+                {
+                    continue;
+                }
+                for (status, stats) in responses {
+                    builder.add(
+                        stats,
+                        &[
+                            ("endpoint", endpoint.as_str()),
+                            ("status", &status.to_string()),
+                        ],
+                        true,
+                    );
+                }
             }
-            for (status, stats) in responses {
-                builder.add(
-                    stats,
-                    &[
-                        ("endpoint", endpoint.as_str()),
-                        ("status", &status.to_string()),
-                    ],
-                    true,
-                );
+            builder.build(prefix, "grpc", metrics);
+        } else {
+            // Per-collection mode: render per-collection metrics with `collection` label
+            let mut builder = OperationDurationMetricsBuilder::default();
+            for (collection, methods) in &self.per_collection_responses {
+                for (endpoint, responses) in methods {
+                    if GRPC_ENDPOINT_WHITELIST
+                        .binary_search(&endpoint.as_str())
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    for (status, stats) in responses {
+                        builder.add(
+                            stats,
+                            &[
+                                ("endpoint", endpoint.as_str()),
+                                ("status", &status.to_string()),
+                                ("collection", collection),
+                            ],
+                            true,
+                        );
+                    }
+                }
             }
+            builder.build(prefix, "grpc", metrics);
         }
-        builder.build(prefix, "grpc", metrics);
     }
 }
 
@@ -1284,12 +1425,193 @@ mod tests {
         use super::{GRPC_ENDPOINT_WHITELIST, REST_ENDPOINT_WHITELIST};
 
         assert!(
-            REST_ENDPOINT_WHITELIST.windows(2).all(|n| n[0] <= n[1]),
-            "REST_ENDPOINT_WHITELIST must be sorted in code to allow binary search"
+            REST_ENDPOINT_WHITELIST.array_windows().all(|[a, b]| a <= b),
+            "REST_ENDPOINT_WHITELIST must be sorted in code to allow binary search",
         );
         assert!(
-            GRPC_ENDPOINT_WHITELIST.windows(2).all(|n| n[0] <= n[1]),
-            "GRPC_ENDPOINT_WHITELIST must be sorted in code to allow binary search"
+            GRPC_ENDPOINT_WHITELIST.array_windows().all(|[a, b]| a <= b),
+            "GRPC_ENDPOINT_WHITELIST must be sorted in code to allow binary search",
+        );
+    }
+
+    #[test]
+    fn test_rest_whitelist_uses_collection_name_param() {
+        use super::REST_ENDPOINT_WHITELIST;
+
+        for endpoint in REST_ENDPOINT_WHITELIST {
+            assert!(
+                endpoint.contains("{collection_name}"),
+                "REST_ENDPOINT_WHITELIST entry `{endpoint}` must use \
+                 `{{collection_name}}` as the collection path parameter",
+            );
+        }
+    }
+
+    #[test]
+    fn test_rest_metrics_global_mode() {
+        use std::collections::HashMap;
+
+        use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+        use super::{MetricsData, MetricsProvider, WebApiTelemetry};
+
+        let mut responses = HashMap::new();
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            200u16,
+            OperationDurationStatistics {
+                count: 10,
+                ..Default::default()
+            },
+        );
+        responses.insert(
+            "POST /collections/{collection_name}/points/search".to_string(),
+            status_map,
+        );
+
+        let telemetry = WebApiTelemetry {
+            responses,
+            per_collection_responses: HashMap::new(),
+        };
+
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, None);
+        let output = metrics.format_metrics();
+
+        // Should contain global metrics without collection label
+        assert!(output.contains("rest_responses_total"));
+        assert!(!output.contains("collection="));
+    }
+
+    #[test]
+    fn test_rest_metrics_per_collection_mode() {
+        use std::collections::HashMap;
+
+        use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+        use super::{MetricsData, MetricsProvider, WebApiTelemetry};
+
+        // Global responses present but per_collection too
+        let mut responses = HashMap::new();
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            200u16,
+            OperationDurationStatistics {
+                count: 10,
+                ..Default::default()
+            },
+        );
+        responses.insert(
+            "POST /collections/{collection_name}/points/search".to_string(),
+            status_map,
+        );
+
+        let mut per_collection = HashMap::new();
+        let mut methods = HashMap::new();
+        let mut col_status_map = HashMap::new();
+        col_status_map.insert(
+            200u16,
+            OperationDurationStatistics {
+                count: 5,
+                ..Default::default()
+            },
+        );
+        methods.insert(
+            "POST /collections/{collection_name}/points/search".to_string(),
+            col_status_map,
+        );
+        per_collection.insert("my_collection".to_string(), methods);
+
+        let telemetry = WebApiTelemetry {
+            responses,
+            per_collection_responses: per_collection,
+        };
+
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, None);
+        let output = metrics.format_metrics();
+
+        // Should contain collection label
+        assert!(
+            output.contains("collection=\"my_collection\""),
+            "Expected collection label in output:\n{output}"
+        );
+        // Should still have rest_ prefix metrics
+        assert!(output.contains("rest_responses_total"));
+    }
+
+    #[test]
+    fn test_grpc_metrics_per_collection_mode() {
+        use std::collections::HashMap;
+
+        use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+        use super::{GrpcTelemetry, MetricsData, MetricsProvider};
+
+        let mut per_collection = HashMap::new();
+        let mut methods = HashMap::new();
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            0i32,
+            OperationDurationStatistics {
+                count: 7,
+                ..Default::default()
+            },
+        );
+        methods.insert("/qdrant.Points/Search".to_string(), status_map);
+        per_collection.insert("test_col".to_string(), methods);
+
+        let telemetry = GrpcTelemetry {
+            responses: HashMap::new(),
+            per_collection_responses: per_collection,
+        };
+
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, None);
+        let output = metrics.format_metrics();
+
+        assert!(
+            output.contains("collection=\"test_col\""),
+            "Expected collection label in output:\n{output}"
+        );
+        assert!(output.contains("grpc_responses_total"));
+    }
+
+    #[test]
+    fn test_per_collection_skips_non_whitelisted() {
+        use std::collections::HashMap;
+
+        use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+        use super::{MetricsData, MetricsProvider, WebApiTelemetry};
+
+        let mut per_collection = HashMap::new();
+        let mut methods = HashMap::new();
+        let mut status_map = HashMap::new();
+        status_map.insert(
+            200u16,
+            OperationDurationStatistics {
+                count: 3,
+                ..Default::default()
+            },
+        );
+        // This endpoint is NOT in the whitelist
+        methods.insert("GET /collections".to_string(), status_map);
+        per_collection.insert("col".to_string(), methods);
+
+        let telemetry = WebApiTelemetry {
+            responses: HashMap::new(),
+            per_collection_responses: per_collection,
+        };
+
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, None);
+        let output = metrics.format_metrics();
+
+        // Non-whitelisted endpoints should not appear
+        assert!(
+            !output.contains("collection=\"col\""),
+            "Non-whitelisted endpoint should not appear:\n{output}"
         );
     }
 }

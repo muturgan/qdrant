@@ -1,41 +1,63 @@
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use parking_lot::Mutex;
-use segment::common::operation_time_statistics::OperationDurationsAggregator;
-use segment::entry::NonAppendableSegmentEntry as _;
-use segment::segment::Segment;
-use segment::types::{HnswConfig, HnswGlobalConfig, QuantizationConfig};
-
-use crate::collection_manager::holders::segment_holder::SegmentId;
-use crate::collection_manager::optimizers::segment_optimizer::{
-    OptimizationPlanner, OptimizerThresholds, SegmentOptimizer,
-};
-use crate::config::CollectionParams;
-
-const BYTES_IN_KB: usize = 1024;
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
 
 /// Looks for the segments, which require to be indexed.
 ///
 /// If segment is too large, but still does not have indexes - it is time to create some indexes.
 /// The process of index creation is slow and CPU-bounded, so it is convenient to perform
 /// index building in a same way as segment re-creation.
-pub struct IndexingOptimizer {
-    default_segments_number: usize,
-    thresholds_config: OptimizerThresholds,
-    segments_path: PathBuf,
-    collection_temp_dir: PathBuf,
-    collection_params: CollectionParams,
-    hnsw_config: HnswConfig,
-    hnsw_global_config: HnswGlobalConfig,
-    quantization_config: Option<QuantizationConfig>,
-    telemetry_durations_aggregator: Arc<Mutex<OperationDurationsAggregator>>,
-}
+pub use shard::optimizers::indexing_optimizer::IndexingOptimizer;
 
-impl IndexingOptimizer {
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::path::PathBuf;
+
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use fs_err as fs;
+    use itertools::Itertools;
+    use rand::rng;
+    use segment::data_types::named_vectors::NamedVectors;
+    use segment::data_types::vectors::{
+        DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal,
+    };
+    use segment::entry::ReadSegmentEntry;
+    use segment::entry::entry_point::SegmentEntry;
+    use segment::fixtures::index_fixtures::random_vector;
+    use segment::fixtures::payload_fixtures::random_multi_vector;
+    use segment::json_path::JsonPath;
+    use segment::payload_json;
+    use segment::segment_constructor::build_segment;
+    use segment::segment_constructor::simple_segment_constructor::{VECTOR1_NAME, VECTOR2_NAME};
+    use segment::types::{
+        Distance, HnswConfig, HnswGlobalConfig, Indexes, MultiVectorComparator, MultiVectorConfig,
+        PayloadSchemaType, QuantizationConfig, SegmentConfig, SegmentType, VectorDataConfig,
+        VectorNameBuf, VectorStorageType,
+    };
+    use shard::operations::optimization::OptimizerThresholds;
+    use shard::optimizers::segment_optimizer::SegmentOptimizer;
+    use shard::segment_holder::locked::LockedSegmentHolder;
+    use shard::segment_holder::{FlushMode, SegmentId};
+    use shard::update::{process_field_index_operation, process_point_operation};
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::collection_manager::fixtures::{random_multi_vec_segment, random_segment};
+    use crate::collection_manager::holders::segment_holder::SegmentHolder;
+    use crate::collection_manager::optimizers::config_mismatch_optimizer::ConfigMismatchOptimizer;
+    use crate::config::CollectionParams;
+    use crate::operations::point_ops::{
+        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    };
+    use crate::operations::types::{VectorParams, VectorsConfig};
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+    use crate::operations::{CreateIndex, FieldIndexOperations};
+    use crate::optimizers_builder::build_segment_optimizer_config;
+
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new_indexing_optimizer(
         default_segments_number: usize,
         thresholds_config: OptimizerThresholds,
         segments_path: PathBuf,
@@ -44,217 +66,39 @@ impl IndexingOptimizer {
         hnsw_config: HnswConfig,
         hnsw_global_config: HnswGlobalConfig,
         quantization_config: Option<QuantizationConfig>,
-    ) -> Self {
-        IndexingOptimizer {
+    ) -> IndexingOptimizer {
+        let segment_config =
+            build_segment_optimizer_config(&collection_params, &hnsw_config, &quantization_config);
+        shard::optimizers::indexing_optimizer::IndexingOptimizer::new(
             default_segments_number,
             thresholds_config,
             segments_path,
             collection_temp_dir,
-            collection_params,
+            segment_config,
+            hnsw_global_config,
+        )
+    }
+
+    fn new_config_mismatch_optimizer(
+        thresholds_config: OptimizerThresholds,
+        segments_path: PathBuf,
+        collection_temp_dir: PathBuf,
+        collection_params: CollectionParams,
+        hnsw_config: HnswConfig,
+        hnsw_global_config: HnswGlobalConfig,
+        quantization_config: Option<QuantizationConfig>,
+    ) -> ConfigMismatchOptimizer {
+        let segment_config =
+            build_segment_optimizer_config(&collection_params, &hnsw_config, &quantization_config);
+        shard::optimizers::config_mismatch_optimizer::ConfigMismatchOptimizer::new(
+            thresholds_config,
+            segments_path,
+            collection_temp_dir,
+            segment_config,
             hnsw_config,
             hnsw_global_config,
-            quantization_config,
-            telemetry_durations_aggregator: OperationDurationsAggregator::new(),
-        }
+        )
     }
-
-    fn is_optimization_required(&self, segment: &Segment) -> bool {
-        let segment_config = segment.config();
-        let indexing_threshold_bytes = self
-            .thresholds_config
-            .indexing_threshold_kb
-            .saturating_mul(BYTES_IN_KB);
-        let mmap_threshold_bytes = self
-            .thresholds_config
-            .memmap_threshold_kb
-            .saturating_mul(BYTES_IN_KB);
-
-        for (vector_name, vector_config) in self.collection_params.vectors.params_iter() {
-            if let Some(vector_data) = segment_config.vector_data.get(vector_name) {
-                let is_indexed = vector_data.index.is_indexed();
-                let is_on_disk = vector_data.storage_type.is_on_disk();
-                let storage_size_bytes = segment
-                    .available_vectors_size_in_bytes(vector_name)
-                    .unwrap_or_default();
-
-                let is_big_for_index = storage_size_bytes >= indexing_threshold_bytes;
-                let is_big_for_mmap = storage_size_bytes >= mmap_threshold_bytes;
-
-                let optimize_for_index = is_big_for_index && !is_indexed;
-                let optimize_for_mmap = if let Some(on_disk_config) = vector_config.on_disk {
-                    on_disk_config && !is_on_disk
-                } else {
-                    is_big_for_mmap && !is_on_disk
-                };
-
-                if optimize_for_index || optimize_for_mmap {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(sparse_vectors_params) = self.collection_params.sparse_vectors.as_ref() {
-            for sparse_vector_name in sparse_vectors_params.keys() {
-                if let Some(sparse_vector_data) =
-                    segment_config.sparse_vector_data.get(sparse_vector_name)
-                {
-                    let is_index_immutable = sparse_vector_data.index.index_type.is_immutable();
-
-                    let storage_size = segment
-                        .available_vectors_size_in_bytes(sparse_vector_name)
-                        .unwrap_or_default();
-
-                    let is_big_for_index = storage_size >= indexing_threshold_bytes;
-                    let is_big_for_mmap = storage_size >= mmap_threshold_bytes;
-
-                    let is_big = is_big_for_index || is_big_for_mmap;
-
-                    if is_big && !is_index_immutable {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-}
-
-impl SegmentOptimizer for IndexingOptimizer {
-    fn name(&self) -> &'static str {
-        "indexing"
-    }
-
-    fn segments_path(&self) -> &Path {
-        self.segments_path.as_path()
-    }
-
-    fn temp_path(&self) -> &Path {
-        self.collection_temp_dir.as_path()
-    }
-
-    fn collection_params(&self) -> CollectionParams {
-        self.collection_params.clone()
-    }
-
-    fn hnsw_config(&self) -> &HnswConfig {
-        &self.hnsw_config
-    }
-
-    fn hnsw_global_config(&self) -> &HnswGlobalConfig {
-        &self.hnsw_global_config
-    }
-
-    fn quantization_config(&self) -> Option<QuantizationConfig> {
-        self.quantization_config.clone()
-    }
-
-    fn threshold_config(&self) -> &OptimizerThresholds {
-        &self.thresholds_config
-    }
-
-    fn plan_optimizations(&self, planner: &mut OptimizationPlanner) {
-        let max_segment_size_bytes = self
-            .thresholds_config
-            .max_segment_size_kb
-            .saturating_mul(BYTES_IN_KB);
-
-        let mut unindexed = VecDeque::<(SegmentId, usize)>::new();
-        let mut indexed = VecDeque::<(SegmentId, usize)>::new();
-        for (&segment_id, segment) in planner.remaining().iter() {
-            let segment = segment.read();
-            let vector_size_bytes = segment
-                .max_available_vectors_size_in_bytes()
-                .unwrap_or_default();
-            if self.is_optimization_required(&segment) {
-                unindexed.push_back((segment_id, vector_size_bytes));
-            }
-
-            let segment_config = segment.config();
-            if segment_config.is_any_vector_indexed() || segment_config.is_any_on_disk() {
-                indexed.push_back((segment_id, vector_size_bytes));
-            }
-        }
-        unindexed.make_contiguous().sort_by_key(|(_, size)| *size);
-        indexed.make_contiguous().sort_by_key(|(_, size)| *size);
-
-        // Select the largest unindexed segment
-        while let Some((selected_segment_id, selected_segment_size)) = unindexed.pop_back() {
-            if !planner.remaining().contains_key(&selected_segment_id) {
-                continue;
-            }
-
-            // If the number of segments if equal or bigger than the default_segments_number
-            // We want to make sure that we at least do not increase number of segments after optimization, thus we take more than one segment to optimize
-
-            if planner.expected_segments_number() < self.default_segments_number {
-                planner.plan(vec![selected_segment_id]);
-                continue;
-            }
-
-            // It is better for scheduling if indexing optimizer optimizes 2 segments.
-            // Because result of the optimization is usually 2 segment - it should preserve
-            // overall count of segments.
-
-            // Find the smallest unindexed to check if we can index together
-            if let Some(&(segment_id, size)) = unindexed.front()
-                && planner.remaining().contains_key(&segment_id)
-                && selected_segment_size + size < max_segment_size_bytes
-            {
-                unindexed.pop_front();
-                planner.plan(vec![selected_segment_id, segment_id]);
-                continue;
-            }
-
-            // Find smallest indexed to check if we can reindex together
-            if let Some(&(segment_id, size)) = indexed.front()
-                && planner.remaining().contains_key(&segment_id)
-                && segment_id != selected_segment_id
-                && selected_segment_size + size < max_segment_size_bytes
-            {
-                indexed.pop_front();
-                planner.plan(vec![selected_segment_id, segment_id]);
-                continue;
-            }
-
-            planner.plan(vec![selected_segment_id]);
-        }
-    }
-
-    fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
-        &self.telemetry_durations_aggregator
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use common::counter::hardware_counter::HardwareCounterCell;
-    use fs_err as fs;
-    use itertools::Itertools;
-    use rand::rng;
-    use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
-    use segment::entry::entry_point::NonAppendableSegmentEntry;
-    use segment::fixtures::index_fixtures::random_vector;
-    use segment::json_path::JsonPath;
-    use segment::payload_json;
-    use segment::segment_constructor::simple_segment_constructor::{VECTOR1_NAME, VECTOR2_NAME};
-    use segment::types::{Distance, PayloadSchemaType, SegmentType, VectorNameBuf};
-    use shard::segment_holder::locked::LockedSegmentHolder;
-    use shard::update::{process_field_index_operation, process_point_operation};
-    use tempfile::Builder;
-
-    use super::*;
-    use crate::collection_manager::fixtures::{random_multi_vec_segment, random_segment};
-    use crate::collection_manager::holders::segment_holder::SegmentHolder;
-    use crate::collection_manager::optimizers::config_mismatch_optimizer::ConfigMismatchOptimizer;
-    use crate::operations::point_ops::{
-        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
-    };
-    use crate::operations::types::{VectorParams, VectorsConfig};
-    use crate::operations::vector_params_builder::VectorParamsBuilder;
-    use crate::operations::{CreateIndex, FieldIndexOperations};
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -300,12 +144,13 @@ mod tests {
             })
             .collect();
 
-        let mut index_optimizer = IndexingOptimizer::new(
+        let mut index_optimizer = new_indexing_optimizer(
             2,
             OptimizerThresholds {
                 max_segment_size_kb: 300,
                 memmap_threshold_kb: 1000,
                 indexing_threshold_kb: 1000,
+                deferred_internal_id: None,
             },
             segments_dir.path().to_owned(),
             segments_temp_dir.path().to_owned(),
@@ -322,8 +167,12 @@ mod tests {
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         assert!(suggested_to_optimize.is_empty());
 
-        index_optimizer.thresholds_config.memmap_threshold_kb = 1000;
-        index_optimizer.thresholds_config.indexing_threshold_kb = 50;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .memmap_threshold_kb = 1000;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 50;
 
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
@@ -334,7 +183,7 @@ mod tests {
         let infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let configs = locked_holder
             .read()
@@ -355,6 +204,193 @@ mod tests {
             assert_eq!(config.vector_data.get(VECTOR1_NAME).unwrap().size, dim1);
             assert_eq!(config.vector_data.get(VECTOR2_NAME).unwrap().size, dim2);
         }
+    }
+
+    /// A multivector's deferred-point threshold is computed assuming a fixed inner-vector
+    /// count (`MULTIVECTOR_SIZE = 16`, see `CollectionParams::get_deferred_point_id`). This
+    /// makes points become "deferred" at a far smaller storage size than the actual data
+    /// occupies, so a segment can hold deferred points while staying well below the indexing
+    /// threshold.
+    ///
+    /// Before the fix, the indexing optimizer rebuilt such a segment as a plain (non-HNSW)
+    /// segment because it was below the indexing threshold. Plain segments don't promote
+    /// deferred points, so `has_deferred_points()` stayed `true` and the optimizer kept
+    /// re-selecting the segment forever (infinite loop).
+    ///
+    /// This test proves the fix: a below-threshold segment with deferred points is optimized
+    /// into an HNSW-indexed segment (which promotes the deferred points) and is no longer
+    /// selected for optimization afterwards.
+    #[test]
+    fn test_deferred_points_multivector_optimization() {
+        init();
+
+        // Multivector named vector. With float32 elements the per-point size used to derive
+        // the deferred-point threshold is `ELEMENT_BYTES * DIM * MULTIVECTOR_SIZE`.
+        const VECTOR_NAME: &str = "vector";
+        const DIM: usize = 16;
+        const MULTIVECTOR_SIZE: usize = 16; // mirrors CollectionParams::get_deferred_point_id
+        const ELEMENT_BYTES: usize = 4; // float32
+
+        // Deferred-point byte threshold, sized so points start deferring at internal offset 100.
+        let deferred_threshold_bytes =
+            NonZeroUsize::new(ELEMENT_BYTES * DIM * MULTIVECTOR_SIZE * 100).unwrap(); // 102_400
+
+        let collection_params = CollectionParams {
+            vectors: VectorsConfig::Multi(BTreeMap::from([(
+                VECTOR_NAME.to_owned(),
+                VectorParams {
+                    memory: None,
+                    size: NonZeroU64::new(DIM as u64).unwrap(),
+                    distance: Distance::Dot,
+                    hnsw_config: None,
+                    quantization_config: None,
+                    on_disk: None,
+                    datatype: None,
+                    multivector_config: Some(MultiVectorConfig::default()),
+                },
+            )])),
+            ..CollectionParams::empty()
+        };
+
+        let hnsw_config = HnswConfig::default();
+
+        // Deferred-point offset, derived exactly as production does it. Because the multivector
+        // assumes 16 inner vectors per point, the threshold of 102_400 bytes maps to only 100
+        // points (102_400 / (4 * 16 * 16)), even though each point actually stores far less.
+        let deferred_internal_id =
+            collection_params.get_deferred_point_id(&hnsw_config, Some(deferred_threshold_bytes));
+        assert_eq!(
+            deferred_internal_id,
+            Some(100),
+            "points should start deferring at internal offset 100",
+        );
+
+        // Build a multivector segment holding deferred points: insert more points than the
+        // deferred offset, each with a single inner vector so the actual storage size stays
+        // tiny (DIM * ELEMENT_BYTES bytes/point) - far below the indexing threshold.
+        let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+        let segments_temp_dir = Builder::new()
+            .prefix("segments_temp_dir")
+            .tempdir()
+            .unwrap();
+
+        const NUM_POINTS: u64 = 120;
+        let segment_config = SegmentConfig {
+            vector_data: HashMap::from([(
+                VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: DIM,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::default(),
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: Some(MultiVectorConfig::default()),
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type: Default::default(),
+        };
+
+        let (mut segment, _) = build_segment(
+            segments_dir.path(),
+            &segment_config,
+            deferred_internal_id,
+            true,
+        )
+        .unwrap();
+
+        let mut rnd = rng();
+        let hw_counter = HardwareCounterCell::new();
+        for n in 0..NUM_POINTS {
+            let multi_vec = random_multi_vector(&mut rnd, DIM, 1);
+            let mut named = NamedVectors::default();
+            named.insert(
+                VECTOR_NAME.to_owned(),
+                VectorInternal::MultiDense(multi_vec),
+            );
+            segment
+                .upsert_point(n, n.into(), named, &hw_counter)
+                .unwrap();
+        }
+
+        // The segment holds deferred points, yet its vectors stay below the indexing threshold.
+        assert!(
+            segment.has_deferred_points(),
+            "segment should hold deferred points",
+        );
+        let vectors_size_bytes = segment
+            .available_vectors_size_in_bytes(VECTOR_NAME)
+            .unwrap();
+
+        let mut holder = SegmentHolder::default();
+        let segment_id = holder.add_new(segment);
+        let locked_holder = LockedSegmentHolder::new(holder);
+
+        // Indexing threshold set BELOW the deferred byte threshold but ABOVE the actual segment
+        // size, so the segment does NOT exceed the indexing threshold by size.
+        let indexing_threshold_kb = 50; // 51_200 bytes
+        assert!(
+            vectors_size_bytes < indexing_threshold_kb * 1024,
+            "segment ({vectors_size_bytes} bytes) must stay below the indexing threshold",
+        );
+        assert!(
+            indexing_threshold_kb * 1024 < deferred_threshold_bytes.get(),
+            "indexing threshold must be under the deferred-point threshold",
+        );
+
+        let index_optimizer = new_indexing_optimizer(
+            1,
+            OptimizerThresholds {
+                max_segment_size_kb: 1000,
+                memmap_threshold_kb: 1000,
+                indexing_threshold_kb,
+                deferred_internal_id,
+            },
+            segments_dir.path().to_owned(),
+            segments_temp_dir.path().to_owned(),
+            collection_params,
+            hnsw_config,
+            HnswGlobalConfig::default(),
+            None,
+        );
+
+        // The segment is selected for optimization solely because it has deferred points.
+        let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
+        assert!(suggested_to_optimize.contains(&segment_id));
+
+        index_optimizer.optimize_for_test(locked_holder.clone(), suggested_to_optimize);
+
+        // The fix: the optimized segment is HNSW-indexed even though it was below the indexing
+        // threshold, which promotes the deferred points.
+        let infos = locked_holder
+            .read()
+            .iter()
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
+            .collect_vec();
+        assert!(
+            infos
+                .iter()
+                .any(|info| info.segment_type == SegmentType::Indexed),
+            "optimized segment must be HNSW-indexed to promote deferred points",
+        );
+
+        // No segment holds deferred points anymore, so the optimizer no longer loops on it.
+        let still_has_deferred = locked_holder
+            .read()
+            .iter()
+            .any(|(_sid, segment)| segment.get().read().has_deferred_points());
+        assert!(
+            !still_has_deferred,
+            "deferred points must be promoted after optimization",
+        );
+
+        let suggested_after = index_optimizer.plan_optimizations_for_test(&locked_holder);
+        assert!(
+            suggested_after.is_empty(),
+            "no further optimization should be required (no infinite loop)",
+        );
     }
 
     #[test]
@@ -388,12 +424,13 @@ mod tests {
         let middle_segment_id = holder.add_new(middle_segment);
         let large_segment_id = holder.add_new(large_segment);
 
-        let mut index_optimizer = IndexingOptimizer::new(
+        let mut index_optimizer = new_indexing_optimizer(
             2,
             OptimizerThresholds {
                 max_segment_size_kb: 300,
                 memmap_threshold_kb: 1000,
                 indexing_threshold_kb: 1000,
+                deferred_internal_id: None,
             },
             segments_dir.path().to_owned(),
             segments_temp_dir.path().to_owned(),
@@ -418,8 +455,12 @@ mod tests {
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         assert!(suggested_to_optimize.is_empty());
 
-        index_optimizer.thresholds_config.memmap_threshold_kb = 1000;
-        index_optimizer.thresholds_config.indexing_threshold_kb = 50;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .memmap_threshold_kb = 1000;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 50;
 
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(
@@ -430,14 +471,22 @@ mod tests {
             ]),
         );
 
-        index_optimizer.thresholds_config.memmap_threshold_kb = 1000;
-        index_optimizer.thresholds_config.indexing_threshold_kb = 1000;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .memmap_threshold_kb = 1000;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 1000;
 
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         assert!(suggested_to_optimize.is_empty());
 
-        index_optimizer.thresholds_config.memmap_threshold_kb = 50;
-        index_optimizer.thresholds_config.indexing_threshold_kb = 1000;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .memmap_threshold_kb = 50;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 1000;
 
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(
@@ -448,8 +497,12 @@ mod tests {
             ]),
         );
 
-        index_optimizer.thresholds_config.memmap_threshold_kb = 150;
-        index_optimizer.thresholds_config.indexing_threshold_kb = 50;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .memmap_threshold_kb = 150;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 50;
 
         // ----- CREATE AN INDEXED FIELD ------
         let hw_counter = HardwareCounterCell::new();
@@ -494,7 +547,7 @@ mod tests {
         let infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let configs = locked_holder
             .read()
@@ -519,6 +572,14 @@ mod tests {
             on_disk_count, 1,
             "Testing that only largest segment is not Mmap"
         );
+
+        // Optimizations defer destroying their source segments to a post-flush action; the files
+        // are removed once a flush confirms the optimized data is durable (see
+        // `SegmentHolder::register_post_flush_action`). Flush to run the action before counting dirs.
+        locked_holder
+            .read()
+            .flush_all(FlushMode::Sync, true)
+            .expect("failed to flush segment holder");
 
         let segment_dirs = fs::read_dir(segments_dir.path()).unwrap().collect_vec();
         assert_eq!(
@@ -570,6 +631,7 @@ mod tests {
             &locked_holder.read(),
             opnum.next().unwrap(),
             insert_point_ops,
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -577,7 +639,7 @@ mod tests {
         let new_infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let new_smallest_size = new_infos
             .iter()
@@ -594,7 +656,9 @@ mod tests {
         // ---- New appendable segment should be created if none left
 
         // Index even the smallest segment
-        index_optimizer.thresholds_config.indexing_threshold_kb = 20;
+        index_optimizer
+            .threshold_config_mut_for_test()
+            .indexing_threshold_kb = 20;
         let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
         let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
         assert!(suggested_to_optimize.contains(&small_segment_id));
@@ -603,7 +667,7 @@ mod tests {
         let new_infos2 = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
 
         let mut has_empty = false;
@@ -633,6 +697,7 @@ mod tests {
             &locked_holder.read(),
             opnum.next().unwrap(),
             insert_point_ops,
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -671,12 +736,13 @@ mod tests {
 
         let locked_holder = LockedSegmentHolder::new(holder);
 
-        let index_optimizer = IndexingOptimizer::new(
+        let index_optimizer = new_indexing_optimizer(
             number_of_segments, // Keep the same number of segments
             OptimizerThresholds {
                 max_segment_size_kb: 1000,
                 memmap_threshold_kb: 1000,
                 indexing_threshold_kb: 10, // Always optimize
+                deferred_internal_id: None,
             },
             segments_dir.path().to_owned(),
             segments_temp_dir.path().to_owned(),
@@ -743,6 +809,7 @@ mod tests {
             max_segment_size_kb: usize::MAX,
             memmap_threshold_kb: 10,
             indexing_threshold_kb: usize::MAX,
+            deferred_internal_id: None,
         };
         let mut collection_params = CollectionParams {
             vectors: VectorsConfig::Single(
@@ -764,6 +831,7 @@ mod tests {
         let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config = HnswConfig {
+            memory: None,
             m: 16,
             ef_construct: 100,
             full_scan_threshold: 10,
@@ -775,7 +843,7 @@ mod tests {
 
         {
             // Optimizers used in test
-            let index_optimizer = IndexingOptimizer::new(
+            let index_optimizer = new_indexing_optimizer(
                 2,
                 thresholds_config,
                 dir.path().to_owned(),
@@ -785,7 +853,7 @@ mod tests {
                 HnswGlobalConfig::default(),
                 Default::default(),
             );
-            let config_mismatch_optimizer = ConfigMismatchOptimizer::new(
+            let config_mismatch_optimizer = new_config_mismatch_optimizer(
                 thresholds_config,
                 dir.path().to_owned(),
                 temp_dir.path().to_owned(),
@@ -837,7 +905,7 @@ mod tests {
             .take();
 
         // Optimizers used in test
-        let index_optimizer = IndexingOptimizer::new(
+        let index_optimizer = new_indexing_optimizer(
             2,
             thresholds_config,
             dir.path().to_owned(),
@@ -847,7 +915,7 @@ mod tests {
             HnswGlobalConfig::default(),
             Default::default(),
         );
-        let config_mismatch_optimizer = ConfigMismatchOptimizer::new(
+        let config_mismatch_optimizer = new_config_mismatch_optimizer(
             thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
@@ -888,5 +956,172 @@ mod tests {
                     "segment must be on disk with mmap",
                 );
             });
+    }
+
+    /// Multi vectors with deferred points below the indexing threshold must not cause an
+    /// infinite optimization loop.
+    ///
+    /// Deferred points are tracked with a static internal-id offset (`deferred_internal_id`).
+    /// For multi vectors this offset is computed assuming a fixed number of sub vectors per
+    /// point (see [`CollectionParams::get_deferred_point_id`] and its `MULTIVECTOR_SIZE`
+    /// constant). When a user uploads small multi vectors (e.g. a single sub vector per
+    /// point), the real storage size stays well below the indexing threshold, yet the segment
+    /// still ends up with deferred points because the offset was sized for much larger points.
+    ///
+    /// The indexing optimizer always triggers for segments that have deferred points, so it
+    /// can promote them quickly by building an HNSW index. Before commit "Always optimize
+    /// deferred points", the optimizer skipped building the HNSW index while the segment was
+    /// still below the indexing threshold. Because building the index is what promotes
+    /// deferred points, they stayed deferred, the optimizer kept being triggered, and the
+    /// same segment was re-optimized forever -- an infinite loop.
+    ///
+    /// This test reproduces that scenario. Before the fix it loops forever (and hits the
+    /// iteration limit, failing the test); after the fix the optimizer builds an HNSW index,
+    /// promotes the deferred points, and terminates.
+    #[test]
+    fn test_deferred_multivector_below_indexing_threshold_no_infinite_loop() {
+        init();
+
+        let dim = 4;
+        let indexing_threshold_kb = 10;
+        let indexing_threshold_bytes = indexing_threshold_kb * 1024;
+
+        let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+        let segments_temp_dir = Builder::new()
+            .prefix("segments_temp_dir")
+            .tempdir()
+            .unwrap();
+
+        // A single multi vector (one vector configured as a multivector).
+        let mut multi_params = VectorParamsBuilder::new(dim as u64, Distance::Dot).build();
+        multi_params.multivector_config = Some(MultiVectorConfig {
+            comparator: MultiVectorComparator::MaxSim,
+        });
+        let collection_params = CollectionParams {
+            vectors: VectorsConfig::Single(multi_params),
+            ..CollectionParams::empty()
+        };
+
+        let hnsw_config = HnswConfig::default();
+
+        // The deferred offset, computed exactly like production does. For multi vectors this
+        // assumes a fixed (large) number of sub vectors per point, so the offset is small
+        // relative to the number of points even when each point holds a single sub vector.
+        let deferred_internal_id = collection_params
+            .get_deferred_point_id(&hnsw_config, NonZeroUsize::new(indexing_threshold_bytes))
+            .expect("a multi vector with HNSW indexing should produce a deferred offset");
+
+        // Upload more points than the deferred offset (so we get deferred points), while each
+        // point stores only a single sub vector so the real storage size stays well below the
+        // indexing threshold.
+        let num_points = u64::from(deferred_internal_id) * 2;
+        assert!(
+            num_points > u64::from(deferred_internal_id),
+            "test must upload more points than the deferred offset to create deferred points",
+        );
+
+        // Build a plain, appendable segment for this collection with the deferred offset set,
+        // mimicking a live appendable segment that has accumulated deferred points.
+        let segment_optimizer_config =
+            build_segment_optimizer_config(&collection_params, &hnsw_config, &None);
+        let segment_config = segment_optimizer_config.plain_segment_config();
+
+        let hw_counter = HardwareCounterCell::new();
+        let (mut segment, _) = build_segment(
+            segments_dir.path(),
+            &segment_config,
+            Some(deferred_internal_id),
+            true,
+        )
+        .unwrap();
+
+        for i in 0..num_points {
+            let mut vectors = NamedVectors::default();
+            vectors.insert(
+                DEFAULT_VECTOR_NAME.into(),
+                VectorInternal::MultiDense(
+                    MultiDenseVectorInternal::try_from_matrix(vec![vec![0.5; dim]]).unwrap(),
+                ),
+            );
+            segment
+                .upsert_point(100, (i + 1).into(), vectors, &hw_counter)
+                .unwrap();
+        }
+
+        // Sanity: the segment has deferred points but stays below the indexing threshold.
+        assert!(
+            segment.has_deferred_points(),
+            "segment should have deferred points",
+        );
+        let stored_bytes = segment
+            .available_vectors_size_in_bytes(DEFAULT_VECTOR_NAME)
+            .unwrap();
+        assert!(
+            stored_bytes < indexing_threshold_bytes,
+            "segment must stay below the indexing threshold \
+             ({stored_bytes} >= {indexing_threshold_bytes})",
+        );
+
+        let mut holder = SegmentHolder::default();
+        holder.add_new(segment);
+        let locked_holder = LockedSegmentHolder::new(holder);
+
+        let index_optimizer = new_indexing_optimizer(
+            2,
+            OptimizerThresholds {
+                max_segment_size_kb: 1000,
+                memmap_threshold_kb: 1_000_000, // never put on disk
+                indexing_threshold_kb,          // real size stays below this
+                deferred_internal_id: Some(deferred_internal_id),
+            },
+            segments_dir.path().to_owned(),
+            segments_temp_dir.path().to_owned(),
+            collection_params.clone(),
+            hnsw_config,
+            HnswGlobalConfig::default(),
+            Default::default(),
+        );
+
+        // Drive the optimizer until there is nothing left to do. Before the fix the optimizer
+        // re-optimizes the same segment forever because the deferred points are never
+        // promoted; the iteration limit turns that infinite loop into a test failure.
+        const MAX_ITERATIONS: usize = 16;
+        let mut iterations = 0;
+        loop {
+            let suggested_to_optimize = index_optimizer.plan_optimizations_for_test(&locked_holder);
+            if suggested_to_optimize.is_empty() {
+                break;
+            }
+            assert!(
+                iterations < MAX_ITERATIONS,
+                "indexing optimizer is stuck in an infinite loop: deferred points below the \
+                 indexing threshold are never promoted",
+            );
+            let batch = suggested_to_optimize.into_iter().next().unwrap();
+            index_optimizer.optimize_for_test(locked_holder.clone(), batch);
+            iterations += 1;
+        }
+
+        // The deferred points must have been promoted: no segment has deferred points left,
+        // and an HNSW index was built to make them searchable.
+        let holder = locked_holder.read();
+        let any_deferred = holder
+            .iter()
+            .any(|(_, segment)| segment.get().read().has_deferred_points());
+        assert!(!any_deferred, "deferred points should have been promoted");
+
+        let any_hnsw = holder.iter().any(|(_, segment)| {
+            segment
+                .get()
+                .read()
+                .config()
+                .vector_data
+                .values()
+                .any(|vector| matches!(vector.index, Indexes::Hnsw(_)))
+        });
+        assert!(
+            any_hnsw,
+            "an HNSW index should have been created to promote the deferred points",
+        );
     }
 }

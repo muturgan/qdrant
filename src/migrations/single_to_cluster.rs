@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use collection::collection_state::State;
@@ -12,7 +16,7 @@ use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::shard_distribution::ShardDistributionProposal;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements, Auth, AuthType};
+use storage::rbac::{Access, AccessRequirements, Auth};
 
 /// Processes the existing collections, which were created outside the consensus:
 /// - during the migration from single to cluster
@@ -25,7 +29,7 @@ pub async fn handle_existing_collections(
     collections: Vec<String>,
 ) {
     let full_access = Access::full("Migration from single to cluster");
-    let full_auth = Auth::new(full_access.clone(), None, None, AuthType::Internal);
+    let full_auth = Auth::new_internal(full_access.clone());
     let multipass = full_auth
         .check_global_access(AccessRequirements::new().manage(), "migration")
         .expect("Full access should have manage rights");
@@ -71,7 +75,8 @@ pub async fn handle_existing_collections(
                 sharding_method,
                 replication_factor: Some(params.replication_factor.get()),
                 write_consistency_factor: Some(params.write_consistency_factor.get()),
-                on_disk_payload: Some(params.on_disk_payload),
+                on_disk_payload: params.on_disk_payload,
+                payload: params.payload,
                 hnsw_config: Some(hnsw_config.into()),
                 wal_config: Some(wal_config.into()),
                 optimizers_config: Some(optimizer_config.into()),
@@ -116,7 +121,9 @@ pub async fn handle_existing_collections(
 
                     for shard_id in shard_ids {
                         let shard_info = shards.get(shard_id).unwrap();
-                        placement.push(shard_info.replicas.keys().copied().collect());
+                        let mut replicas: Vec<_> = shard_info.replicas.keys().copied().collect();
+                        replicas.sort_unstable();
+                        placement.push(replicas);
                     }
 
                     consensus_operations.push(CollectionMetaOperations::CreateShardKey(

@@ -14,8 +14,10 @@ skip = [
 
 ignore-words-list = [
     "ABD",                 # Geohash example
+    "INDX",                # bitvec crate const
     "generall",            # The boss
     "hel",                 # Query token
+    "inout",               # Rust inline-asm operand keyword
     "mmapped",             # Memory mapped
     "ser",                 # Serde package
 ]

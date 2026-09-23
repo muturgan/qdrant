@@ -3,6 +3,7 @@ use collection::shards::shard::PeerId;
 use self::collection_meta_ops::CollectionMetaOperations;
 use self::consensus_manager::CollectionsSnapshot;
 use self::errors::StorageError;
+use crate::quota::QuotaConfig;
 
 pub mod alias_mapping;
 pub mod collection_meta_ops;
@@ -10,6 +11,7 @@ pub mod collection_verification;
 mod collections_ops;
 pub mod consensus;
 pub mod consensus_manager;
+pub mod consensus_state_machine;
 pub mod conversions;
 pub mod errors;
 pub mod shard_distribution;
@@ -31,9 +33,10 @@ pub mod consensus_ops {
 
     use super::collection_meta_ops::ReshardingOperation;
     use crate::content_manager::collection_meta_ops::{
-        CollectionMetaOperations, SetShardReplicaState, ShardTransferOperations, UpdateCollection,
+        CollectionMetaOperations, SetShardReplicaState, ShardTransferOperations,
         UpdateCollectionOperation,
     };
+    use crate::quota::QuotaConfig;
 
     /// Operation that should pass consensus
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
@@ -52,6 +55,8 @@ pub mod consensus_ops {
             key: String,
             value: serde_json::Value,
         },
+        /// Replace the cluster-wide resource quota config on every peer.
+        SetQuotaConfig(QuotaConfig),
         RequestSnapshot,
         ReportSnapshot {
             peer_id: PeerId,
@@ -127,19 +132,7 @@ pub mod consensus_ops {
             shard_id: u32,
             peer_id: PeerId,
         ) -> Self {
-            let mut operation = UpdateCollectionOperation::new(
-                collection_name,
-                UpdateCollection {
-                    vectors: None,
-                    optimizers_config: None,
-                    params: None,
-                    hnsw_config: None,
-                    quantization_config: None,
-                    sparse_vectors: None,
-                    strict_mode_config: None,
-                    metadata: None,
-                },
-            );
+            let mut operation = UpdateCollectionOperation::new_empty(collection_name);
             operation
                 .set_shard_replica_changes(vec![replica_set::Change::Remove(shard_id, peer_id)]);
 
@@ -222,6 +215,10 @@ pub trait CollectionContainer {
     fn remove_peer(&self, peer_id: PeerId) -> Result<(), StorageError>;
 
     fn sync_local_state(&self) -> Result<(), StorageError>;
+
+    fn quota_config(&self) -> QuotaConfig;
+
+    fn set_quota_config(&self, config: QuotaConfig) -> Result<(), StorageError>;
 }
 
 #[cfg(test)]

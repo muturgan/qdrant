@@ -14,7 +14,7 @@ use segment::data_types::order_by::OrderBy;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal};
 use segment::types::{Filter, PointIdType, SearchParams};
 use segment::vector_storage::query::{
-    ContextPair, ContextQuery, DiscoveryQuery, FeedbackItem, RecoQuery,
+    ContextPair, ContextQuery, DiscoverQuery, FeedbackItem, RecoQuery,
 };
 use tonic::Status;
 
@@ -99,7 +99,7 @@ pub async fn convert_query_point_groups_from_grpc(
         limit: limit
             .map(|l| l as usize)
             .unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
-        params: params.map(From::from),
+        params: params.map(TryFrom::try_from).transpose()?,
         with_lookup: with_lookup.map(TryFrom::try_from).transpose()?,
     };
 
@@ -168,7 +168,7 @@ pub async fn convert_query_points_from_grpc(
             offset: offset
                 .map(|o| o as usize)
                 .unwrap_or(CollectionQueryRequest::DEFAULT_OFFSET),
-            params: params.map(From::from),
+            params: params.map(TryFrom::try_from).transpose()?,
             with_vector: with_vectors
                 .map(From::from)
                 .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_VECTOR),
@@ -215,7 +215,7 @@ fn convert_prefetch_with_inferred(
         limit: limit
             .map(|l| l as usize)
             .unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
-        params: params.map(SearchParams::from),
+        params: params.map(SearchParams::try_from).transpose()?,
         lookup_from: lookup_from.map(LookupLocation::try_from).transpose()?,
     })
 }
@@ -285,7 +285,7 @@ fn convert_query_with_inferred(
                 .map(|pair| context_pair_from_grpc_with_inferred(pair, inferred))
                 .collect::<Result<_, _>>()?;
 
-            Query::Vector(VectorQuery::Discover(DiscoveryQuery::new(target, context)))
+            Query::Vector(VectorQuery::Discover(DiscoverQuery::new(target, context)))
         }
         Variant::Context(context) => {
             let context_query = context_query_from_grpc_with_inferred(context, inferred)?;
@@ -452,6 +452,8 @@ fn context_pair_from_grpc_with_inferred(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
     use std::collections::HashMap;
 
     use api::grpc::qdrant::Value;

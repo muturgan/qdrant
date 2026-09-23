@@ -79,6 +79,12 @@ impl SplitByShard for PointOperations {
                 #[cfg(not(debug_assertions))]
                 OperationToShard::by_shard(vec![])
             }
+            PointOperations::UpsertPointsRaw(_) | PointOperations::SyncPointsRaw(_) => {
+                #[cfg(debug_assertions)]
+                panic!("Raw point operations are intended to be applied to specific shard only");
+                #[cfg(not(debug_assertions))]
+                OperationToShard::by_shard(vec![])
+            }
         }
     }
 }
@@ -158,7 +164,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::Single(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::MultiDense(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
                         }
@@ -180,7 +190,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::MultiDense(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::Single(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
                         }
@@ -213,7 +227,11 @@ impl SplitByShard for BatchPersisted {
                                             .or_default()
                                             .push(VectorPersisted::from(vector))
                                     }
-                                    _ => unreachable!(), // TODO(sparse) propagate error
+                                    BatchVectorStructPersisted::Single(_)
+                                    | BatchVectorStructPersisted::MultiDense(_) => {
+                                        // TODO(sparse) propagate error
+                                        unreachable!();
+                                    }
                                 }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
@@ -239,7 +257,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::Single(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::MultiDense(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                         }
                     }
@@ -260,7 +282,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::MultiDense(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::Single(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!()
+                                }
                             }
                         }
                     }
@@ -292,7 +318,11 @@ impl SplitByShard for BatchPersisted {
                                             .or_default()
                                             .push(VectorPersisted::from(vector))
                                     }
-                                    _ => unreachable!(), // TODO(sparse) propagate error
+                                    BatchVectorStructPersisted::Single(_)
+                                    | BatchVectorStructPersisted::MultiDense(_) => {
+                                        // TODO(sparse) propagate error
+                                        unreachable!();
+                                    }
                                 }
                             }
                         }

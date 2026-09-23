@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common::generic_consts::Random;
 use common::types::PointOffsetType;
 use quantization::EncodedVectors;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -14,7 +15,8 @@ use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 use crate::vector_storage::quantized::quantized_multivector_storage::{
     MultivectorOffsetsStorage, QuantizedMultivectorStorage,
 };
-use crate::vector_storage::{MultiVectorStorage, Random};
+use crate::vector_storage::turbo::multi_turbo::AppendableMmapMultiTurboVectorStorage;
+use crate::vector_storage::{MultiVectorStorage, VectorStorageRead};
 
 // Multivector shader binding is after vectot data and quantization data bindings.
 const START_MULTIVECTORS_BINDING: usize = STORAGES_COUNT + MAX_QUANTIZATION_BINDINGS;
@@ -85,23 +87,51 @@ impl GpuMultivectors {
     ) -> OperationResult<GpuMultivectors> {
         Self::new_impl(
             device,
-            (0..vector_storage.total_vector_count())
-                // map ID to count of vectors in multivector
-                .map(|id| {
-                    vector_storage
-                        .get_multi::<Random>(id as PointOffsetType)
-                        .vectors_count()
-                })
-                // Map count of vectors to start and count of vectors in multivector.
-                .scan(0, |acc, count| {
-                    let start = *acc;
-                    *acc += count;
-                    Some(GpuMultivectorOffset {
-                        start: start as u32,
-                        count: count as u32,
-                    })
-                }),
+            Self::counts_to_offsets(
+                (0..vector_storage.total_vector_count())
+                    // map ID to count of vectors in multivector
+                    .map(|id| {
+                        vector_storage
+                            .get_multi::<Random>(id as PointOffsetType)
+                            .as_ref()
+                            .vectors_count()
+                    }),
+            ),
         )
+    }
+
+    /// Construct multivectors data from a TurboQuant multivector storage.
+    ///
+    /// Unlike [`Self::new_multidense`], `AppendableMmapMultiTurboVectorStorage` does not
+    /// implement [`MultiVectorStorage`], so the per-point inner counts are read
+    /// directly via `point_inner_vectors_count` and turned into start/count
+    /// offsets here.
+    pub fn new_turbo_multi(
+        device: Arc<gpu::Device>,
+        vector_storage: &AppendableMmapMultiTurboVectorStorage,
+    ) -> OperationResult<GpuMultivectors> {
+        Self::new_impl(
+            device,
+            Self::counts_to_offsets(
+                (0..vector_storage.total_vector_count())
+                    .map(|id| vector_storage.point_inner_vectors_count(id as PointOffsetType)),
+            ),
+        )
+    }
+
+    /// Map per-point inner vector counts to start/count offsets into the
+    /// flattened dense vectors buffer.
+    fn counts_to_offsets(
+        counts: impl Iterator<Item = usize> + Clone,
+    ) -> impl Iterator<Item = GpuMultivectorOffset> + Clone {
+        counts.scan(0, |acc, count| {
+            let start = *acc;
+            *acc += count;
+            Some(GpuMultivectorOffset {
+                start: start as u32,
+                count: count as u32,
+            })
+        })
     }
 
     /// Adds multivector data to the descriptor set builder.

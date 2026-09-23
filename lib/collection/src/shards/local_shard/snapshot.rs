@@ -5,18 +5,19 @@ use std::sync::Arc;
 
 use common::save_on_disk::SaveOnDisk;
 use common::tar_ext;
+use common::types::PointOffsetType;
 use fs_err as fs;
 use parking_lot::RwLock;
 use segment::common::operation_error::{OperationError, OperationResult};
 use segment::data_types::manifest::SegmentManifest;
-use segment::entry::NonAppendableSegmentEntry;
+use segment::entry::StorageSegmentEntry;
 use segment::types::{SegmentConfig, SnapshotFormat};
-use shard::files::{APPLIED_SEQ_FILE, SEGMENTS_PATH, WAL_PATH};
+use shard::files::{APPLIED_SEQ_FILE, SEGMENT_MANIFEST_FILE, SEGMENTS_PATH, WAL_PATH};
 use shard::locked_segment::LockedSegment;
 use shard::operations::OperationWithClockTag;
 use shard::payload_index_schema::PayloadIndexSchema;
-use shard::segment_holder::SegmentHolder;
 use shard::segment_holder::locked::LockedSegmentHolder;
+use shard::segment_holder::{FlushMode, SegmentHolder};
 use shard::snapshots::snapshot_manifest::SnapshotManifest;
 use shard::snapshots::snapshot_utils::SnapshotUtils;
 use shard::wal::SerdeWal;
@@ -30,7 +31,7 @@ use crate::shards::local_shard::{LocalShard, LocalShardClocks};
 impl LocalShard {
     pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
         let task = {
-            let _runtime = self.search_runtime.enter();
+            let _runtime = self.search_runtime.tokio_handle().enter();
 
             let segments = self.segments.clone();
             cancel::blocking::spawn_cancel_on_drop(move |_| segments.read().snapshot_manifest())
@@ -61,47 +62,133 @@ impl LocalShard {
         let shard_path = self.path.clone();
 
         let segments_path = Self::segments_path(&self.path);
-        let segment_config = self
-            .collection_config
-            .read()
-            .await
-            .to_base_segment_config()?;
+        let (segment_config, deferred_internal_id) = {
+            let collection_config = self.collection_config.read().await;
+            (
+                collection_config.to_base_segment_config(),
+                collection_config.params.get_deferred_point_id(
+                    &collection_config.hnsw_config,
+                    collection_config
+                        .optimizer_config
+                        .get_deferred_points_threshold_bytes(),
+                ),
+            )
+        };
 
         let applied_seq_path = self.applied_seq_handler.path().to_path_buf();
 
         let tar = tar.clone();
         let temp_path = temp_path.to_path_buf();
 
-        let plunger_notify = if !save_wal {
-            // If we are not saving WAL, we still need to make sure that all submitted by this point
-            // updates have made it to the segments. So we use the Plunger to achieve that.
-            // It will notify us when all submitted updates so far have been processed.
-            Some(self.plunge_async().await?)
+        // For snapshots that exclude the WAL (e.g. shard transfer), capture the clock maps before
+        // plunging and archive these captured maps instead of the persisted clock files (see the
+        // blocking task below).
+        //
+        // The persisted clocks track the WAL *write* position and therefore run ahead of the applied
+        // segment state. With no WAL in the snapshot, a recovered shard cannot replay operations to
+        // catch up, so archiving the persisted (too new) clocks would leave it with a recovery point
+        // ahead of its data, causing later WAL-delta recovery to skip operations.
+        //
+        // The plunger waits until all updates submitted before it have been applied to the segments.
+        // By capturing the clocks *before* the plunger, the segments snapshotted below are guaranteed
+        // to include every operation reflected in the captured clocks, so the archived clocks are
+        // never ahead of the snapshot data.
+        let (plunger_notify, pinned_clocks) = if !save_wal {
+            // Capture oldest before newest, so that a concurrent cutoff update (which advances newest
+            // before oldest) can never make the captured oldest exceed the captured newest.
+            let oldest_clocks = self.wal.oldest_clocks.lock().await.clone();
+            let newest_clocks = self.wal.newest_clocks.lock().await.clone();
+
+            // We still need to make sure that all updates submitted by this point have made it to the
+            // segments. So we use the Plunger to achieve that. It will notify us when all submitted
+            // updates so far have been processed.
+            let plunger_notify = self.plunge_async().await?;
+
+            (Some(plunger_notify), Some((newest_clocks, oldest_clocks)))
         } else {
-            None
+            (None, None)
         };
 
         let future = async move {
             if let Some(plunger_notify) = plunger_notify {
+                // Plunging is enough as `snapshot_all_segments` will flush all to disk
                 plunger_notify.await?;
             }
 
             let handle = tokio::task::spawn_blocking(move || {
                 // Do not change segments while snapshotting
+
+                // If the shard maintains a segment manifest (`segments_manifest.json`), include it
+                // in the snapshot so out-of-process readers can discover segments without scanning
+                // the filesystem. It lives next to (not inside) the `segments/` directory, so older
+                // versions of Qdrant that don't know about it are unaffected. Captured before
+                // proxying: proxies preserve the wrapped segments' UUIDs, which are exactly the
+                // segment directories written into the snapshot, so the manifest matches the
+                // snapshot contents.
+                if let Some(segment_manifest) = segments.read().segment_manifest_for_snapshot() {
+                    let segment_manifest_json =
+                        serde_json::to_vec(&segment_manifest).map_err(|err| {
+                            CollectionError::service_error(format!(
+                                "failed to serialize segment manifest into JSON: {err}"
+                            ))
+                        })?;
+                    tar.blocking_append_data(
+                        &segment_manifest_json,
+                        Path::new(SEGMENT_MANIFEST_FILE),
+                    )
+                    .map_err(|err| {
+                        CollectionError::service_error(format!(
+                            "failed to archive segment manifest: {err}"
+                        ))
+                    })?;
+                }
+
                 snapshot_all_segments(
                     segments.clone(),
                     &segments_path,
                     Some(segment_config),
                     payload_index_schema,
+                    deferred_internal_id,
                     &temp_path,
                     &tar.descend(Path::new(SEGMENTS_PATH))?,
                     format,
                     manifest.as_ref(),
                 )?;
 
+                // Staging delay: widen the window between snapshotting the segments and archiving
+                // the clocks for WAL-less snapshots. The WAL lock is not held yet, so concurrent
+                // updates can advance (and, with a short flush interval, persist) the clocks past
+                // the just-snapshotted segment data, reproducing the "clocks ahead of data" hazard
+                // this path guards against. Exercised by `wal_less_snapshot_clocks_test`.
+                #[cfg(feature = "staging")]
+                if !save_wal {
+                    let delay_secs: f64 =
+                        std::env::var("QDRANT__STAGING__SNAPSHOT_SHARD_SEGMENTS_DELAY")
+                            .ok()
+                            .and_then(|str| str.parse().ok())
+                            .unwrap_or(0.0);
+
+                    if delay_secs > 0.0 {
+                        log::debug!("Staging: Delaying shard clock snapshot for {delay_secs}s");
+                        std::thread::sleep(std::time::Duration::from_secs_f64(delay_secs));
+                        log::debug!("Staging: Delay complete, snapshotting shard clocks");
+                    }
+                }
+
                 let wal_guard = wal.blocking_lock_owned();
 
-                LocalShardClocks::archive_data(&shard_path, &tar)?;
+                // Archive the clock maps. For WAL-inclusive snapshots, copy the persisted clock
+                // files from disk; any operations the clocks are ahead of are present in the WAL and
+                // replayed on recovery. For WAL-less snapshots, archive the clocks captured before
+                // the plunger above, which the snapshotted segments are guaranteed to include.
+                match &pinned_clocks {
+                    Some((newest_clocks, oldest_clocks)) => {
+                        LocalShardClocks::archive_data_from(newest_clocks, oldest_clocks, &tar)?;
+                    }
+                    None => {
+                        LocalShardClocks::archive_data(&shard_path, &tar)?;
+                    }
+                }
 
                 // Staging delay
                 #[cfg(feature = "staging")]
@@ -248,6 +335,7 @@ pub fn snapshot_all_segments(
     segments_path: &Path,
     segment_config: Option<SegmentConfig>,
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    deferred_internal_id: Option<PointOffsetType>,
     temp_dir: &Path,
     tar: &tar_ext::BuilderExt,
     format: SnapshotFormat,
@@ -261,6 +349,7 @@ pub fn snapshot_all_segments(
         segments_path,
         segment_config,
         payload_index_schema,
+        deferred_internal_id,
         |segment| {
             let read_segment = segment.read();
             let request_segment_manifest = if let Some(manifest) = manifest {
@@ -274,7 +363,7 @@ pub fn snapshot_all_segments(
             } else {
                 None
             };
-            let segment_manifest_ref = request_segment_manifest.as_ref().map(|m| m.as_ref());
+            let segment_manifest_ref = request_segment_manifest.as_deref();
             read_segment.take_snapshot(temp_dir, tar, format, segment_manifest_ref)?;
             Ok(())
         },
@@ -311,10 +400,11 @@ pub fn proxy_all_segments_and_apply<F>(
     segments_path: &Path,
     segment_config: Option<SegmentConfig>,
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    deferred_internal_id: Option<PointOffsetType>,
     mut operation: F,
 ) -> OperationResult<()>
 where
-    F: FnMut(&RwLock<dyn NonAppendableSegmentEntry>) -> OperationResult<()>,
+    F: FnMut(&RwLock<dyn StorageSegmentEntry>) -> OperationResult<()>,
 {
     let segments_lock = segments.upgradable_read();
 
@@ -326,10 +416,11 @@ where
         segments_path,
         segment_config,
         payload_index_schema,
+        deferred_internal_id,
     )?;
 
     // Flush all pending changes of each segment, now wrapped segments won't change anymore
-    segments_lock.flush_all(true, true)?;
+    segments_lock.flush_all(FlushMode::Sync, true)?;
 
     // Apply provided function
     log::trace!("Applying function on all proxied shard segments");

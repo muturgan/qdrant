@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -44,6 +45,7 @@ impl CollectionUpdater {
         operation: CollectionUpdateOperations,
         update_operation_lock: Arc<tokio::sync::RwLock<()>>,
         update_tracker: UpdateTracker,
+        max_segment_size_bytes: Option<NonZeroUsize>,
         hw_counter: &HardwareCounterCell,
     ) -> CollectionResult<usize> {
         // Use block_in_place here to avoid blocking the current async executor
@@ -62,16 +64,29 @@ impl CollectionUpdater {
 
             match operation {
                 CollectionUpdateOperations::PointOperation(point_operation) => {
-                    process_point_operation(&segments_guard, op_num, point_operation, hw_counter)
+                    process_point_operation(
+                        &segments_guard,
+                        op_num,
+                        point_operation,
+                        max_segment_size_bytes,
+                        hw_counter,
+                    )
                 }
                 CollectionUpdateOperations::VectorOperation(vector_operation) => {
-                    process_vector_operation(&segments_guard, op_num, vector_operation, hw_counter)
+                    process_vector_operation(
+                        &segments_guard,
+                        op_num,
+                        vector_operation,
+                        max_segment_size_bytes,
+                        hw_counter,
+                    )
                 }
                 CollectionUpdateOperations::PayloadOperation(payload_operation) => {
                     process_payload_operation(
                         &segments_guard,
                         op_num,
                         payload_operation,
+                        max_segment_size_bytes,
                         hw_counter,
                     )
                 }
@@ -82,6 +97,9 @@ impl CollectionUpdater {
                         &index_operation,
                         hw_counter,
                     )
+                }
+                CollectionUpdateOperations::VectorNameOperation(vector_name_operation) => {
+                    process_vector_name_operation(&segments_guard, op_num, &vector_name_operation)
                 }
                 #[cfg(feature = "staging")]
                 CollectionUpdateOperations::StagingOperation(staging_operation) => {
@@ -102,15 +120,17 @@ impl CollectionUpdater {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::atomic::AtomicBool;
 
     use common::counter::hardware_accumulator::HwMeasurementAcc;
+    use common::types::DeferredBehavior;
     use itertools::Itertools;
     use parking_lot::RwLockUpgradableReadGuard;
     use segment::data_types::vectors::{
         DEFAULT_VECTOR_NAME, VectorStructInternal, only_default_vector,
     };
-    use segment::entry::entry_point::NonAppendableSegmentEntry;
+    use segment::entry::NonAppendableSegmentEntry as _;
     use segment::json_path::JsonPath;
     use segment::payload_json;
     use segment::types::PayloadSchemaType::Keyword;
@@ -177,6 +197,7 @@ mod tests {
             Some(10.into()),
             None,
             &points,
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -208,8 +229,8 @@ mod tests {
 
         let hw_counter = HardwareCounterCell::new();
 
-        let res = upsert_points(&segments.read(), 100, &points, &hw_counter);
-        assert!(matches!(res, Ok(1)));
+        let res = upsert_points(&segments.read(), 100, &points, None, &hw_counter);
+        assert_matches!(res, Ok(1));
 
         let records = retrieve_blocking(
             segments.clone(),
@@ -219,6 +240,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -245,6 +267,7 @@ mod tests {
             PointOperations::DeletePoints {
                 ids: vec![500.into()],
             },
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -257,6 +280,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -288,6 +312,7 @@ mod tests {
                 filter: None,
                 key: None,
             }),
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -300,6 +325,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -326,6 +352,7 @@ mod tests {
                 keys: vec!["color".parse().unwrap(), "empty".parse().unwrap()],
                 filter: None,
             }),
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -338,6 +365,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -356,6 +384,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -370,6 +399,7 @@ mod tests {
             PayloadOps::ClearPayload {
                 points: vec![2.into()],
             },
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -381,6 +411,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -441,6 +472,7 @@ mod tests {
                 filter: None,
                 key: Some(meta_key_path.clone()),
             }),
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -453,6 +485,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()
@@ -504,6 +537,7 @@ mod tests {
                 filter: None,
                 key: Some(meta_key_path.clone()),
             }),
+            None,
             &hw_counter,
         )
         .unwrap();
@@ -516,6 +550,7 @@ mod tests {
             TEST_TIMEOUT,
             &is_stopped,
             HwMeasurementAcc::new(),
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap()
         .into_values()

@@ -5,8 +5,6 @@ pub mod fixtures;
 pub mod id_tracker;
 pub mod index;
 pub mod payload_storage;
-#[cfg(feature = "rocksdb")]
-pub mod rocksdb_backup;
 pub mod segment;
 pub mod segment_constructor;
 pub mod spaces;
@@ -18,7 +16,3 @@ pub mod json_path;
 pub mod types;
 pub mod utils;
 pub mod vector_storage;
-
-#[macro_use]
-extern crate num_derive;
-extern crate core;

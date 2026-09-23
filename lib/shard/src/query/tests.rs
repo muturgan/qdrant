@@ -1,3 +1,5 @@
+use std::assert_matches;
+
 use ahash::AHashSet;
 use ordered_float::OrderedFloat;
 use segment::common::operation_error::OperationError;
@@ -125,6 +127,34 @@ fn test_try_from_double_rescore() {
 }
 
 #[test]
+fn test_try_from_limit_offset_saturates_on_overflow() {
+    // Regression: folding `offset` into the fetch `limit` must saturate instead
+    // of overflowing. With limit = usize::MAX and offset > 0, the previous
+    // `limit + offset` panicked in debug (overflow check) and wrapped to a tiny
+    // value in release; `saturating_add` clamps it to usize::MAX.
+    let dummy_vector = vec![1.0, 2.0, 3.0];
+    let request = ShardQueryRequest {
+        prefetches: vec![], // No prefetch
+        query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
+            VectorInternal::Dense(dummy_vector),
+            "full",
+        )))),
+        filter: None,
+        score_threshold: None,
+        limit: usize::MAX,
+        offset: 10,
+        params: None,
+        with_vector: WithVector::Bool(false),
+        with_payload: WithPayloadInterface::Bool(false),
+    };
+
+    let planned_query = PlannedQuery::try_from(vec![request]).unwrap();
+
+    assert_eq!(planned_query.searches.len(), 1);
+    assert_eq!(planned_query.searches[0].limit, usize::MAX);
+}
+
+#[test]
 fn test_try_from_no_prefetch() {
     let dummy_vector = vec![1.0, 2.0, 3.0];
     let request = ShardQueryRequest {
@@ -160,6 +190,7 @@ fn test_try_from_no_prefetch() {
         }]
     );
 
+    // A search leaf fetches per segment, so the root plan retrieves for the merged result.
     assert_eq!(
         planned_query.root_plans,
         vec![RootPlan {
@@ -171,6 +202,45 @@ fn test_try_from_no_prefetch() {
             },
         }]
     );
+}
+
+/// MMR without prefetches is rescored at collection level, so its candidates leaf must not
+/// fetch payload or vectors; the root plan fetches them for the final result.
+#[test]
+fn test_try_from_no_prefetch_mmr() {
+    let request = ShardQueryRequest {
+        prefetches: vec![],
+        query: Some(ScoringQuery::Mmr(MmrInternal {
+            vector: VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
+            using: "dense".to_owned(),
+            lambda: OrderedFloat(0.5),
+            candidates_limit: 100,
+        })),
+        filter: None,
+        score_threshold: None,
+        limit: 10,
+        offset: 0,
+        params: None,
+        with_vector: WithVector::Bool(false),
+        with_payload: WithPayloadInterface::Bool(true),
+    };
+
+    let planned_query = PlannedQuery::try_from(vec![request]).unwrap();
+
+    let [search] = planned_query.searches.as_slice() else {
+        panic!("expected a single candidates search");
+    };
+    assert_eq!(search.with_vector, Some(WithVector::Bool(false)));
+    assert_eq!(search.with_payload, Some(WithPayloadInterface::Bool(false)));
+
+    let [root_plan] = planned_query.root_plans.as_slice() else {
+        panic!("expected a single root plan");
+    };
+    assert_eq!(
+        root_plan.with_vector,
+        WithVector::Selector(vec!["dense".to_owned()])
+    );
+    assert_eq!(root_plan.with_payload, WithPayloadInterface::Bool(true));
 }
 
 #[test]
@@ -333,7 +403,7 @@ fn test_base_params_mapping_in_try_from() {
                 "dense",
             )))),
             limit: 37,
-            params: dummy_params,
+            params: dummy_params.clone(),
             filter: dummy_filter.clone(),
             score_threshold: Some(OrderedFloat(0.1)),
         }],
@@ -347,7 +417,7 @@ fn test_base_params_mapping_in_try_from() {
         offset: 49,
 
         // these params will be ignored because we have a prefetch
-        params: top_level_params,
+        params: top_level_params.clone(),
         with_payload: WithPayloadInterface::Bool(true),
         with_vector: WithVector::Bool(false),
     };
@@ -495,10 +565,10 @@ fn test_detect_max_depth() {
     assert_eq!(request.prefetches_depth(), 65);
 
     // assert error
-    assert!(matches!(
+    assert_matches!(
         PlannedQuery::try_from(vec![request]),
         Err(OperationError::ValidationError { description }) if description == "prefetches depth 65 exceeds max depth 64",
-    ));
+    );
 }
 
 fn dummy_core_prefetch(limit: usize) -> ShardPrefetch {
@@ -553,7 +623,7 @@ fn test_from_batch_of_requests() {
             limit: 20,
             offset: 0,
             params: None,
-            with_payload: WithPayloadInterface::Bool(false),
+            with_payload: WithPayloadInterface::Bool(true),
             with_vector: WithVector::Bool(false),
         },
         // A double fusion query
@@ -590,6 +660,12 @@ fn test_from_batch_of_requests() {
     assert_eq!(planned_query.searches.len(), 3);
     assert_eq!(planned_query.scrolls.len(), 2);
     assert_eq!(planned_query.root_plans.len(), 3);
+
+    // The no-prefetch scroll fetches its own payload.
+    assert_eq!(
+        planned_query.scrolls[0].with_payload,
+        WithPayloadInterface::Bool(true)
+    );
 
     assert_eq!(
         planned_query.root_plans,

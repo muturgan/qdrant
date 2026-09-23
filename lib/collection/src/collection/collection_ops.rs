@@ -2,19 +2,21 @@ use std::cmp;
 use std::sync::{Arc, LazyLock};
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::types::DeferredBehavior;
 use futures::{TryStreamExt as _, future};
 use segment::types::{Payload, QuantizationConfig, StrictModeConfig};
 use semver::Version;
 use shard::count::CountRequestInternal;
+use shard::operations::optimization::{OptimizationsRequestOptions, OptimizationsResponse};
 
 use super::Collection;
 use crate::operations::config_diff::*;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
-use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::replica_set::Change;
 use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::PeerId;
+use crate::shards::shard_holder::SharedShardHolder;
 
 /// Old logic for aborting shard transfers on shard drop, had a bug: it dropped all transfers
 /// regardless of the shard id. In order to keep consensus consistent, we can only
@@ -29,7 +31,7 @@ impl Collection {
     /// Updates collection params:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_params_from_diff(
         &self,
@@ -46,7 +48,7 @@ impl Collection {
     /// Updates HNSW config:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_hnsw_config_from_diff(
         &self,
@@ -63,7 +65,7 @@ impl Collection {
     /// Updates vectors config:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_vectors_from_diff(
         &self,
@@ -81,7 +83,7 @@ impl Collection {
     /// Updates sparse vectors config:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_sparse_vectors_from_other(
         &self,
@@ -99,7 +101,7 @@ impl Collection {
     /// Updates shard optimization params:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_optimizer_params_from_diff(
         &self,
@@ -113,26 +115,10 @@ impl Collection {
         Ok(())
     }
 
-    /// Updates shard optimization params: Saves new params on disk
-    ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
-    /// the updated configuration.
-    pub async fn update_optimizer_params(
-        &self,
-        optimizer_config: OptimizersConfig,
-    ) -> CollectionResult<()> {
-        {
-            let mut config = self.collection_config.write().await;
-            config.optimizer_config = optimizer_config;
-        }
-        self.collection_config.read().await.save(&self.path)?;
-        Ok(())
-    }
-
     /// Updates quantization config:
     /// Saves new params on disk
     ///
-    /// After this, `recreate_optimizers_blocking` must be called to create new optimizers using
+    /// After this, `recreate_optimizers_background` must be called to create new optimizers using
     /// the updated configuration.
     pub async fn update_quantization_config_from_diff(
         &self,
@@ -155,6 +141,11 @@ impl Collection {
                     config
                         .quantization_config
                         .replace(QuantizationConfig::Binary(binary));
+                }
+                QuantizationConfigDiff::Turbo(turbo) => {
+                    config
+                        .quantization_config
+                        .replace(QuantizationConfig::Turbo(turbo));
                 }
                 QuantizationConfigDiff::Disabled(_) => {
                     config.quantization_config = None;
@@ -182,32 +173,65 @@ impl Collection {
     }
 
     /// Updates the strict mode configuration and saves it to disk.
+    ///
+    /// Order matters: rate limiters on each shard are updated *before* the new
+    /// `strict_mode_config` is published to `self.collection_config`. Otherwise
+    /// readers of `info()` could observe `enabled=false` while a search arriving
+    /// on the same peer is still rejected by a not-yet-cleared rate limiter
+    /// (or vice versa for an enable).
     pub async fn update_strict_mode_config(
         &self,
         strict_mode_diff: StrictModeConfig,
     ) -> CollectionResult<()> {
-        {
-            let mut config = self.collection_config.write().await;
-            if let Some(current_config) = config.strict_mode_config.as_mut() {
-                *current_config = current_config.update(&strict_mode_diff);
+        // Compute the new strict-mode config without yet exposing it.
+        let new_strict_mode_config = {
+            let config = self.collection_config.read().await;
+            if let Some(current) = config.strict_mode_config.as_ref() {
+                current.update(&strict_mode_diff)
             } else {
-                config.strict_mode_config = Some(strict_mode_diff);
+                strict_mode_diff
+            }
+        };
+
+        // Apply rate-limiter changes to every shard first, so the visible config
+        // never lies about the active rate limit.
+        {
+            let shard_holder = self.shards_holder.write().await;
+            let updates = shard_holder.all_shards().map(|replica_set| {
+                replica_set.on_strict_mode_config_update(&new_strict_mode_config)
+            });
+            // Drive every shard update to completion even if a sibling fails, so a single
+            // shard error does not skip rate-limiter updates on the remaining shards.
+            let results = future::join_all(updates).await;
+
+            let mut first_err = None;
+            for result in results {
+                if let Err(err) = result {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    } else {
+                        log::error!("Additional shard strict mode update failure: {err}");
+                    }
+                }
+            }
+
+            if let Some(err) = first_err {
+                return Err(err);
             }
         }
-        // update collection config
+
+        // Publish the new config and persist it.
+        {
+            let mut config = self.collection_config.write().await;
+            config.strict_mode_config = Some(new_strict_mode_config);
+        }
         self.collection_config.read().await.save(&self.path)?;
-        // apply config change to all shards
-        let mut shard_holder = self.shards_holder.write().await;
-        let updates = shard_holder
-            .all_shards_mut()
-            .map(|replica_set| replica_set.on_strict_mode_config_update());
-        future::try_join_all(updates).await?;
         Ok(())
     }
 
     /// Handle replica changes
     ///
-    /// add and remove replicas from replica set
+    /// Remove replicas from replica set
     pub async fn handle_replica_changes(
         &self,
         replica_changes: Vec<Change>,
@@ -217,35 +241,35 @@ impl Collection {
         }
 
         let shard_holder = self.shards_holder.read().await;
+        let mut to_remove = Vec::with_capacity(replica_changes.len());
 
         for change in replica_changes {
             let (shard_id, peer_id) = match change {
                 Change::Remove(shard_id, peer_id) => (shard_id, peer_id),
             };
 
-            let Some(replica_set) = shard_holder.get_shard(shard_id) else {
-                return Err(CollectionError::BadRequest {
-                    description: format!("Shard {} of {} not found", shard_id, self.name()),
-                });
+            let Some(replica_set) = shard_holder.get_shard(shard_id).cloned() else {
+                return Err(CollectionError::bad_request(format!(
+                    "Shard {shard_id} of {} not found",
+                    self.name(),
+                )));
             };
 
             let peers = replica_set.peers();
 
             if !peers.contains_key(&peer_id) {
-                return Err(CollectionError::BadRequest {
-                    description: format!("Peer {peer_id} has no replica of shard {shard_id}"),
-                });
+                return Err(CollectionError::bad_request(format!(
+                    "Peer {peer_id} has no replica of shard {shard_id}"
+                )));
             }
 
             // Check that we are not removing the *last* replica or the last *active* replica
             //
             // `is_last_active_replica` counts both `Active` and `ReshardingScaleDown` replicas!
             if peers.len() == 1 || replica_set.is_last_source_of_truth_replica(peer_id) {
-                return Err(CollectionError::BadRequest {
-                    description: format!(
-                        "Shard {shard_id} must have at least one active replica after removing {peer_id}",
-                    ),
-                });
+                return Err(CollectionError::bad_request(format!(
+                    "Shard {shard_id} must have at least one active replica after removing {peer_id}",
+                )));
             }
 
             let all_nodes_fixed_cancellation = self
@@ -262,9 +286,15 @@ impl Collection {
                     .get_transfers(|transfer| transfer.from == peer_id || transfer.to == peer_id)
             };
 
-            // ...and cancel transfer tasks and remove transfers from internal state
+            to_remove.push((replica_set, peer_id, transfers));
+        }
+
+        // Must release shard holder lock for abort_shard_transfer_and_resharding
+        drop(shard_holder);
+
+        for (replica_set, peer_id, transfers) in to_remove {
             for transfer in transfers {
-                self.abort_shard_transfer_and_resharding(transfer.key(), Some(&shard_holder))
+                self.abort_shard_transfer_and_resharding(transfer.key())
                     .await?;
             }
 
@@ -277,31 +307,98 @@ impl Collection {
             // the transfer should be cancelled (see the block right above this comment),
             // so no special handling is needed.
         }
+
         Ok(())
     }
 
-    /// Recreate the optimizers on all shards for this collection
+    /// Recreate the optimizers on all shards for this collection, in the background.
     ///
-    /// This will stop existing optimizers, and start new ones with new configurations.
+    /// Returns immediately and performs all the work - stopping the existing workers and starting
+    /// new ones - in a detached task. Stopping the existing workers waits for in-flight
+    /// optimizations to finish, which can take a long time. This is why it runs in the background:
+    /// it is reached from paths that go through consensus, where blocking the caller stalls the
+    /// whole consensus loop and can take down a cluster.
     ///
-    /// # Blocking
+    /// At most one recreation runs at a time. If one is already running, this records that another
+    /// run is needed and returns; the running task then runs once more when it finishes, picking up
+    /// the latest config. Any number of requests that arrive while a task is running collapse into a
+    /// single additional run (recreation always rebuilds from the current config, so coalescing is
+    /// safe - the last run reflects the latest state).
     ///
-    /// Partially blocking. Stopping existing optimizers is blocking. Starting new optimizers is
-    /// not blocking.
-    ///
-    /// ## Cancel safety
-    ///
-    /// This function is cancel safe, and will always run to completion.
-    pub async fn recreate_optimizers_blocking(&self) -> CollectionResult<()> {
+    /// Errors are logged rather than returned: the configuration change that triggers the
+    /// recreation has already been applied and persisted by the time we get here, so there is no
+    /// caller left to propagate them to. Failures are also surfaced as optimizer errors per shard
+    /// (see `LocalShard::on_optimizer_config_update`).
+    pub fn recreate_optimizers_background(&self) {
+        // Single-flight: only spawn a task if none is running. Otherwise the request is coalesced
+        // into a queued re-run handled by the task that is already running.
+        if !self.recreate_optimizers_state.request() {
+            return;
+        }
+
         let shards_holder = self.shards_holder.clone();
+        let collection_id = self.id.clone();
+        let recreate_state = self.recreate_optimizers_state.clone();
         tokio::task::spawn(async move {
-            let shard_holder = shards_holder.read().await;
-            let updates = shard_holder
-                .all_shards()
-                .map(|replica_set| replica_set.on_optimizer_config_update());
-            future::try_join_all(updates).await
-        })
-        .await??;
+            loop {
+                // Run the recreation as a child task, so a panic is contained (surfaced as a
+                // `JoinError`) and never unwinds the coordinator loop below - which would otherwise
+                // leave `running` stuck and wedge all future recreations.
+                match tokio::task::spawn(Self::recreate_optimizers(shards_holder.clone())).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => log::error!(
+                        "Failed to recreate optimizers for collection {collection_id} in background: {err}",
+                    ),
+                    Err(err) => log::error!(
+                        "Optimizer recreation task for collection {collection_id} failed: {err}",
+                    ),
+                }
+
+                // Run again if a request arrived while we were running, otherwise stop. The
+                // decision is a single atomic compare-and-swap (in `finish_run`), so a request
+                // arriving exactly now is never lost: it either still sees us running (and queues a
+                // re-run, handled by the next iteration) or sees us idle (and spawns a fresh task).
+                if !recreate_state.finish_run() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Stop the existing optimizers on all shards and start new ones using the current config.
+    ///
+    /// Implementation behind [`Collection::recreate_optimizers_background`]. Takes an owned
+    /// [`SharedShardHolder`] so the returned future is `'static` and can be spawned as a task.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel safe and must be run to completion. Early cancellation may result in dead workers.
+    async fn recreate_optimizers(shards_holder: SharedShardHolder) -> CollectionResult<()> {
+        let shard_holder = shards_holder.read().await;
+        let updates = shard_holder
+            .all_shards()
+            .map(|replica_set| replica_set.on_optimizer_config_update());
+
+        // `on_optimizer_config_update` is *not* cancel safe: once a shard has stopped its update
+        // workers it must reach `run_workers` before the future is dropped. `try_join_all` cancels
+        // sibling futures on the first error, so use `join_all` and aggregate errors instead.
+        let results = future::join_all(updates).await;
+
+        let mut first_err = None;
+        for result in results {
+            if let Err(err) = result {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                } else {
+                    log::error!("Additional shard optimizer recreation failure: {err}");
+                }
+            }
+        }
+
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+
         Ok(())
     }
 
@@ -311,6 +408,10 @@ impl Collection {
             .await
             .strict_mode_config
             .clone()
+    }
+
+    pub async fn vectors_config(&self) -> VectorsConfig {
+        self.collection_config.read().await.params.vectors.clone()
     }
 
     pub async fn info(
@@ -354,11 +455,23 @@ impl Collection {
             info.points_count = info.points_count.zip(points_count).map(|(a, b)| a + b);
             info.segments_count += segments_count;
             info.warnings.extend(warnings);
-            if let Some(queue) = &mut info.update_queue {
-                queue.length += update_queue.map(|q| q.length).unwrap_or(0);
+
+            if let Some(UpdateQueueInfo {
+                length,
+                deferred_points,
+            }) = &mut info.update_queue
+            {
+                *length += update_queue.as_ref().map(|q| q.length).unwrap_or(0);
+
+                if let Some(response_deferred_count) = update_queue.and_then(|i| i.deferred_points)
+                    && response_deferred_count > 0
+                {
+                    *deferred_points.get_or_insert_default() += response_deferred_count;
+                }
             } else {
                 info.update_queue = update_queue;
             }
+
             for (key, response_schema) in payload_schema {
                 info.payload_schema
                     .entry(key)
@@ -395,7 +508,12 @@ impl Collection {
                 // So that we can monitor hardware usage without interference
                 let hw_acc = HwMeasurementAcc::disposable();
                 let count_result = replica_set
-                    .count_local(count_request.clone(), None, hw_acc)
+                    .count_local(
+                        count_request.clone(),
+                        None,
+                        hw_acc,
+                        DeferredBehavior::VisibleOnly,
+                    )
                     .await
                     .unwrap_or_default();
 

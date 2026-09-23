@@ -1,20 +1,28 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::grpc::qdrant_internal_server::QdrantInternal;
 use api::grpc::{
-    GetConsensusCommitRequest, GetConsensusCommitResponse, GetTelemetryRequest,
-    GetTelemetryResponse, PeerTelemetry, WaitOnConsensusCommitRequest,
-    WaitOnConsensusCommitResponse,
+    GetAuditLogRequest, GetAuditLogResponse, GetConsensusAppliedLogRequest,
+    GetConsensusAppliedLogResponse, GetConsensusCommitRequest, GetConsensusCommitResponse,
+    GetQuotaUsageRequest, GetQuotaUsageResponse, GetTelemetryRequest, GetTelemetryResponse,
+    PeerTelemetry, QuotaUsage, WaitOnConsensusCommitRequest, WaitOnConsensusCommitResponse,
 };
+use chrono::DateTime;
 use common::types::{DetailsLevel, TelemetryDetail};
+use storage::audit::AuditConfig;
+use storage::audit_reader::{AuditLogQuery, read_local_audit_logs};
 use storage::content_manager::consensus_manager::ConsensusStateRef;
-use storage::rbac::{Access, Auth, AuthType};
+use storage::quota;
+use storage::rbac::AccessRequirements;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
+use crate::common::consensus_lag::applied_log_to_grpc;
 use crate::common::telemetry::TelemetryCollector;
 use crate::settings::Settings;
+use crate::tonic::auth::extract_auth;
 
 pub struct QdrantInternalService {
     /// Telemetry collector
@@ -23,6 +31,8 @@ pub struct QdrantInternalService {
     settings: Settings,
     /// Consensus state
     consensus_state: ConsensusStateRef,
+    /// Audit configuration
+    audit_config: Option<AuditConfig>,
 }
 
 impl QdrantInternalService {
@@ -31,10 +41,12 @@ impl QdrantInternalService {
         settings: Settings,
         consensus_state: ConsensusStateRef,
     ) -> Self {
+        let audit_config = settings.audit.clone();
         Self {
             telemetry_collector,
             settings,
             consensus_state,
+            audit_config,
         }
     }
 }
@@ -63,15 +75,15 @@ impl QdrantInternal for QdrantInternalService {
         let ok = self
             .consensus_state
             .wait_for_consensus_commit(commit, term, consensus_tick, timeout)
-            .await
-            .is_ok();
+            .await;
         Ok(Response::new(WaitOnConsensusCommitResponse { ok }))
     }
 
     async fn get_telemetry(
         &self,
-        request: Request<GetTelemetryRequest>,
+        mut request: Request<GetTelemetryRequest>,
     ) -> Result<Response<GetTelemetryResponse>, Status> {
+        let auth = extract_auth(&mut request);
         let GetTelemetryRequest {
             details_level,
             collections_selector,
@@ -89,6 +101,7 @@ impl QdrantInternal for QdrantInternalService {
         let detail = TelemetryDetail {
             level: details_level,
             histograms: false,
+            per_collection: false,
         };
 
         let only_collections =
@@ -96,13 +109,6 @@ impl QdrantInternal for QdrantInternalService {
 
         let timing = Instant::now();
         let timeout = Duration::from_secs(timeout);
-
-        let auth = Auth::new(
-            Access::full("internal service"),
-            None,
-            None,
-            AuthType::Internal,
-        );
 
         let telemetry_collector = self.telemetry_collector.lock().await;
         let telemetry_data = telemetry_collector
@@ -115,5 +121,101 @@ impl QdrantInternal for QdrantInternalService {
         };
 
         Ok(Response::new(response))
+    }
+
+    async fn get_quota_usage(
+        &self,
+        mut request: Request<GetQuotaUsageRequest>,
+    ) -> Result<Response<GetQuotaUsageResponse>, Status> {
+        let auth = extract_auth(&mut request);
+        auth.unlogged_access()
+            .check_global_access(AccessRequirements::new())?;
+
+        let timing = Instant::now();
+
+        // Read straight from the node's quota manager: this answers for the peer
+        // that received the call, which is the whole point of the RPC.
+        let manager = quota::global();
+        let usage = manager.usage();
+
+        let response = GetQuotaUsageResponse {
+            result: Some(QuotaUsage {
+                resident_memory_percent: usage.resident_memory_percent.map(u32::from),
+                disk_usage_percent: usage.disk_usage_percent.map(u32::from),
+                exceeded: manager.exceeded().any(),
+            }),
+            time: timing.elapsed().as_secs_f64(),
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn get_consensus_applied_log(
+        &self,
+        _: Request<GetConsensusAppliedLogRequest>,
+    ) -> Result<Response<GetConsensusAppliedLogResponse>, Status> {
+        Ok(Response::new(applied_log_to_grpc(
+            self.consensus_state.applied_log(),
+        )))
+    }
+
+    async fn get_audit_log(
+        &self,
+        request: Request<GetAuditLogRequest>,
+    ) -> Result<Response<GetAuditLogResponse>, Status> {
+        let GetAuditLogRequest {
+            time_from,
+            time_to,
+            filters,
+            limit,
+        } = request.into_inner();
+
+        let audit_config = self
+            .audit_config
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("Audit logging is not configured"))?;
+
+        let time_from = time_from
+            .as_deref()
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| Status::invalid_argument(format!("Invalid time_from: {e}")))
+            })
+            .transpose()?;
+
+        let time_to = time_to
+            .as_deref()
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| Status::invalid_argument(format!("Invalid time_to: {e}")))
+            })
+            .transpose()?;
+
+        let filters: HashMap<String, String> = filters;
+
+        let limit = if limit == 0 {
+            None
+        } else {
+            Some(limit as usize)
+        };
+
+        let query = AuditLogQuery::new(time_from, time_to, filters, limit);
+
+        let config = audit_config.clone();
+        let entries = cancel::blocking::spawn_cancel_on_drop(move |cancel| {
+            read_local_audit_logs(&config, &query, &cancel)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to read local audit logs: {e}")))?
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let entries: Vec<String> = entries
+            .iter()
+            .filter_map(|e| serde_json::to_string(e).ok())
+            .collect();
+
+        Ok(Response::new(GetAuditLogResponse { entries }))
     }
 }

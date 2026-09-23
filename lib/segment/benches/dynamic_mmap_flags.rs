@@ -2,17 +2,18 @@ use std::hint::black_box;
 use std::iter;
 use std::sync::atomic::AtomicBool;
 
+use common::universal_io::{MmapFile, MmapFs, Populate};
 use criterion::{Criterion, criterion_group, criterion_main};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use segment::common::flags::dynamic_mmap_flags::DynamicMmapFlags;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+use segment::common::flags::dynamic_stored_flags::DynamicStoredFlags;
 use segment::common::operation_error::check_process_stopped;
 use tempfile::tempdir;
 
 const FLAG_COUNT: usize = 50_000_000;
 
 fn dynamic_mmap_flag_count(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = SmallRng::seed_from_u64(42);
     let dir = tempdir().unwrap();
     let random_flags: Vec<bool> = iter::repeat_with(|| rng.random())
         .take(FLAG_COUNT)
@@ -20,13 +21,20 @@ fn dynamic_mmap_flag_count(c: &mut Criterion) {
     let stopped = AtomicBool::new(false);
 
     // Build dynamic mmap flags with random deletions
-    let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
-    dynamic_flags.set_len(FLAG_COUNT).unwrap();
-    random_flags
-        .iter()
-        .enumerate()
-        .filter(|(_, flag)| **flag)
-        .for_each(|(i, _)| assert!(!dynamic_flags.set(i, true)));
+    let populate = Populate::No;
+    let mut dynamic_flags =
+        DynamicStoredFlags::<MmapFile>::open(&MmapFs, dir.path(), populate).unwrap();
+    dynamic_flags.set_len(&MmapFs, FLAG_COUNT).unwrap();
+    dynamic_flags
+        .set_ascending_bits(
+            random_flags
+                .iter()
+                .enumerate()
+                .filter(|(_, flag)| **flag)
+                .map(|(i, _)| (i as u64, true)),
+        )
+        .unwrap();
+
     dynamic_flags.flusher()().unwrap();
     let real_count = random_flags.iter().filter(|&&flag| flag).count();
 
@@ -36,7 +44,7 @@ fn dynamic_mmap_flag_count(c: &mut Criterion) {
         b.iter(|| {
             let mut count = 0;
             for i in 0..FLAG_COUNT {
-                if dynamic_flags.get(i) {
+                if dynamic_flags.get(i).unwrap() {
                     count += 1;
                 }
                 check_process_stopped(&stopped).unwrap();
@@ -50,7 +58,7 @@ fn dynamic_mmap_flag_count(c: &mut Criterion) {
         b.iter(|| {
             let mut count = 0;
             for i in 0..FLAG_COUNT {
-                if dynamic_flags.get(i) {
+                if dynamic_flags.get(i).unwrap() {
                     count += 1;
                 }
             }
@@ -61,7 +69,7 @@ fn dynamic_mmap_flag_count(c: &mut Criterion) {
 
     group.bench_function("count-ones", |b| {
         b.iter(|| {
-            let count = dynamic_flags.count_flags();
+            let count = dynamic_flags.count_flags().unwrap();
             assert_eq!(count, real_count);
             black_box(count)
         });

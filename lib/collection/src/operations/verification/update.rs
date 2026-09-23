@@ -1,9 +1,9 @@
 use api::rest::{
-    BatchVectorStruct, MultiDenseVector, PointInsertOperations, PointsBatch, PointsList,
-    UpdateVectors, Vector, VectorStruct,
+    BatchVectorStruct, PointInsertOperations, PointsBatch, PointsList, UpdateVectors, Vector,
+    VectorStruct,
 };
 use segment::data_types::tiny_map::TinyMap;
-use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, MultiDenseVector};
 use segment::types::{
     Filter, StrictModeConfig, StrictModeMultivectorConfig, StrictModeSparseConfig, VectorName,
     VectorNameBuf,
@@ -16,6 +16,32 @@ use crate::operations::payload_ops::{DeletePayload, SetPayload};
 use crate::operations::point_ops::PointsSelector;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::vector_ops::DeleteVectors;
+
+impl StrictModeVerification for shard::operations::CreateVectorName {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
+    fn query_limit(&self) -> Option<usize> {
+        None
+    }
+
+    fn indexed_filter_read(&self) -> Option<&Filter> {
+        None
+    }
+
+    fn indexed_filter_write(&self) -> Option<&Filter> {
+        None
+    }
+
+    fn request_exact(&self) -> Option<bool> {
+        None
+    }
+
+    fn request_search_params(&self) -> Option<&segment::types::SearchParams> {
+        None
+    }
+}
 
 impl StrictModeVerification for PointsSelector {
     fn indexed_filter_write(&self) -> Option<&Filter> {
@@ -65,6 +91,10 @@ impl StrictModeVerification for DeleteVectors {
 }
 
 impl StrictModeVerification for SetPayload {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
     async fn check_custom(
         &self,
         collection: &Collection,
@@ -123,6 +153,10 @@ impl StrictModeVerification for DeletePayload {
 }
 
 impl StrictModeVerification for PointInsertOperations {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
     async fn check_custom(
         &self,
         collection: &Collection,
@@ -185,6 +219,10 @@ impl StrictModeVerification for PointInsertOperations {
 }
 
 impl StrictModeVerification for UpdateVectors {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
     async fn check_custom(
         &self,
         collection: &Collection,

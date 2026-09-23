@@ -31,28 +31,26 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
-use common::fs::{atomic_save, read_bin};
+use common::fs::atomic_save;
 use common::types::{PointOffsetType, ScoredPointOffset};
+use common::universal_io::{MmapFs, UniversalReadFs, read_bin_via};
 use fs_err as fs;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::HnswM;
 use super::entry_points::{EntryPoint, EntryPoints};
-use super::graph_links::{GraphLinks, GraphLinksFormat};
+use super::graph_links::{GraphLinks, GraphLinksFormat, GraphLinksResidency};
+use super::{GraphWithVectorsScorers, HnswM};
 use crate::common::operation_error::{
     CancellableResult, OperationError, OperationResult, check_process_stopped,
 };
 use crate::common::utils::rev_range;
 use crate::index::hnsw_index::graph_links::{GraphLinksFormatParam, serialize_graph_links};
-use crate::index::hnsw_index::point_scorer::{FilteredBytesScorer, FilteredScorer, ScorerFilters};
+use crate::index::hnsw_index::point_scorer::{FilteredBytesScorer, FilteredScorer};
 use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 use crate::vector_storage::RawScorer;
 use crate::vector_storage::query_scorer::QueryScorerBytes;
-
-pub type LinkContainer = Vec<PointOffsetType>;
-pub type LayersContainer = Vec<LinkContainer>;
 
 pub const HNSW_GRAPH_FILE: &str = "graph.bin";
 
@@ -212,7 +210,7 @@ pub trait GraphLayersBase {
             });
 
             // Collect 2-hop neighbors (neighbors of neighbors)
-            for &hop1 in to_explore.iter() {
+            for &hop1 in &to_explore {
                 check_process_stopped(is_stopped)?;
 
                 let total_limit = to_score.len() + hop2_limit;
@@ -503,28 +501,9 @@ impl GraphLayers {
         self.links.point_level(point_id)
     }
 
-    fn get_entry_point(
-        &self,
-        filters: &ScorerFilters,
-        custom_entry_points: Option<&[PointOffsetType]>,
-    ) -> Option<EntryPoint> {
-        // Try to get it from custom entry points
-        custom_entry_points
-            .and_then(|custom_entry_points| {
-                custom_entry_points
-                    .iter()
-                    .filter(|&&point_id| filters.check_vector(point_id))
-                    .map(|&point_id| {
-                        let level = self.point_level(point_id);
-                        EntryPoint { point_id, level }
-                    })
-                    .max_by_key(|ep| ep.level)
-            })
-            .or_else(|| {
-                // Otherwise use normal entry points
-                self.entry_points
-                    .get_entry_point(|point_id| filters.check_vector(point_id))
-            })
+    #[cfg(any(test, feature = "testing"))]
+    pub fn unfiltered_entry_point(&self) -> EntryPoint {
+        self.entry_points.get_entry_point(|_| true).unwrap()
     }
 
     pub fn search(
@@ -532,64 +511,51 @@ impl GraphLayers {
         top: usize,
         ef: usize,
         algorithm: SearchAlgorithm,
-        mut points_scorer: FilteredScorer,
-        custom_entry_points: Option<&[PointOffsetType]>,
+        points_scorer: &mut FilteredScorer,
+        entry_point: EntryPoint,
         is_stopped: &AtomicBool,
     ) -> CancellableResult<Vec<ScoredPointOffset>> {
-        let Some(entry_point) = self.get_entry_point(points_scorer.filters(), custom_entry_points)
-        else {
-            return Ok(Vec::default());
-        };
-
         let zero_level_entry = self.search_entry(
             entry_point.point_id,
             entry_point.level,
             0,
-            &mut points_scorer,
+            points_scorer,
             is_stopped,
         )?;
         let ef = max(ef, top);
         let nearest = match algorithm {
             SearchAlgorithm::Hnsw => {
-                self.search_on_level(zero_level_entry, 0, ef, &mut points_scorer, is_stopped)
+                self.search_on_level(zero_level_entry, 0, ef, points_scorer, is_stopped)
             }
             SearchAlgorithm::Acorn => {
-                self.search_on_level_acorn(zero_level_entry, 0, ef, &mut points_scorer, is_stopped)
+                self.search_on_level_acorn(zero_level_entry, 0, ef, points_scorer, is_stopped)
             }
         }?;
         Ok(nearest.into_iter_sorted().take(top).collect_vec())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn search_with_vectors(
         &self,
         top: usize,
         ef: usize,
-        links_scorer: &FilteredScorer,
-        links_scorer_bytes: &FilteredBytesScorer,
-        base_scorer: &dyn QueryScorerBytes,
-        custom_entry_points: Option<&[PointOffsetType]>,
+        scorers: GraphWithVectorsScorers,
+        entry_point: EntryPoint,
         is_stopped: &AtomicBool,
     ) -> CancellableResult<Vec<ScoredPointOffset>> {
-        let Some(entry_point) = self.get_entry_point(links_scorer.filters(), custom_entry_points)
-        else {
-            return Ok(Vec::default());
-        };
-
         let zero_level_entry = self.search_entry_with_vectors(
             entry_point.point_id,
             entry_point.level,
             0,
-            links_scorer.raw_scorer(),
-            links_scorer_bytes,
+            scorers.links.raw_scorer(),
+            scorers.links_bytes,
             is_stopped,
         )?;
         let nearest = self.search_on_level_with_vectors(
             zero_level_entry,
             0,
             max(top, ef),
-            links_scorer_bytes,
-            base_scorer,
+            scorers.links_bytes,
+            scorers.base,
             is_stopped,
         )?;
         Ok(nearest.into_iter_sorted().take(top).collect_vec())
@@ -616,39 +582,90 @@ impl GraphLayers {
         ]
     }
 
-    pub fn num_points(&self) -> usize {
-        self.links.num_points()
+    /// Heap RAM held by the graph links, in bytes.
+    /// Zero when the links are backed by a live (mmap-backed) file handle;
+    /// see [`GraphLinks::heap_size_bytes`].
+    pub fn links_heap_size_bytes(&self) -> usize {
+        self.links.heap_size_bytes()
     }
 }
 
 impl GraphLayers {
-    pub fn load(dir: &Path, on_disk: bool, compress: bool) -> OperationResult<Self> {
-        let graph_data: GraphLayerData = read_bin(&GraphLayers::get_path(dir))?;
-
+    /// Load via local mmap, optionally converting the links to the compressed
+    /// format first. Used by the (mutable) on-disk HNSW index.
+    ///
+    /// `residency` controls how the links reside in memory after loading;
+    /// see [`GraphLinksResidency`].
+    pub fn load(
+        dir: &Path,
+        residency: GraphLinksResidency,
+        compress: bool,
+    ) -> OperationResult<Self> {
         if compress {
+            // `convert_to_compressed` writes data, and we don't have a
+            // `UniversalWriteFs` yet, so it stays on local mmap IO. It is not
+            // enabled as per `super::hnsw::LINK_COMPRESSION_CONVERT_EXISTING`.
+            let graph_data: GraphLayerData = read_bin_via(&MmapFs, GraphLayers::get_path(dir))?;
             Self::convert_to_compressed(dir, HnswM::new(graph_data.m, graph_data.m0))?;
         }
 
-        Ok(Self {
-            hnsw_m: HnswM::new(graph_data.m, graph_data.m0),
-            links: Self::load_links(dir, on_disk)?,
-            entry_points: graph_data.entry_points.into_owned(),
-            visited_pool: VisitedPool::new(),
-        })
+        Self::load_universal(&MmapFs, dir, residency)
     }
 
-    fn load_links(dir: &Path, on_disk: bool) -> OperationResult<GraphLinks> {
+    /// Format of the links file present in `dir`, probed in the same order as
+    /// [`Self::load_universal`] reads it.
+    pub(super) fn probe_links_format(
+        fs: &impl UniversalReadFs,
+        dir: &Path,
+    ) -> OperationResult<Option<GraphLinksFormat>> {
         for format in [
             GraphLinksFormat::CompressedWithVectors,
             GraphLinksFormat::Compressed,
             GraphLinksFormat::Plain,
         ] {
-            let path = GraphLayers::get_links_path(dir, format);
-            if path.exists() {
-                return GraphLinks::load_from_file(&path, on_disk, format);
+            if fs.exists(&Self::get_links_path(dir, format))? {
+                return Ok(Some(format));
             }
         }
-        Err(OperationError::service_error("No links file found"))
+        Ok(None)
+    }
+
+    /// Load purely through universal IO, without the format conversion path of
+    /// [`Self::load`]. Used by the read-only index.
+    ///
+    /// `residency` controls how the links reside in memory after loading;
+    /// see [`GraphLinksResidency`].
+    pub fn load_universal<Fs>(
+        fs: &Fs,
+        dir: &Path,
+        residency: GraphLinksResidency,
+    ) -> OperationResult<Self>
+    where
+        Fs: UniversalReadFs,
+        Fs::File: 'static,
+    {
+        let graph_data: GraphLayerData = read_bin_via(fs, GraphLayers::get_path(dir))?;
+
+        Ok(Self {
+            hnsw_m: HnswM::new(graph_data.m, graph_data.m0),
+            links: Self::load_links_universal(fs, dir, residency)?,
+            entry_points: graph_data.entry_points.into_owned(),
+            visited_pool: VisitedPool::new(),
+        })
+    }
+
+    fn load_links_universal<Fs>(
+        fs: &Fs,
+        dir: &Path,
+        residency: GraphLinksResidency,
+    ) -> OperationResult<GraphLinks>
+    where
+        Fs: UniversalReadFs,
+        Fs::File: 'static,
+    {
+        let format = Self::probe_links_format(fs, dir)?
+            .ok_or_else(|| OperationError::service_error("No links file found"))?;
+        GraphLinks::load_universal(fs, &Self::get_links_path(dir, format), format, residency)
     }
 
     /// Convert the "plain" format into the "compressed" format.
@@ -668,7 +685,12 @@ impl GraphLayers {
 
         let start = std::time::Instant::now();
 
-        let links = GraphLinks::load_from_file(&plain_path, true, GraphLinksFormat::Plain)?;
+        let links = GraphLinks::load_universal(
+            &MmapFs,
+            &plain_path,
+            GraphLinksFormat::Plain,
+            GraphLinksResidency::Cold,
+        )?;
         let original_size = fs::metadata(&plain_path)?.len();
         atomic_save(&compressed_path, |writer| {
             let edges = links.to_edges();
@@ -704,15 +726,11 @@ impl GraphLayers {
         )
         .unwrap();
     }
-
-    pub fn populate(&self) -> OperationResult<()> {
-        self.links.populate()?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use common::universal_io::MmapFile;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rstest::rstest;
@@ -721,13 +739,80 @@ mod tests {
     use super::*;
     use crate::data_types::vectors::VectorElementType;
     use crate::fixtures::index_fixtures::{TestRawScorerProducer, random_vector};
+    use crate::index::hnsw_index::graph::HnswGraph;
     use crate::index::hnsw_index::tests::{
         create_graph_layer_builder_fixture, create_graph_layer_fixture,
     };
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::CosineMetric;
     use crate::types::Distance;
-    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage};
+    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorageRead};
+
+    /// `preopen_universal` must schedule exactly the files `load_universal`
+    /// goes on to consume.
+    ///
+    /// Merely loading after a `preopen_universal` proves nothing: `CachedFs`
+    /// falls back to a plain inner open for any path that was never scheduled.
+    /// To make the prefetch pool the *only* possible source, the graph
+    /// directory is emptied between the two calls: the already-open handles
+    /// parked in the pool stay readable, while any fallback open hits
+    /// `NotFound`.
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain, GraphLinksResidency::Cold)]
+    #[case::compressed(GraphLinksFormat::Compressed, GraphLinksResidency::Cold)]
+    #[case::compressed_cached(GraphLinksFormat::Compressed, GraphLinksResidency::Cached)]
+    fn preopen_then_load_through_cached_fs(
+        #[case] format: GraphLinksFormat,
+        #[case] residency: GraphLinksResidency,
+    ) {
+        use common::universal_io::{CachedFs, CachedReadFs};
+
+        let num_vectors = 100;
+        let dim = 8;
+        let top = 5;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let dir = Builder::new().prefix("graph_preopen").tempdir().unwrap();
+
+        let (vector_holder, graph_layers_builder) = create_graph_layer_builder_fixture(
+            num_vectors,
+            M,
+            dim,
+            false,
+            false,
+            Distance::Cosine,
+            &mut rng,
+        );
+        let graph_links_vectors = vector_holder.graph_links_vectors();
+        let graph = graph_layers_builder
+            .into_graph_layers(
+                dir.path(),
+                format.with_param_for_tests(graph_links_vectors.as_ref()),
+                false,
+            )
+            .unwrap();
+
+        let query = random_vector(&mut rng, dim);
+        let expected = search_in_graph(&query, top, &vector_holder, &graph);
+        drop(graph);
+
+        // Same order as the segment open path: snapshot, then preopen, then load.
+        let mut cached_fs = CachedFs::new(MmapFs, dir.path()).unwrap();
+        cached_fs.cache_file_info().unwrap();
+        HnswGraph::<MmapFile>::preopen_universal(&cached_fs, dir.path(), residency).unwrap();
+        futures::executor::block_on(cached_fs.wait_all());
+
+        // Everything `load_universal` reads must now come from the prefetch pool.
+        for entry in fs_err::read_dir(dir.path()).unwrap() {
+            fs_err::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        let graph = GraphLayers::load_universal(&cached_fs, dir.path(), residency).unwrap();
+        assert_eq!(
+            search_in_graph(&query, top, &vector_holder, &graph),
+            expected
+        );
+    }
 
     fn search_in_graph(
         query: &[VectorElementType],
@@ -735,7 +820,7 @@ mod tests {
         vector_storage: &TestRawScorerProducer,
         graph: &GraphLayers,
     ) -> Vec<ScoredPointOffset> {
-        let scorer = vector_storage.scorer(query.to_owned());
+        let mut scorer = vector_storage.scorer(query.to_owned());
 
         let ef = 16;
         graph
@@ -743,8 +828,8 @@ mod tests {
                 top,
                 ef,
                 SearchAlgorithm::Hnsw,
-                scorer,
-                None,
+                &mut scorer,
+                graph.unfiltered_entry_point(),
                 &DEFAULT_STOPPED,
             )
             .unwrap()
@@ -848,18 +933,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(graph1.links.format(), initial_format);
+        // The built graph must be mmap-backed, not pinned in heap.
+        assert_eq!(graph1.links.heap_size_bytes(), 0);
         let res1 = search_in_graph(&query, top, &vector_holder, &graph1);
         drop(graph1);
 
-        let graph2 = GraphLayers::load(dir.path(), false, compress).unwrap();
+        let graph2 = GraphLayers::load(dir.path(), GraphLinksResidency::Cached, compress).unwrap();
         if compress {
             assert_eq!(graph2.links.format(), GraphLinksFormat::Compressed);
         } else {
             assert_eq!(graph2.links.format(), initial_format);
         }
+        // `Cached` residency keeps the links in the page cache, not in heap.
+        assert_eq!(graph2.links.heap_size_bytes(), 0);
         let res2 = search_in_graph(&query, top, &vector_holder, &graph2);
 
         assert_eq!(res1, res2)
+    }
+
+    /// A freshly built graph must have the same, single-copy residency as one
+    /// loaded from disk: mmap-backed for both `on_disk` values, never pinned
+    /// in heap.
+    #[rstest]
+    fn test_built_graph_is_not_pinned(#[values(false, true)] on_disk: bool) {
+        let mut rng = StdRng::seed_from_u64(42);
+        let dir = Builder::new().prefix("graph_dir").tempdir().unwrap();
+
+        let (_vector_holder, graph_layers_builder) =
+            create_graph_layer_builder_fixture(100, M, 8, false, true, Distance::Cosine, &mut rng);
+        let graph = graph_layers_builder
+            .into_graph_layers(dir.path(), GraphLinksFormatParam::Compressed, on_disk)
+            .unwrap();
+        assert_eq!(graph.links.heap_size_bytes(), 0);
     }
 
     #[rstest]

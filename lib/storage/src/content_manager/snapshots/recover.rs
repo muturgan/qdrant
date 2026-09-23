@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use collection::collection::Collection;
-use collection::collection::payload_index_schema::{PAYLOAD_INDEX_CONFIG_FILE, PayloadIndexSchema};
+use collection::collection::payload_index_schema::PayloadIndexSchema;
 use collection::common::sha_256::hashes_equal;
 use collection::config::CollectionConfigInternal;
 use collection::operations::snapshot_ops::{SnapshotPriority, SnapshotRecover};
@@ -11,6 +13,7 @@ use collection::shards::replica_set::replica_set_state::{
 use collection::shards::shard::{PeerId, ShardId};
 use common::save_on_disk::SaveOnDisk;
 use fs_err::tokio as tokio_fs;
+use shard::files::PAYLOAD_INDEX_CONFIG_FILE;
 use shard::snapshots::snapshot_manifest::RecoveryType;
 
 use crate::content_manager::collection_meta_ops::{
@@ -32,7 +35,7 @@ pub async fn activate_shard(
         log::debug!(
             "Activating shard {} of collection {} with consensus",
             shard_id,
-            &collection.name()
+            collection.name()
         );
         toc.send_set_replica_state_proposal(
             collection.name().to_string(),
@@ -45,7 +48,7 @@ pub async fn activate_shard(
         log::debug!(
             "Activating shard {} of collection {} locally",
             shard_id,
-            &collection.name()
+            collection.name()
         );
         collection
             .set_shard_replica_state(*shard_id, peer_id, ReplicaState::Active, None)
@@ -125,6 +128,7 @@ async fn _do_recover_from_snapshot(
         location,
         // Default temporary path to storage dir, to allow faster recovery within the same volume
         &toc.optional_temp_or_storage_temp_path()?,
+        toc.snapshots_path(),
         checksum.is_some(),
     )
     .await?;
@@ -237,22 +241,32 @@ async fn _do_recover_from_snapshot(
         ReplicaState::Partial
     };
 
+    let local_states_before_recovery: HashMap<_, _> = state
+        .shards
+        .iter()
+        .filter_map(|(&shard_id, shard_info)| {
+            shard_info
+                .replicas
+                .get(&this_peer_id)
+                .copied()
+                .map(|replica_state| (shard_id, replica_state))
+        })
+        .collect();
+
     // Deactivate collection local shards during recovery
     for (shard_id, shard_info) in &state.shards {
         let local_shard_state = shard_info.replicas.get(&this_peer_id);
         match local_shard_state {
-            None => {} // Shard is not on this node, skip
-            Some(state) => {
-                if state != &recovery_state {
-                    toc.send_set_replica_state_proposal(
-                        collection_pass.to_string(),
-                        this_peer_id,
-                        *shard_id,
-                        recovery_state,
-                        None,
-                    )?;
-                }
+            Some(state) if state != &recovery_state => {
+                toc.send_set_replica_state_proposal(
+                    collection_pass.to_string(),
+                    this_peer_id,
+                    *shard_id,
+                    recovery_state,
+                    None,
+                )?;
             }
+            Some(_) | None => {} // Shard is not on this node, skip
         }
     }
 
@@ -283,6 +297,33 @@ async fn _do_recover_from_snapshot(
 
         if !recovered {
             log::debug!("Shard {shard_id} is not in snapshot");
+
+            // This peer may have been switched into recovery state before restore. If the snapshot
+            // does not contain local data for this shard, revert to previous state so the replica
+            // is not left stuck in `Partial`/`ManualRecovery`.
+            if let Some(previous_state) = local_states_before_recovery.get(shard_id).copied()
+                && previous_state != recovery_state
+            {
+                if toc.is_distributed() {
+                    toc.send_set_replica_state_proposal(
+                        collection_pass.to_string(),
+                        this_peer_id,
+                        *shard_id,
+                        previous_state,
+                        Some(recovery_state),
+                    )?;
+                } else {
+                    collection
+                        .set_shard_replica_state(
+                            *shard_id,
+                            this_peer_id,
+                            previous_state,
+                            Some(recovery_state),
+                        )
+                        .await?;
+                }
+            }
+
             continue;
         }
 

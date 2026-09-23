@@ -5,12 +5,12 @@ use rand::seq::IteratorRandom;
 
 use crate::data_types::vectors::VectorElementType;
 use crate::id_tracker::IdTracker;
-use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead};
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 pub type Error = Box<dyn error::Error>;
 
-pub fn sampler(rng: impl rand::Rng) -> impl Iterator<Item = f32> {
+pub fn sampler(rng: impl rand::RngExt) -> impl Iterator<Item = f32> {
     rng.sample_iter(rand::distr::StandardUniform)
 }
 
@@ -44,7 +44,7 @@ pub fn delete_random_vectors(
     id_tracker: &mut impl IdTracker,
     vectors: usize,
 ) -> Result<()> {
-    let offsets = (0..storage.total_vector_count() as _).choose_multiple(rng, vectors);
+    let offsets = (0..storage.total_vector_count() as _).sample(rng, vectors);
 
     for offset in offsets {
         storage.delete_vector(offset)?;

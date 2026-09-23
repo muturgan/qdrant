@@ -151,7 +151,11 @@ mod tests {
         let scored_points = rrf_scoring(responses, DEFAULT_RRF_K, None).unwrap();
         assert_eq!(scored_points.len(), 4);
         // assert that the list is sorted
-        assert!(scored_points.windows(2).all(|w| w[0].score >= w[1].score));
+        assert!(
+            scored_points
+                .array_windows()
+                .all(|[a, b]| a.score >= b.score),
+        );
 
         assert_eq!(scored_points.len(), 4);
         assert_eq!(scored_points[0].id, 1.into());
@@ -191,7 +195,7 @@ mod tests {
         // - Being at pos 0 in low-weight source still gives full 1/k score
         // So the weighted RRF favors items that rank well across sources,
         // with higher-weight sources having their position penalties reduced.
-        assert!(scored_points[0].id == 2.into());
+        assert_eq!(scored_points[0].id, 2.into());
         assert!(scored_points[0].score > scored_points[1].score);
     }
 

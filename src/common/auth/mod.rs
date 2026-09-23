@@ -1,10 +1,15 @@
+use std::fmt::Display;
 use std::sync::Arc;
 
+pub use api::HTTP_HEADER_API_KEY;
+use chrono::Utc;
+use collection::operations::routing::RoutingToken;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::types::{WithPayloadInterface, WithVector};
 use shard::scroll::ScrollRequestInternal;
+use storage::audit::{AuditEvent, AuditResult, audit_log, is_audit_enabled};
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::rbac::Access;
@@ -20,8 +25,6 @@ pub mod jwt_parser;
 // Re-export Auth and AuthType from storage crate.
 pub use storage::rbac::AuthType;
 pub use storage::rbac::auth::Auth;
-
-pub const HTTP_HEADER_API_KEY: &str = "api-key";
 
 /// The API keys used for auth
 #[derive(Clone)]
@@ -52,6 +55,40 @@ pub enum AuthError {
     StorageError(StorageError),
 }
 
+impl Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
+            AuthError::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            AuthError::StorageError(e) => write!(f, "Storage error: {e}"),
+        }
+    }
+}
+
+/// Log a denied authentication attempt to the audit log when audit is enabled.
+/// Used by both REST (actix) and gRPC (tonic) auth middlewares.
+pub fn log_denied_auth(
+    api: &str,
+    remote: Option<String>,
+    tracing_id: Option<String>,
+    error: &AuthError,
+) {
+    if is_audit_enabled() {
+        audit_log(AuditEvent {
+            timestamp: Utc::now(),
+            method: None,
+            api: Some(api.to_string()),
+            auth_type: AuthType::None,
+            subject: None,
+            remote,
+            collection: None,
+            tracing_id,
+            result: AuditResult::Denied,
+            error: Some(error.to_string()),
+        });
+    }
+}
+
 impl AuthKeys {
     fn get_jwt_parser(service_config: &ServiceConfig) -> (Option<JwtParser>, Option<JwtParser>) {
         if service_config.jwt_rbac.unwrap_or_default() {
@@ -59,10 +96,12 @@ impl AuthKeys {
                 service_config
                     .api_key
                     .as_ref()
+                    .filter(|s| !s.is_empty())
                     .map(|secret| JwtParser::new(secret)),
                 service_config
                     .alt_api_key
                     .as_ref()
+                    .filter(|s| !s.is_empty())
                     .map(|secret| JwtParser::new(secret)),
             )
         } else {
@@ -74,10 +113,11 @@ impl AuthKeys {
     ///
     /// Returns None if no scheme is specified.
     pub fn try_create(service_config: &ServiceConfig, toc: Arc<TableOfContent>) -> Option<Self> {
+        let non_empty = |k: Option<String>| k.filter(|k| !k.is_empty());
         match (
-            service_config.api_key.clone(),
-            service_config.alt_api_key.clone(),
-            service_config.read_only_api_key.clone(),
+            non_empty(service_config.api_key.clone()),
+            non_empty(service_config.alt_api_key.clone()),
+            non_empty(service_config.read_only_api_key.clone()),
         ) {
             (None, None, None) => None,
             (read_write, alt_read_write, read_only) => {
@@ -146,7 +186,23 @@ impl AuthKeys {
             } = claims;
 
             if let Some(value_exists) = value_exists {
-                self.validate_value_exists(&value_exists).await?;
+                // Route the stateful existence check with the caller's routing token
+                // (the same header used for their reads) so it lands on the same replica
+                // and stays consistent with what those reads see. Seeding from the claim
+                // instead would be useless when claims are shared across tokens — it would
+                // pin every validation to a single replica.
+                let routing_token = get_header(api::HTTP_HEADER_ROUTING_TOKEN)
+                    .filter(|token| !token.is_empty())
+                    .map(|token| RoutingToken::from_bytes(token.as_bytes()));
+
+                self.validate_value_exists(&value_exists, routing_token)
+                    .await?;
+            }
+
+            if blacklist_matches {
+                return Err(AuthError::Forbidden(
+                    "This path is blacklisted by config".to_string(),
+                ));
             }
 
             if blacklist_matches {
@@ -169,7 +225,11 @@ impl AuthKeys {
         ))
     }
 
-    async fn validate_value_exists(&self, value_exists: &ValueExists) -> Result<(), AuthError> {
+    async fn validate_value_exists(
+        &self,
+        value_exists: &ValueExists,
+        routing_token: Option<RoutingToken>,
+    ) -> Result<(), AuthError> {
         let scroll_req = ScrollRequestInternal {
             offset: None,
             limit: Some(1),
@@ -185,22 +245,21 @@ impl AuthKeys {
                 value_exists.get_collection(),
                 scroll_req,
                 None,
+                routing_token,
                 None, // no timeout
                 ShardSelectorInternal::All,
-                Auth::new(
-                    Access::full("JWT stateful validation"),
-                    None,
-                    None,
-                    AuthType::Internal,
-                ),
+                Auth::new_internal(Access::full("JWT stateful validation")),
                 HwMeasurementAcc::disposable(),
             )
             .await
-            .map_err(|e| match e {
-                StorageError::NotFound { .. } => {
-                    AuthError::Forbidden("Invalid JWT, stateful validation failed".to_string())
+            .map_err(|e| {
+                #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
+                match e {
+                    StorageError::NotFound { .. } => {
+                        AuthError::Forbidden("Invalid JWT, stateful validation failed".to_string())
+                    }
+                    _ => AuthError::StorageError(e),
                 }
-                _ => AuthError::StorageError(e),
             })?;
 
         if res.points.is_empty() {
@@ -232,5 +291,88 @@ impl AuthKeys {
             .as_ref()
             .is_some_and(|alt_rw_key| ct_eq(alt_rw_key, key));
         can_write || alt_can_write
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use collection::shards::channel_service::ChannelService;
+    use common::budget::ResourceBudget;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::settings::Settings;
+
+    /// Service config from the bundled defaults, with the given API keys set.
+    fn config(api_key: Option<&str>, alt: Option<&str>, read_only: Option<&str>) -> ServiceConfig {
+        let mut cfg = Settings::new(None).unwrap().service;
+        cfg.api_key = api_key.map(String::from);
+        cfg.alt_api_key = alt.map(String::from);
+        cfg.read_only_api_key = read_only.map(String::from);
+        cfg
+    }
+
+    /// An empty, temp-dir backed `TableOfContent`. `try_create` only stores it,
+    /// so this is enough to exercise key parsing. `TempDir` must outlive `toc`.
+    fn test_toc() -> (Arc<TableOfContent>, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Settings::new(None).unwrap().storage;
+        cfg.storage_path = dir.path().to_path_buf();
+        cfg.snapshots_path = dir.path().join("snapshots");
+        cfg.temp_path = None;
+        let toc = TableOfContent::new(
+            &cfg,
+            ResourceBudget::default(),
+            ChannelService::new(6333, false, None, None),
+            0,
+            None,
+        )
+        .unwrap();
+        (Arc::new(toc), dir)
+    }
+
+    #[test]
+    fn empty_api_keys_are_treated_as_unset() {
+        let (toc, _dir) = test_toc();
+        for cfg in [
+            config(Some(""), None, None),
+            config(None, None, Some("")),
+            config(Some(""), Some(""), Some("")),
+        ] {
+            assert!(AuthKeys::try_create(&cfg, toc.clone()).is_none());
+        }
+    }
+
+    #[test]
+    fn single_char_api_keys_are_used() {
+        let (toc, _dir) = test_toc();
+
+        let rw = AuthKeys::try_create(&config(Some("x"), None, None), toc.clone()).unwrap();
+        assert!(rw.can_write("x"));
+        assert!(!rw.can_write(""));
+        assert!(!rw.can_write("y"));
+
+        let ro = AuthKeys::try_create(&config(None, None, Some("r")), toc).unwrap();
+        assert!(ro.can_read("r"));
+        assert!(!ro.can_read(""));
+        assert!(!ro.can_write("r"));
+    }
+
+    #[test]
+    fn empty_jwt_secret_is_treated_as_unset() {
+        let mut cfg = config(Some(""), Some(""), None);
+        cfg.jwt_rbac = Some(true);
+        let (parser, alt_parser) = AuthKeys::get_jwt_parser(&cfg);
+        assert!(parser.is_none());
+        assert!(alt_parser.is_none());
+    }
+
+    #[test]
+    fn single_char_jwt_secret_is_used() {
+        let mut cfg = config(Some("x"), None, None);
+        cfg.jwt_rbac = Some(true);
+        let (parser, alt_parser) = AuthKeys::get_jwt_parser(&cfg);
+        assert!(parser.is_some());
+        assert!(alt_parser.is_none());
     }
 }

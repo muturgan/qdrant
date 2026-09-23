@@ -70,7 +70,7 @@ pub struct SnapshotRecover {
 
     /// Defines which data should be used as a source of truth if there are other replicas in the cluster.
     /// If set to `Snapshot`, the snapshot will be used as a source of truth, and the current state will be overwritten.
-    /// If set to `Replica`, the current state will be used as a source of truth, and after recovery if will be synchronized with the snapshot.
+    /// If set to `Replica`, the current state will be used as a source of truth, and after recovery it will be synchronized from other replicas.
     #[serde(default)]
     pub priority: Option<SnapshotPriority>,
 
@@ -105,11 +105,18 @@ pub struct SnapshotDescription {
 
 impl From<SnapshotDescription> for api::grpc::qdrant::SnapshotDescription {
     fn from(value: SnapshotDescription) -> Self {
+        let SnapshotDescription {
+            name,
+            creation_time,
+            size,
+            checksum,
+        } = value;
+
         Self {
-            name: value.name,
-            creation_time: value.creation_time.map(naive_date_time_to_proto),
-            size: value.size as i64,
-            checksum: value.checksum,
+            name,
+            creation_time: creation_time.map(naive_date_time_to_proto),
+            size: size as i64,
+            checksum,
         }
     }
 }
@@ -149,7 +156,7 @@ pub fn get_checksum_path(snapshot_path: impl Into<PathBuf>) -> PathBuf {
     checksum_path.into()
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, Validate)]
 pub struct ShardSnapshotRecover {
     pub location: ShardSnapshotLocation,
 

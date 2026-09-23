@@ -5,16 +5,17 @@ use ::common::tempfile_ext::MaybeTempPath;
 use actix_multipart::form::MultipartForm;
 use actix_multipart::form::tempfile::TempFile;
 use actix_web::{Responder, Result, delete, get, post, put, web};
+use actix_web_validator as valid;
 use collection::common::file_utils::move_file;
 use collection::common::sha_256;
 use collection::common::snapshot_stream::SnapshotStream;
 use collection::operations::snapshot_ops::{
-    ShardSnapshotRecover, SnapshotPriority, SnapshotRecover,
+    ShardSnapshotLocation, ShardSnapshotRecover, SnapshotPriority, SnapshotRecover,
 };
 use collection::operations::types::CollectionError;
 use collection::operations::verification::new_unchecked_verification_pass;
-use collection::shards::shard::ShardId;
 use collection::shards::shard_holder::shard_not_found_error;
+use fs_err as fs;
 use fs_err::tokio as tokio_fs;
 use futures::{FutureExt as _, StreamExt as _, TryFutureExt as _};
 use reqwest::Url;
@@ -35,16 +36,19 @@ use storage::rbac::AccessRequirements;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use validator::Validate;
-use {actix_web_validator as valid, fs_err as fs};
 
-use super::{CollectionPath, StrictCollectionPath};
-use crate::actix::auth::ActixAuth;
+use super::{
+    CollectionPath, CollectionShardPath, CollectionShardSnapshotPath, CollectionSnapshotPath,
+    StrictCollectionPath,
+};
+use crate::actix::auth::{ActixAccessManage, ActixAuth};
 use crate::actix::helpers::{self, HttpError};
 use crate::common;
 use crate::common::auth::Auth;
 use crate::common::collections::*;
 use crate::common::http_client::HttpClient;
 use crate::common::snapshots::try_take_partial_snapshot_recovery_lock;
+use crate::settings::ServiceConfig;
 
 #[derive(Deserialize, Serialize, JsonSchema, Validate)]
 pub struct SnapshotUploadingParam {
@@ -145,10 +149,10 @@ pub async fn do_get_snapshot(
     Ok(snapshot_stream)
 }
 
-#[get("/collections/{name}/snapshots")]
+#[get("/collections/{collection_name}/snapshots")]
 async fn list_snapshots(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<String>,
+    collection: valid::Path<CollectionPath>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // Nothing to verify.
@@ -157,22 +161,22 @@ async fn list_snapshots(
     helpers::time(do_list_snapshots(
         dispatcher.toc(&auth, &pass),
         &auth,
-        &path,
+        &collection.collection_name,
     ))
     .await
 }
 
-#[post("/collections/{name}/snapshots")]
+#[post("/collections/{collection_name}/snapshots")]
 async fn create_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<String>,
+    collection: valid::Path<CollectionPath>,
     params: valid::Query<SnapshottingParam>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // Nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let collection_name = path.into_inner();
+    let collection_name = collection.into_inner().collection_name;
 
     let future = async move {
         do_create_snapshot(
@@ -186,15 +190,19 @@ async fn create_snapshot(
     helpers::time_or_accept(future, params.wait.unwrap_or(true)).await
 }
 
-#[post("/collections/{name}/snapshots/upload")]
+#[post("/collections/{collection_name}/snapshots/upload")]
 async fn upload_snapshot(
+    // NOTE: this extractor must come *before* `MultipartForm` so that
+    // unauthorized requests are rejected before the body is spooled to disk
+    // (GHSA-3v92-w72v-j994).
+    early_auth: ActixAccessManage,
     dispatcher: web::Data<Dispatcher>,
     http_client: web::Data<HttpClient>,
     collection: valid::Path<StrictCollectionPath>,
     MultipartForm(form): MultipartForm<SnapshottingForm>,
     params: valid::Query<SnapshotUploadingParam>,
-    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
+    let auth = early_auth.auth;
     let wait = params.wait;
 
     // Nothing to verify.
@@ -203,8 +211,6 @@ async fn upload_snapshot(
     let future = async move {
         let snapshot = form.snapshot;
 
-        auth.check_global_access(AccessRequirements::new().manage(), "upload_snapshot")?;
-
         if let Some(checksum) = &params.checksum {
             let snapshot_checksum = sha_256::hash_file(snapshot.file.path()).await?;
             if !sha_256::hashes_equal(&snapshot_checksum, checksum) {
@@ -212,9 +218,12 @@ async fn upload_snapshot(
             }
         }
 
-        let snapshot_location =
-            do_save_uploaded_snapshot(dispatcher.toc(&auth, &pass), &collection.name, snapshot)
-                .await?;
+        let snapshot_location = do_save_uploaded_snapshot(
+            dispatcher.toc(&auth, &pass),
+            &collection.collection_name,
+            snapshot,
+        )
+        .await?;
 
         // Snapshot is a local file, we do not need an API key for that
         let http_client = http_client.client(None)?;
@@ -228,7 +237,7 @@ async fn upload_snapshot(
 
         do_recover_from_snapshot(
             dispatcher.get_ref(),
-            &collection.name,
+            &collection.collection_name,
             snapshot_recover,
             auth,
             http_client,
@@ -239,10 +248,11 @@ async fn upload_snapshot(
     helpers::time_or_accept(future, wait.unwrap_or(true)).await
 }
 
-#[put("/collections/{name}/snapshots/recover")]
+#[put("/collections/{collection_name}/snapshots/recover")]
 async fn recover_from_snapshot(
     dispatcher: web::Data<Dispatcher>,
     http_client: web::Data<HttpClient>,
+    service_config: web::Data<ServiceConfig>,
     collection: valid::Path<CollectionPath>,
     request: valid::Json<SnapshotRecover>,
     params: valid::Query<SnapshottingParam>,
@@ -250,11 +260,20 @@ async fn recover_from_snapshot(
 ) -> impl Responder {
     let future = async move {
         let snapshot_recover = request.into_inner();
+
+        if !service_config.enable_snapshot_url_recovery
+            && matches!(snapshot_recover.location.scheme(), "http" | "https")
+        {
+            return Err(StorageError::forbidden(
+                "Snapshot recovery from remote URLs is disabled in the configuration",
+            ));
+        }
+
         let http_client = http_client.client(snapshot_recover.api_key.as_deref())?;
 
         do_recover_from_snapshot(
             dispatcher.get_ref(),
-            &collection.name,
+            &collection.collection_name,
             snapshot_recover,
             auth,
             http_client,
@@ -265,16 +284,19 @@ async fn recover_from_snapshot(
     helpers::time_or_accept(future, params.wait.unwrap_or(true)).await
 }
 
-#[get("/collections/{name}/snapshots/{snapshot_name}")]
+#[get("/collections/{collection_name}/snapshots/{snapshot_name}")]
 async fn get_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, String)>,
+    path: valid::Path<CollectionSnapshotPath>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // Nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection_name, snapshot_name) = path.into_inner();
+    let CollectionSnapshotPath {
+        collection_name,
+        snapshot_name,
+    } = path.into_inner();
     do_get_snapshot(
         dispatcher.toc(&auth, &pass),
         &auth,
@@ -333,15 +355,18 @@ async fn delete_full_snapshot(
     helpers::time_or_accept(future, params.wait.unwrap_or(true)).await
 }
 
-#[delete("/collections/{name}/snapshots/{snapshot_name}")]
+#[delete("/collections/{collection_name}/snapshots/{snapshot_name}")]
 async fn delete_collection_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, String)>,
+    path: valid::Path<CollectionSnapshotPath>,
     params: valid::Query<SnapshottingParam>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let future = async move {
-        let (collection_name, snapshot_name) = path.into_inner();
+        let CollectionSnapshotPath {
+            collection_name,
+            snapshot_name,
+        } = path.into_inner();
 
         do_delete_collection_snapshot(dispatcher.get_ref(), auth, &collection_name, &snapshot_name)
             .await
@@ -350,21 +375,24 @@ async fn delete_collection_snapshot(
     helpers::time_or_accept(future, params.wait.unwrap_or(true)).await
 }
 
-#[get("/collections/{collection}/shards/{shard}/snapshots")]
+#[get("/collections/{collection_name}/shards/{shard}/snapshots")]
 async fn list_shard_snapshots(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
+    path: valid::Path<CollectionShardPath>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name,
+        shard,
+    } = path.into_inner();
 
     let future = common::snapshots::list_shard_snapshots(
         dispatcher.toc(&auth, &pass).clone(),
         &auth,
-        collection,
+        collection_name,
         shard,
     )
     .map_err(Into::into);
@@ -372,22 +400,25 @@ async fn list_shard_snapshots(
     helpers::time(future).await
 }
 
-#[post("/collections/{collection}/shards/{shard}/snapshots")]
+#[post("/collections/{collection_name}/shards/{shard}/snapshots")]
 async fn create_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
+    path: valid::Path<CollectionShardPath>,
     query: web::Query<SnapshottingParam>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name,
+        shard,
+    } = path.into_inner();
     let future = async move {
         common::snapshots::create_shard_snapshot(
             dispatcher.toc(&auth, &pass).clone(),
             &auth,
-            collection,
+            collection_name,
             shard,
         )
         .await
@@ -396,20 +427,23 @@ async fn create_shard_snapshot(
     helpers::time_or_accept(future, query.wait.unwrap_or(true)).await
 }
 
-#[get("/collections/{collection}/shards/{shard}/snapshot")]
+#[get("/collections/{collection_name}/shards/{shard}/snapshot")]
 async fn stream_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
+    path: valid::Path<CollectionShardPath>,
     ActixAuth(auth): ActixAuth,
 ) -> Result<SnapshotStream, HttpError> {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name,
+        shard,
+    } = path.into_inner();
     Ok(common::snapshots::stream_shard_snapshot(
         dispatcher.toc(&auth, &pass).clone(),
         &auth,
-        collection,
+        collection_name,
         shard,
         None,
     )
@@ -417,20 +451,33 @@ async fn stream_shard_snapshot(
 }
 
 // TODO: `PUT` (same as `recover_from_snapshot`) or `POST`!?
-#[put("/collections/{collection}/shards/{shard}/snapshots/recover")]
+#[put("/collections/{collection_name}/shards/{shard}/snapshots/recover")]
 async fn recover_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
     http_client: web::Data<HttpClient>,
-    path: web::Path<(String, ShardId)>,
+    service_config: web::Data<ServiceConfig>,
+    path: valid::Path<CollectionShardPath>,
     query: web::Query<SnapshottingParam>,
-    web::Json(request): web::Json<ShardSnapshotRecover>,
+    valid::Json(request): valid::Json<ShardSnapshotRecover>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
     let future = async move {
-        let (collection, shard) = path.into_inner();
+        if !service_config.enable_snapshot_url_recovery
+            && let ShardSnapshotLocation::Url(url) = &request.location
+            && matches!(url.scheme(), "http" | "https")
+        {
+            return Err(StorageError::forbidden(
+                "Snapshot recovery from remote URLs is disabled in the configuration",
+            ));
+        }
+
+        let CollectionShardPath {
+            collection_name: collection,
+            shard,
+        } = path.into_inner();
 
         common::snapshots::recover_shard_snapshot(
             dispatcher.toc(&auth, &pass).clone(),
@@ -452,18 +499,25 @@ async fn recover_shard_snapshot(
 }
 
 // TODO: `POST` (same as `upload_snapshot`) or `PUT`!?
-#[post("/collections/{collection}/shards/{shard}/snapshots/upload")]
+#[post("/collections/{collection_name}/shards/{shard}/snapshots/upload")]
 async fn upload_shard_snapshot(
+    // NOTE: this extractor must come *before* `MultipartForm` so that
+    // unauthorized requests are rejected before the body is spooled to disk
+    // (GHSA-3v92-w72v-j994).
+    early_auth: ActixAccessManage,
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
-    query: web::Query<SnapshotUploadingParam>,
+    path: valid::Path<CollectionShardPath>,
+    query: valid::Query<SnapshotUploadingParam>,
     MultipartForm(form): MultipartForm<SnapshottingForm>,
-    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
+    let ActixAccessManage { auth, multipass } = early_auth;
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name: collection,
+        shard,
+    } = path.into_inner();
     let SnapshotUploadingParam {
         wait,
         priority,
@@ -474,10 +528,7 @@ async fn upload_shard_snapshot(
     //   - but the task is *spawned* on the runtime and won't be cancelled, if request is cancelled
 
     let future = cancel::future::spawn_cancel_on_drop(async move |cancel| {
-        // TODO: Run this check before the multipart blob is uploaded
-        let collection_pass = auth
-            .check_global_access(AccessRequirements::new().manage(), "upload_shard_snapshot")?
-            .issue_pass(&collection);
+        let collection_pass = multipass.issue_pass(&collection);
 
         let cancel_safe = async {
             if let Some(checksum) = checksum {
@@ -509,6 +560,8 @@ async fn upload_shard_snapshot(
             snapshot_data,
             priority.unwrap_or_default(),
             RecoveryType::Full,
+            // Direct API recovery is not tracked as a transfer-side recovery
+            None,
             cancel,
         )
         .await?;
@@ -520,16 +573,20 @@ async fn upload_shard_snapshot(
     helpers::time_or_accept(future, wait.unwrap_or(true)).await
 }
 
-#[get("/collections/{collection}/shards/{shard}/snapshots/{snapshot}")]
+#[get("/collections/{collection_name}/shards/{shard}/snapshots/{snapshot}")]
 async fn download_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId, String)>,
+    path: valid::Path<CollectionShardSnapshotPath>,
     ActixAuth(auth): ActixAuth,
 ) -> Result<impl Responder, HttpError> {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard, snapshot) = path.into_inner();
+    let CollectionShardSnapshotPath {
+        collection_name: collection,
+        shard,
+        snapshot,
+    } = path.into_inner();
     let collection_pass = auth.check_collection_access(
         &collection,
         AccessRequirements::new().extras(),
@@ -552,17 +609,21 @@ async fn download_shard_snapshot(
     Ok(snapshot_stream)
 }
 
-#[delete("/collections/{collection}/shards/{shard}/snapshots/{snapshot}")]
+#[delete("/collections/{collection_name}/shards/{shard}/snapshots/{snapshot}")]
 async fn delete_shard_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId, String)>,
+    path: valid::Path<CollectionShardSnapshotPath>,
     query: web::Query<SnapshottingParam>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     // nothing to verify.
     let pass = new_unchecked_verification_pass();
 
-    let (collection, shard, snapshot) = path.into_inner();
+    let CollectionShardSnapshotPath {
+        collection_name: collection,
+        shard,
+        snapshot,
+    } = path.into_inner();
     let future = async move {
         common::snapshots::delete_shard_snapshot(
             dispatcher.toc(&auth, &pass).clone(),
@@ -578,14 +639,17 @@ async fn delete_shard_snapshot(
     helpers::time_or_accept(future, query.wait.unwrap_or(true)).await
 }
 
-#[post("/collections/{collection}/shards/{shard}/snapshot/partial/create")]
+#[post("/collections/{collection_name}/shards/{shard}/snapshot/partial/create")]
 async fn create_partial_snapshot(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
+    path: valid::Path<CollectionShardPath>,
     manifest: web::Json<SnapshotManifest>,
     ActixAuth(auth): ActixAuth,
 ) -> Result<SnapshotStream, HttpError> {
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name: collection,
+        shard,
+    } = path.into_inner();
     let manifest = manifest.into_inner();
 
     // nothing to verify.
@@ -603,15 +667,22 @@ async fn create_partial_snapshot(
     Ok(snapshot_stream)
 }
 
-#[post("/collections/{collection}/shards/{shard}/snapshot/partial/recover")]
+#[post("/collections/{collection_name}/shards/{shard}/snapshot/partial/recover")]
 async fn recover_partial_snapshot(
+    // NOTE: this extractor must come *before* `MultipartForm` so that
+    // unauthorized requests are rejected before the body is spooled to disk
+    // (GHSA-3v92-w72v-j994).
+    early_auth: ActixAccessManage,
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
-    query: web::Query<SnapshotUploadingParam>,
+    path: valid::Path<CollectionShardPath>,
+    query: valid::Query<SnapshotUploadingParam>,
     MultipartForm(form): MultipartForm<SnapshottingForm>,
-    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
-    let (collection, shard) = path.into_inner();
+    let ActixAccessManage { auth, multipass } = early_auth;
+    let CollectionShardPath {
+        collection_name: collection,
+        shard,
+    } = path.into_inner();
 
     let SnapshotUploadingParam {
         wait,
@@ -640,13 +711,7 @@ async fn recover_partial_snapshot(
     let future = cancel::future::spawn_cancel_on_drop(async move |cancel| {
         let _recovery_lock = recovery_lock;
 
-        // TODO: Run this check before the multipart blob is uploaded
-        let collection_pass = auth
-            .check_global_access(
-                AccessRequirements::new().manage(),
-                "recover_partial_snapshot",
-            )?
-            .issue_pass(&collection);
+        let collection_pass = multipass.issue_pass(&collection);
 
         let cancel_safe = async {
             if let Some(checksum) = checksum {
@@ -678,6 +743,8 @@ async fn recover_partial_snapshot(
             snapshot_data,
             priority.unwrap_or_default(),
             RecoveryType::Partial,
+            // Direct API recovery is not tracked as a transfer-side recovery
+            None,
             cancel,
         )
         .await?;
@@ -695,18 +762,33 @@ pub struct PartialSnapshotRecoverFrom {
     api_key: Option<String>,
 }
 
-#[post("/collections/{collection}/shards/{shard}/snapshot/partial/recover_from")]
+#[post("/collections/{collection_name}/shards/{shard}/snapshot/partial/recover_from")]
 async fn recover_partial_snapshot_from(
     dispatcher: web::Data<Dispatcher>,
     http_client: web::Data<HttpClient>,
-    path: web::Path<(String, ShardId)>,
+    service_config: web::Data<ServiceConfig>,
+    path: valid::Path<CollectionShardPath>,
     query: web::Query<SnapshottingParam>,
     web::Json(request): web::Json<PartialSnapshotRecoverFrom>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
-    let (collection_name, shard_id) = path.into_inner();
+    let CollectionShardPath {
+        collection_name,
+        shard: shard_id,
+    } = path.into_inner();
     let PartialSnapshotRecoverFrom { peer_url, api_key } = request;
     let SnapshottingParam { wait } = query.into_inner();
+
+    if !service_config.enable_snapshot_url_recovery && matches!(peer_url.scheme(), "http" | "https")
+    {
+        return helpers::process_response_error(
+            StorageError::forbidden(
+                "Snapshot recovery from remote URLs is disabled in the configuration",
+            ),
+            tokio::time::Instant::now(),
+            None,
+        );
+    }
 
     // nothing to verify
     let pass = new_unchecked_verification_pass();
@@ -841,6 +923,8 @@ async fn recover_partial_snapshot_from(
             snapshot_data,
             SnapshotPriority::NoSync,
             RecoveryType::Partial,
+            // Direct API recovery is not tracked as a transfer-side recovery
+            None,
             cancel,
         )
         .await?;
@@ -852,13 +936,16 @@ async fn recover_partial_snapshot_from(
     helpers::time_or_accept(future, wait.unwrap_or(true)).await
 }
 
-#[get("/collections/{collection}/shards/{shard}/snapshot/partial/manifest")]
+#[get("/collections/{collection_name}/shards/{shard}/snapshot/partial/manifest")]
 async fn get_partial_snapshot_manifest(
     dispatcher: web::Data<Dispatcher>,
-    path: web::Path<(String, ShardId)>,
+    path: valid::Path<CollectionShardPath>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
-    let (collection, shard) = path.into_inner();
+    let CollectionShardPath {
+        collection_name: collection,
+        shard,
+    } = path.into_inner();
     let pass = new_unchecked_verification_pass();
 
     let future = async move {

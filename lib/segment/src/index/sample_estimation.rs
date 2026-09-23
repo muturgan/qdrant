@@ -1,22 +1,10 @@
-use std::cmp::{max, min};
-
 use common::types::PointOffsetType;
+
+use crate::common::operation_error::OperationResult;
 
 const MAX_ESTIMATED_POINTS: usize = 1000;
 
-/// How many points do we need to check in order to estimate expected query cardinality.
-/// Based on <https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval>
-#[allow(dead_code)]
-fn estimate_required_sample_size(total: usize, confidence_interval: usize) -> usize {
-    let confidence_interval = min(confidence_interval, total);
-    let z = 1.96; // percentile 0.95 of normal distribution
-    let index_fraction = confidence_interval as f64 / total as f64 / 2.0;
-    let h = 0.5; // success rate which requires most number of estimations
-    let estimated_size = h * (1. - h) / (index_fraction / z).powi(2);
-    max(estimated_size as usize, 10)
-}
-
-/// Returns (expected cardinality ± confidence interval at 0.99)
+/// Returns (expected cardinality ± confidence interval at ~0.95, i.e. z = 2.0)
 /// Based on <https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Agresti%E2%80%93Coull_interval>
 fn confidence_agresti_coull_interval(trials: usize, positive: usize, total: usize) -> (i64, i64) {
     let z = 2.; // heuristics
@@ -33,17 +21,17 @@ fn confidence_agresti_coull_interval(trials: usize, positive: usize, total: usiz
 /// Iteratively samples points until the decision could be made with confidence
 pub fn sample_check_cardinality(
     sample_points: impl Iterator<Item = PointOffsetType>,
-    checker: impl Fn(PointOffsetType) -> bool,
+    checker: impl Fn(PointOffsetType) -> OperationResult<bool>,
     threshold: usize,
     total_points: usize,
-) -> bool {
+) -> OperationResult<bool> {
     let mut matched_points = 0;
     let mut total_checked = 0;
 
     let mut exp = 0;
     let mut interval;
     for idx in sample_points.take(MAX_ESTIMATED_POINTS) {
-        matched_points += usize::from(checker(idx));
+        matched_points += usize::from(checker(idx)?);
         total_checked += 1;
 
         let estimation =
@@ -52,21 +40,21 @@ pub fn sample_check_cardinality(
         interval = estimation.1;
 
         if exp - interval > threshold as i64 {
-            return true;
+            return Ok(true);
         }
 
         if exp + interval < threshold as i64 {
-            return false;
+            return Ok(false);
         }
     }
 
-    exp > threshold as i64
+    Ok(exp > threshold as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     use super::*;
 
@@ -95,10 +83,11 @@ mod tests {
     fn test_sample_check_cardinality() {
         let res = sample_check_cardinality(
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].into_iter(),
-            |idx| idx % 2 == 0,
+            |idx| Ok(idx % 2 == 0),
             10_000,
             100_000,
-        );
+        )
+        .unwrap();
 
         assert!(res)
     }

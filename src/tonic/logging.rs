@@ -1,11 +1,15 @@
 use std::task::{Context, Poll};
 
+use api::grpc::qdrant::storage_read_server;
 use futures_util::future::BoxFuture;
 use tonic::Code;
-use tonic::body::BoxBody;
-use tonic::codegen::http::Response;
 use tower::Service;
 use tower_layer::Layer;
+
+/// Service component of a gRPC request path (`/{package.Service}/{Method}`).
+fn service_name(method_name: &str) -> Option<&str> {
+    method_name.strip_prefix('/')?.split('/').next()
+}
 
 #[derive(Clone)]
 pub struct LoggingMiddleware<T> {
@@ -21,11 +25,11 @@ impl LoggingMiddlewareLayer {
     }
 }
 
-impl<S> Service<tonic::codegen::http::Request<tonic::transport::Body>> for LoggingMiddleware<S>
+impl<S, ReqBody, RespBody> Service<http::Request<ReqBody>> for LoggingMiddleware<S>
 where
-    S: Service<tonic::codegen::http::Request<tonic::transport::Body>, Response = Response<BoxBody>>
-        + Clone,
+    S: Service<http::Request<ReqBody>, Response = http::Response<RespBody>> + Clone,
     S::Future: Send + 'static,
+    ReqBody: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -35,10 +39,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(
-        &mut self,
-        request: tonic::codegen::http::Request<tonic::transport::Body>,
-    ) -> Self::Future {
+    fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
@@ -64,6 +65,22 @@ where
                                 // cluster mode generates a large amount of `stream error received: stream no longer needed`
                                 log::trace!("gRPC cancelled {method_name} {elapsed_sec:.6}");
                             }
+                            // A read-only follower routinely probes files that are created
+                            // lazily by the writer (e.g. the mutable id tracker's mappings and
+                            // versions), so a StorageRead not-found is expected traffic, not a
+                            // client error worth INFO.
+                            Code::NotFound
+                                if service_name(&method_name)
+                                    == Some(storage_read_server::SERVICE_NAME) =>
+                            {
+                                log::debug!(
+                                    "gRPC {} failed with {} {:?} {:.6}",
+                                    method_name,
+                                    grpc_status.code(),
+                                    grpc_status.message(),
+                                    elapsed_sec,
+                                );
+                            }
                             Code::DeadlineExceeded
                             | Code::Aborted
                             | Code::OutOfRange
@@ -80,6 +97,18 @@ where
                                     grpc_status.code(),
                                     grpc_status.message(),
                                     elapsed_sec,
+                                );
+                            }
+                            // A client dropping a unary call between HEADERS and DATA
+                            // surfaces as this internal error rather than `Cancelled`,
+                            // because hyper 1.x hides stream resets during request body
+                            // read (hyperium/hyper#3681). Cluster mode generates these
+                            // routinely by cancelling fanned-out read requests.
+                            Code::Internal
+                                if grpc_status.message() == "Missing request message." =>
+                            {
+                                log::trace!(
+                                    "gRPC cancelled before request message {method_name} {elapsed_sec:.6}"
                                 );
                             }
                             Code::Internal

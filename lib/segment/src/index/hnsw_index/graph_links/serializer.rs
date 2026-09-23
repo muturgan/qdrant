@@ -70,7 +70,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
     let mut total_offsets_len = 0;
     {
         let mut suffix_sum = point_count_by_level.iter().sum::<u64>();
-        for &value in point_count_by_level.iter() {
+        for &value in &point_count_by_level {
             writer.write_all(total_offsets_len.as_bytes())?;
             total_offsets_len += suffix_sum;
             suffix_sum -= value;
@@ -127,12 +127,14 @@ pub fn serialize_graph_links<W: Write + Seek>(
 
                     // 1. Base vector (`B` in the doc, only on level 0).
                     if level == 0 {
-                        let vector = vectors.get_base_vector(id)?;
-                        if vector.len() != vectors_layout.base.size() {
-                            return Err(OperationError::service_error("Vector size mismatch"));
-                        }
-                        writer.write_all(vector)?;
-                        offset += vector.len();
+                        vectors.for_base_vector(id, &mut |vector_bytes| {
+                            if vector_bytes.len() != vectors_layout.base.size() {
+                                return Err(OperationError::service_error("Vector size mismatch"));
+                            }
+                            writer.write_all(vector_bytes)?;
+                            Ok(())
+                        })?;
+                        offset += vectors_layout.base.size();
                     }
 
                     // 2. The varint-encoded length (`#` in the doc).
@@ -156,7 +158,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
                         if vector.len() != vectors_layout.link.size() {
                             return Err(OperationError::service_error("Vector size mismatch"));
                         }
-                        writer.write_all(vector)?;
+                        writer.write_all(&vector)?;
                         offset += vector.len();
                     }
 

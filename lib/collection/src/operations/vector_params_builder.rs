@@ -1,6 +1,10 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::num::NonZeroU64;
 
-use segment::types::{Distance, MultiVectorConfig, QuantizationConfig};
+use segment::types::{Distance, QuantizationConfig};
 
 use crate::operations::config_diff::HnswConfigDiff;
 use crate::operations::types::{Datatype, VectorParams};
@@ -18,10 +22,21 @@ impl VectorParamsBuilder {
                 hnsw_config: None,
                 quantization_config: None,
                 on_disk: None,
+                memory: None,
                 datatype: None,
                 multivector_config: None,
             },
         }
+    }
+
+    pub fn with_on_disk(mut self, on_disk: bool) -> Self {
+        self.vector_params.on_disk = Some(on_disk);
+        self
+    }
+
+    pub fn with_memory(mut self, memory: segment::types::Memory) -> Self {
+        self.vector_params.memory = Some(memory);
+        self
     }
 
     pub fn with_hnsw_config(mut self, hnsw_config: HnswConfigDiff) -> Self {
@@ -34,18 +49,8 @@ impl VectorParamsBuilder {
         self
     }
 
-    pub fn with_on_disk(mut self, on_disk: bool) -> Self {
-        self.vector_params.on_disk = Some(on_disk);
-        self
-    }
-
     pub fn with_datatype(mut self, datatype: Datatype) -> Self {
         self.vector_params.datatype = Some(datatype);
-        self
-    }
-
-    pub fn with_multivector_config(mut self, multivector_config: MultiVectorConfig) -> Self {
-        self.vector_params.multivector_config = Some(multivector_config);
         self
     }
 

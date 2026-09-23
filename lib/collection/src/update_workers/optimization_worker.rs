@@ -11,8 +11,8 @@ use common::save_on_disk::SaveOnDisk;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use segment::common::operation_error::{OperationError, OperationResult};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::types::QuantizationConfig;
+use shard::operations::optimization::OptimizerThresholds;
+use shard::optimizers::config::SegmentOptimizerConfig;
 use shard::payload_index_schema::PayloadIndexSchema;
 use shard::segment_holder::locked::LockedSegmentHolder;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -24,14 +24,11 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::collection_manager::collection_updater::CollectionUpdater;
-use crate::collection_manager::optimizers::segment_optimizer::{
-    OptimizerThresholds, plan_optimizations,
-};
+use crate::collection_manager::optimizers::segment_optimizer::plan_optimizations;
 use crate::collection_manager::optimizers::{
     Tracker, TrackerLog, TrackerSegmentInfo, TrackerStatus,
 };
 use crate::common::stoppable_task::{StoppableTaskHandle, spawn_stoppable};
-use crate::config::CollectionParams;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::update_tracker::UpdateTracker;
 use crate::update_handler::{Optimizer, OptimizerSignal};
@@ -62,11 +59,14 @@ impl UpdateWorkers {
         update_tracker: UpdateTracker,
         optimization_finished_sender: watch::Sender<()>,
     ) {
+        let Some(some_optimizer) = optimizers.first() else {
+            debug_assert!(false, "No optimizers configured");
+            log::error!("No optimizers configured, optimization worker will not run");
+            return;
+        };
+
         let max_handles = max_handles.unwrap_or(usize::MAX);
-        let max_indexing_threads = optimizers
-            .first()
-            .map(|optimizer| optimizer.hnsw_config().max_indexing_threads)
-            .unwrap_or_default();
+        let num_indexing_threads = some_optimizer.num_indexing_threads();
 
         // Asynchronous task to trigger optimizers once CPU budget is available again
         let mut resource_available_trigger: Option<JoinHandle<()>> = None;
@@ -110,21 +110,24 @@ impl UpdateWorkers {
 
             // Ensure we have at least one appendable segment with enough capacity
             // Source required parameters from first optimizer
-            if let Some(optimizer) = optimizers.first() {
-                let result = Self::ensure_appendable_segment_with_capacity(
-                    &segments,
-                    optimizer.segments_path(),
-                    &optimizer.collection_params(),
-                    optimizer.quantization_config().as_ref(),
-                    optimizer.threshold_config(),
-                    payload_index_schema.clone(),
-                );
-                if let Err(err) = result {
-                    log::error!(
-                        "Failed to ensure there are appendable segments with capacity: {err}"
-                    );
-                    panic!("Failed to ensure there are appendable segments with capacity: {err}");
-                }
+            let result = Self::ensure_appendable_segment_with_capacity(
+                &segments,
+                some_optimizer.segments_path(),
+                some_optimizer.segment_optimizer_config(),
+                some_optimizer.threshold_config(),
+                payload_index_schema.clone(),
+            );
+            if let Err(err) = result {
+                log::error!("Failed to ensure there are appendable segments with capacity: {err}");
+                panic!("Failed to ensure there are appendable segments with capacity: {err}");
+            }
+
+            // Backstop: reconcile the segment manifest with the live segment set. Registration
+            // normally happens at each publication site via the `NewSegmentToken`; this wake-up is
+            // the recovery path that picks up any registration that was skipped (e.g. an ignored
+            // token). No-op if already in sync.
+            if let Err(err) = segments.read().sync_segment_manifest(None) {
+                log::error!("Failed to write segment manifest: {err}");
             }
 
             // If not forcing, wait on next signal if we have too many handles
@@ -137,10 +140,12 @@ impl UpdateWorkers {
                 wal.clone(),
                 update_operation_lock.clone(),
                 update_tracker.clone(),
+                some_optimizer.threshold_config().max_segment_size_bytes(),
             )
             .await
             .is_err()
             {
+                let _ = optimization_finished_sender.send(());
                 continue;
             }
 
@@ -148,7 +153,7 @@ impl UpdateWorkers {
             // Otherwise skip now and start a task to trigger the optimizer again once resource
             // budget becomes available
             let desired_cpus = 0;
-            let desired_io = num_rayon_threads(max_indexing_threads);
+            let desired_io = num_indexing_threads;
             if !optimizer_resource_budget.has_budget(desired_cpus, desired_io) {
                 let trigger_active = resource_available_trigger
                     .as_ref()
@@ -163,6 +168,7 @@ impl UpdateWorkers {
                         ),
                     );
                 }
+                let _ = optimization_finished_sender.send(());
                 continue;
             }
 
@@ -280,7 +286,7 @@ impl UpdateWorkers {
         let scheduled = plan_optimizations(&segments.read(), &optimizers);
         for (optimizer, segments_to_merge) in scheduled {
             // Return early if we reached the optimization job limit
-            if limit.map(|extra| handles.len() >= extra).unwrap_or(false) {
+            if limit.is_some_and(|extra| handles.len() >= extra) {
                 log::trace!("Reached optimization job limit, postponing other optimizations");
                 break;
             }
@@ -313,15 +319,13 @@ impl UpdateWorkers {
             log::debug!(
                 "Optimizer '{}' running on segments: {uuids}",
                 optimizer.name(),
-                uuids = segment_infos.iter().format_with(", ", |segment_info, f| {
-                    f(&format_args!("{}", segment_info.uuid))
-                })
+                uuids = segment_infos.iter().map(|s| s.uuid.to_string()).join(", "),
             );
 
             // Determine how many Resources we prefer for optimization task, acquire permit for it
             // And use same amount of IO threads as CPUs
-            let max_indexing_threads = optimizer.hnsw_config().max_indexing_threads;
-            let desired_io = num_rayon_threads(max_indexing_threads);
+            let num_indexing_threads = optimizer.num_indexing_threads();
+            let desired_io = num_indexing_threads;
             let Some(mut permit) = optimizer_resource_budget.try_acquire(0, desired_io) else {
                 // If there is no Resource budget, break and return early
                 // If we have no handles (no optimizations) trigger callback so that we wake up
@@ -392,7 +396,7 @@ impl UpdateWorkers {
                         callback();
                     }
                     // Cancelled
-                    Ok(Err(CollectionError::Cancelled { description })) => {
+                    Ok(Err(OperationError::Cancelled { description })) => {
                         is_optimized = false;
                         log::debug!("Optimization cancelled - {description}");
                         status = TrackerStatus::Cancelled(description);
@@ -413,7 +417,7 @@ impl UpdateWorkers {
 
                         is_optimized = false;
                         status = TrackerStatus::Error(status_msg.clone());
-                        reported_error = Some(CollectionError::service_error(status_msg));
+                        reported_error = Some(OperationError::service_error(status_msg));
                         log::warn!(
                             "Optimization task panicked, collection may be in unstable state\
                              {separator}{message}"
@@ -442,45 +446,27 @@ impl UpdateWorkers {
     pub fn ensure_appendable_segment_with_capacity(
         segments: &LockedSegmentHolder,
         segments_path: &Path,
-        collection_params: &CollectionParams,
-        collection_quantization: Option<&QuantizationConfig>,
+        segment_config: &SegmentOptimizerConfig,
         thresholds_config: &OptimizerThresholds,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     ) -> OperationResult<()> {
-        let no_segment_with_capacity = {
-            let segments_read = segments.read();
-            segments_read
-                .appendable_segments_ids()
-                .into_iter()
-                .filter_map(|segment_id| segments_read.get(segment_id))
-                .all(|segment| {
-                    let max_vector_size_bytes = segment
-                        .get()
-                        .read()
-                        .max_available_vectors_size_in_bytes()
-                        .unwrap_or_default();
-                    let max_segment_size_bytes = thresholds_config
-                        .max_segment_size_kb
-                        .saturating_mul(segment::common::BYTES_IN_KB);
-
-                    max_vector_size_bytes >= max_segment_size_bytes
-                })
-        };
+        let no_segment_with_capacity = !segments
+            .read()
+            .has_appendable_segment_with_capacity(thresholds_config.max_segment_size_bytes());
 
         if no_segment_with_capacity {
             log::debug!("Creating new appendable segment, all existing segments are over capacity");
 
-            let segment_config = collection_params
-                .to_base_segment_config(collection_quantization)
-                .map_err(|err| OperationError::service_error(err.to_string()))?;
-
             let segments_guard = segments.upgradable_read();
-            let new_segment = segments_guard.build_tmp_segment(
+            // Building the segment yields a `NewSegmentToken` obliging us to register it.
+            let (new_segment, token) = segments_guard.build_tmp_segment(
                 segments_path,
-                Some(segment_config),
+                Some(segment_config.plain_segment_config()),
                 payload_index_schema,
+                thresholds_config.deferred_internal_id,
                 true,
             )?;
+            segments_guard.sync_segment_manifest(Some(token))?;
             let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(segments_guard);
             write_guard.add_new_locked(new_segment);
         }
@@ -516,6 +502,7 @@ impl UpdateWorkers {
         wal: LockedWal,
         update_operation_lock: Arc<tokio::sync::RwLock<()>>,
         update_tracker: UpdateTracker,
+        max_segment_size_bytes: Option<std::num::NonZeroUsize>,
     ) -> CollectionResult<usize> {
         // Try to re-apply everything starting from the first failed operation
         let first_failed_operation_option = segments.read().failed_operation.iter().cloned().min();
@@ -523,13 +510,19 @@ impl UpdateWorkers {
             None => {}
             Some(first_failed_op) => {
                 let wal_lock = wal.lock().await;
-                for (op_num, operation) in wal_lock.read(first_failed_op) {
+                for entry in wal_lock.read(first_failed_op) {
+                    let (op_num, operation) = entry.map_err(|e| {
+                        CollectionError::service_error(format!(
+                            "Failed to read WAL during recovery: {e}"
+                        ))
+                    })?;
                     CollectionUpdater::update(
                         &segments,
                         op_num,
                         operation.operation,
                         update_operation_lock.clone(),
                         update_tracker.clone(),
+                        max_segment_size_bytes,
                         &HardwareCounterCell::disposable(), // Internal operation, no measurement needed
                     )?;
                 }

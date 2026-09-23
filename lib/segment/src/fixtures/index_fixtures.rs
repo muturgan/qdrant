@@ -1,9 +1,13 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::sync::atomic::AtomicBool;
 
-use bitvec::prelude::BitVec;
+use common::bitvec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::data_types::vectors::{DenseVector, QueryVector, VectorElementType, VectorRef};
 use crate::index::hnsw_index::graph_links::StorageGraphLinksVectors;
@@ -50,6 +54,7 @@ impl TestRawScorerProducer {
                     r#type: Default::default(),
                     quantile: None,
                     always_ram: Some(true),
+                    memory: None,
                 }
                 .into(),
                 QuantizedVectorsStorageType::Immutable,

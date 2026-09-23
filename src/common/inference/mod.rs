@@ -1,9 +1,9 @@
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 pub mod api_keys;
 mod batch_processing;
 mod batch_processing_grpc;
-pub mod bm25;
+pub mod bm25_inference;
 pub(crate) mod config;
 mod infer_processing;
 pub mod inference_input;

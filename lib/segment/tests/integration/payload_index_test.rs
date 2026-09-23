@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,31 +9,35 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use atomic_refcell::AtomicRefCell;
+use common::condition_checker::ConditionChecker;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
+use common::types::{DeferredBehavior, PointOffsetType};
 use fnv::FnvBuildHasher;
 use fs_err as fs;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use segment::data_types::facets::{FacetParams, FacetValue};
 use segment::data_types::index::{
     FloatIndexParams, FloatIndexType, IntegerIndexParams, IntegerIndexType, KeywordIndexParams,
     KeywordIndexType, TextIndexParams, TextIndexType,
 };
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
-use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
-use segment::fixtures::payload_context_fixture::FixtureIdTracker;
+use segment::entry::entry_point::{
+    NonAppendableSegmentEntry, ReadSegmentEntry, SegmentEntry, StorageSegmentEntry,
+};
+use segment::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use segment::fixtures::payload_fixtures::{
     FLICKING_KEY, FLT_KEY, GEO_KEY, INT_KEY, INT_KEY_2, INT_KEY_3, LAT_RANGE, LON_RANGE, STR_KEY,
     STR_PROJ_KEY, STR_ROOT_PROJ_KEY, TEXT_KEY, generate_diverse_nested_payload,
     generate_diverse_payload, random_filter, random_nested_filter, random_vector,
 };
-use segment::index::PayloadIndex;
-use segment::index::field_index::{FieldIndex, PrimaryCondition};
-use segment::index::struct_payload_index::StructPayloadIndex;
+use segment::id_tracker::IdTrackerRead;
+use segment::index::field_index::{FieldIndex, PayloadFieldIndexRead, PrimaryCondition};
+use segment::index::struct_payload_index::{IndexLoadMode, StorageType, StructPayloadIndex};
+use segment::index::{PayloadIndex, PayloadIndexRead};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::payload_storage::PayloadStorage;
@@ -43,8 +51,9 @@ use segment::types::PayloadSchemaType::{Integer, Keyword};
 use segment::types::{
     AnyVariants, Condition, Distance, FieldCondition, Filter, GeoBoundingBox, GeoLineString,
     GeoPoint, GeoPolygon, GeoRadius, HnswConfig, HnswGlobalConfig, Indexes, IsEmptyCondition,
-    Match, Payload, PayloadField, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType,
-    Range, SegmentConfig, ValueVariants, VectorDataConfig, VectorStorageType, WithPayload,
+    Match, MinShould, Payload, PayloadField, PayloadFieldSchema, PayloadSchemaParams,
+    PayloadSchemaType, Range, SegmentConfig, ValueVariants, VectorDataConfig, VectorStorageType,
+    WithPayload,
 };
 use segment::utils::scored_point_ties::ScoredPointTies;
 use tempfile::{Builder, TempDir};
@@ -84,10 +93,10 @@ impl TestSegments {
 
         let config = Self::make_simple_config(true);
 
-        let mut plain_segment =
-            build_segment(&base_dir.path().join("plain"), &config, true).unwrap();
-        let mut struct_segment =
-            build_segment(&base_dir.path().join("struct"), &config, true).unwrap();
+        let (mut plain_segment, _) =
+            build_segment(&base_dir.path().join("plain"), &config, None, true).unwrap();
+        let (mut struct_segment, _) =
+            build_segment(&base_dir.path().join("struct"), &config, None, true).unwrap();
 
         let num_points = 3000;
         let points_to_delete = 500;
@@ -129,7 +138,16 @@ impl TestSegments {
             .create_field_index(
                 opnum,
                 &JsonPath::new(STR_KEY),
-                Some(&Keyword.into()),
+                Some(&FieldParams(PayloadSchemaParams::Keyword(
+                    KeywordIndexParams {
+                        memory: None,
+                        r#type: KeywordIndexType::Keyword,
+                        is_tenant: None,
+                        on_disk: None,
+                        enable_hnsw: None,
+                        prefix: Some(true),
+                    },
+                ))),
                 &hw_counter,
             )
             .unwrap();
@@ -148,6 +166,7 @@ impl TestSegments {
                 &JsonPath::new(INT_KEY_2),
                 Some(&FieldParams(PayloadSchemaParams::Integer(
                     IntegerIndexParams {
+                        memory: None,
                         r#type: IntegerIndexType::Integer,
                         lookup: Some(true),
                         range: Some(false),
@@ -165,6 +184,7 @@ impl TestSegments {
                 &JsonPath::new(INT_KEY_3),
                 Some(&FieldParams(PayloadSchemaParams::Integer(
                     IntegerIndexParams {
+                        memory: None,
                         r#type: IntegerIndexType::Integer,
                         lookup: Some(false),
                         range: Some(true),
@@ -235,10 +255,10 @@ impl TestSegments {
 
         for (field, indexes) in struct_segment.payload_index.borrow().field_indexes.iter() {
             for index in indexes {
-                assert!(index.count_indexed_points() <= num_points as usize);
+                assert!(index.count_indexed_points().unwrap() <= num_points as usize);
                 if field.to_string() != FLICKING_KEY {
                     assert!(
-                        index.count_indexed_points()
+                        index.count_indexed_points().unwrap()
                             >= (num_points as usize - points_to_delete - points_to_clear)
                     );
                 }
@@ -289,8 +309,10 @@ impl TestSegments {
         )
         .unwrap();
 
-        builder.update(&[plain_segment], &stopped).unwrap();
         let hw_counter = HardwareCounterCell::new();
+        builder
+            .update(&[plain_segment], &stopped, &hw_counter)
+            .unwrap();
 
         let mut segment = builder.build_for_test(path);
         let opnum = segment.version() + 1;
@@ -301,10 +323,12 @@ impl TestSegments {
                 &JsonPath::new(STR_KEY),
                 Some(&FieldParams(PayloadSchemaParams::Keyword(
                     KeywordIndexParams {
+                        memory: None,
                         r#type: KeywordIndexType::Keyword,
                         is_tenant: None,
                         on_disk: Some(true),
                         enable_hnsw: None,
+                        prefix: Some(true),
                     },
                 ))),
                 &hw_counter,
@@ -316,6 +340,7 @@ impl TestSegments {
                 &JsonPath::new(INT_KEY),
                 Some(&FieldParams(PayloadSchemaParams::Integer(
                     IntegerIndexParams {
+                        memory: None,
                         r#type: IntegerIndexType::Integer,
                         lookup: Some(true),
                         range: Some(true),
@@ -333,6 +358,7 @@ impl TestSegments {
                 &JsonPath::new(INT_KEY_2),
                 Some(&FieldParams(PayloadSchemaParams::Integer(
                     IntegerIndexParams {
+                        memory: None,
                         r#type: IntegerIndexType::Integer,
                         lookup: Some(true),
                         range: Some(false),
@@ -350,6 +376,7 @@ impl TestSegments {
                 &JsonPath::new(INT_KEY_3),
                 Some(&FieldParams(PayloadSchemaParams::Integer(
                     IntegerIndexParams {
+                        memory: None,
                         r#type: IntegerIndexType::Integer,
                         lookup: Some(false),
                         range: Some(true),
@@ -366,6 +393,7 @@ impl TestSegments {
                 opnum,
                 &JsonPath::new(FLT_KEY),
                 Some(&FieldParams(PayloadSchemaParams::Float(FloatIndexParams {
+                    memory: None,
                     r#type: FloatIndexType::Float,
                     is_principal: None,
                     on_disk: Some(true),
@@ -481,11 +509,11 @@ fn build_test_segments_nested_payload(path_struct: &Path, path_plain: &Path) -> 
             .unwrap();
     }
 
-    for (_field, indexes) in struct_segment.payload_index.borrow().field_indexes.iter() {
+    for indexes in struct_segment.payload_index.borrow().field_indexes.values() {
         for index in indexes {
-            assert!(index.count_indexed_points() <= num_points as usize);
+            assert!(index.count_indexed_points().unwrap() <= num_points as usize);
             assert!(
-                index.count_indexed_points()
+                index.count_indexed_points().unwrap()
                     > (num_points as usize - points_to_delete - points_to_clear)
             );
         }
@@ -517,7 +545,8 @@ fn validate_geo_filter(test_segments: &TestSegments, query_filter: Filter) -> Re
             .plain_segment
             .payload_index
             .borrow()
-            .estimate_cardinality(&query_filter, &hw_counter);
+            .with_view(|v| v.estimate_cardinality(&query_filter, &hw_counter))
+            .unwrap();
 
         ensure!(estimation.min <= estimation.exp, "{estimation:#?}");
         ensure!(estimation.exp <= estimation.max, "{estimation:#?}");
@@ -548,7 +577,8 @@ fn validate_geo_filter(test_segments: &TestSegments, query_filter: Filter) -> Re
             .struct_segment
             .payload_index
             .borrow()
-            .estimate_cardinality(&query_filter, &hw_counter);
+            .with_view(|v| v.estimate_cardinality(&query_filter, &hw_counter))
+            .unwrap();
 
         ensure!(estimation.min <= estimation.exp, "{estimation:#?}");
         ensure!(estimation.exp <= estimation.max, "{estimation:#?}");
@@ -580,6 +610,7 @@ fn test_read_operations() -> Result<()> {
 
     for test_fn in [
         test_is_empty_conditions,
+        test_empty_min_should,
         test_integer_index_types,
         test_cardinality_estimation,
         test_struct_payload_index,
@@ -587,6 +618,7 @@ fn test_read_operations() -> Result<()> {
         test_struct_payload_geo_radius_index,
         test_struct_payload_geo_polygon_index,
         test_any_matcher_cardinality_estimation,
+        test_prefix_match,
         test_struct_keyword_facet,
         test_mmap_keyword_facet,
         test_struct_keyword_facet_filtered,
@@ -617,19 +649,22 @@ fn test_is_empty_conditions(test_segments: &TestSegments) -> Result<()> {
         .struct_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     let estimation_plain = test_segments
         .plain_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     let plain_result = test_segments
         .plain_segment
         .payload_index
         .borrow()
-        .query_points(&filter, &hw_counter, &is_stopped);
+        .with_view(|v| v.query_points(&filter, &hw_counter, &is_stopped))
+        .unwrap();
 
     let real_number = plain_result.len();
 
@@ -638,7 +673,8 @@ fn test_is_empty_conditions(test_segments: &TestSegments) -> Result<()> {
         .struct_segment
         .payload_index
         .borrow()
-        .query_points(&filter, &hw_counter, &is_stopped)
+        .with_view(|v| v.query_points(&filter, &hw_counter, &is_stopped))
+        .unwrap()
         .into_iter()
         // null index does not track deleted points, so we need to filter them out here. In callsites,
         // the deleted check is done externally anyway
@@ -657,10 +693,74 @@ fn test_is_empty_conditions(test_segments: &TestSegments) -> Result<()> {
     ensure!(estimation_struct.max >= real_number);
     ensure!(estimation_struct.min <= real_number);
 
-    ensure!(
-        (estimation_struct.exp as f64 - real_number as f64).abs()
-            <= (estimation_plain.exp as f64 - real_number as f64).abs()
-    );
+    // Do not assert struct `exp` is closer to `real_number` than plain: NullIndex
+    // complement estimates may include soft-deleted offsets, and plain is only
+    // `available/2`. Neither side promises a better point estimate here.
+
+    Ok(())
+}
+
+/// Regression test for <https://github.com/qdrant/qdrant/issues/9369>.
+///
+/// `min_should` matches points satisfying at least `min_count` of the given
+/// conditions. With an empty condition list this means:
+///
+/// * `min_count == 0` is trivially satisfied -> match all points.
+/// * `min_count > 0` is impossible to satisfy -> match no points.
+///
+/// The optimized (indexed) filter path used to drop an empty `min_should`
+/// clause entirely, turning the unsatisfiable case into a match-all. Verify the
+/// optimized (`struct`/`mmap`) paths agree with the non-optimized (`plain`) one.
+fn test_empty_min_should(test_segments: &TestSegments) -> Result<()> {
+    let hw_counter = HardwareCounterCell::new();
+    let is_stopped = AtomicBool::new(false);
+
+    let query = |segment: &Segment, filter: &Filter| {
+        segment
+            .payload_index
+            .borrow()
+            .with_view(|v| v.query_points(filter, &hw_counter, &is_stopped))
+            .unwrap()
+    };
+
+    let segments = [
+        ("plain", &test_segments.plain_segment),
+        ("struct", &test_segments.struct_segment),
+        ("mmap", &test_segments.mmap_segment),
+    ];
+
+    // Empty conditions with `min_count > 0` is unsatisfiable: match nothing.
+    let unsatisfiable = Filter::new_min_should(MinShould {
+        conditions: vec![],
+        min_count: 1,
+    });
+    for (name, segment) in segments {
+        let result = query(segment, &unsatisfiable);
+        ensure!(
+            result.is_empty(),
+            "{name} segment matched {} points for unsatisfiable min_should",
+            result.len(),
+        );
+    }
+
+    // Empty conditions with `min_count == 0` is trivially satisfied: match all,
+    // exactly like an empty filter would.
+    let match_all = Filter::new_min_should(MinShould {
+        conditions: vec![],
+        min_count: 0,
+    });
+    for (name, segment) in segments {
+        let result = query(segment, &match_all);
+        let unfiltered = query(segment, &Filter::default());
+        ensure!(
+            !unfiltered.is_empty(),
+            "{name} segment has no points to match",
+        );
+        ensure!(
+            result == unfiltered,
+            "{name} segment match-all min_should disagrees with empty filter",
+        );
+    }
 
     Ok(())
 }
@@ -736,20 +836,24 @@ fn test_cardinality_estimation(test_segments: &TestSegments) -> Result<()> {
         .struct_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
     let payload_index = test_segments.struct_segment.payload_index.borrow();
-    let filter_context = payload_index.filter_context(&filter, &hw_counter);
-    let exact = test_segments
-        .struct_segment
-        .id_tracker
-        .borrow()
-        .iter_internal()
-        .filter(|x| filter_context.check(*x))
-        .collect_vec()
-        .len();
+    let exact = payload_index.with_view(|v| {
+        let filter_context = v.filter_context(&filter, &hw_counter).unwrap();
+        test_segments
+            .struct_segment
+            .id_tracker
+            .borrow()
+            .point_mappings()
+            .iter_internal()
+            .filter(|x| filter_context.check(*x).unwrap())
+            .collect_vec()
+            .len()
+    });
 
     eprintln!("exact = {exact:#?}");
     eprintln!("estimation = {estimation:#?}");
@@ -781,7 +885,8 @@ fn test_root_nested_array_filter_cardinality_estimation() {
     let estimation = struct_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     // not empty primary clauses
     assert_eq!(estimation.primary_clauses.len(), 1);
@@ -795,7 +900,7 @@ fn test_root_nested_array_filter_cardinality_estimation() {
 
     match primary_clause {
         PrimaryCondition::Condition(field_condition) => {
-            assert_eq!(*field_condition, Box::new(expected_primary_clause));
+            assert_eq!(**field_condition, expected_primary_clause);
         }
         o => panic!("unexpected primary clause: {o:?}"),
     }
@@ -803,14 +908,17 @@ fn test_root_nested_array_filter_cardinality_estimation() {
     let hw_counter = HardwareCounterCell::new();
 
     let payload_index = struct_segment.payload_index.borrow();
-    let filter_context = payload_index.filter_context(&filter, &hw_counter);
-    let exact = struct_segment
-        .id_tracker
-        .borrow()
-        .iter_internal()
-        .filter(|x| filter_context.check(*x))
-        .collect_vec()
-        .len();
+    let exact = payload_index.with_view(|v| {
+        let filter_context = v.filter_context(&filter, &hw_counter).unwrap();
+        struct_segment
+            .id_tracker
+            .borrow()
+            .point_mappings()
+            .iter_internal()
+            .filter(|x| filter_context.check(*x).unwrap())
+            .collect_vec()
+            .len()
+    });
 
     eprintln!("exact = {exact:#?}");
     eprintln!("estimation = {estimation:#?}");
@@ -845,7 +953,8 @@ fn test_nesting_nested_array_filter_cardinality_estimation() {
     let estimation = struct_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     // not empty primary clauses
     assert_eq!(estimation.primary_clauses.len(), 1);
@@ -862,7 +971,7 @@ fn test_nesting_nested_array_filter_cardinality_estimation() {
 
     match primary_clause {
         PrimaryCondition::Condition(field_condition) => {
-            assert_eq!(*field_condition, Box::new(expected_primary_clause));
+            assert_eq!(**field_condition, expected_primary_clause);
         }
         o => panic!("unexpected primary clause: {o:?}"),
     }
@@ -870,14 +979,17 @@ fn test_nesting_nested_array_filter_cardinality_estimation() {
     let hw_counter = HardwareCounterCell::new();
 
     let payload_index = struct_segment.payload_index.borrow();
-    let filter_context = payload_index.filter_context(&filter, &hw_counter);
-    let exact = struct_segment
-        .id_tracker
-        .borrow()
-        .iter_internal()
-        .filter(|x| filter_context.check(*x))
-        .collect_vec()
-        .len();
+    let exact = payload_index.with_view(|v| {
+        let filter_context = v.filter_context(&filter, &hw_counter).unwrap();
+        struct_segment
+            .id_tracker
+            .borrow()
+            .point_mappings()
+            .iter_internal()
+            .filter(|x| filter_context.check(*x).unwrap())
+            .collect_vec()
+            .len()
+    });
 
     eprintln!("exact = {exact:#?}");
     eprintln!("estimation = {estimation:#?}");
@@ -937,7 +1049,8 @@ fn test_struct_payload_index(test_segments: &TestSegments) -> Result<()> {
             .struct_segment
             .payload_index
             .borrow()
-            .estimate_cardinality(&query_filter, &hw_counter);
+            .with_view(|v| v.estimate_cardinality(&query_filter, &hw_counter))
+            .unwrap();
 
         ensure!(estimation.min <= estimation.exp, "{estimation:#?}");
         ensure!(estimation.exp <= estimation.max, "{estimation:#?}");
@@ -953,15 +1066,15 @@ fn test_struct_payload_index(test_segments: &TestSegments) -> Result<()> {
 
         // Perform additional sort to break ties by score
         let mut plain_result_sorted_ties: Vec<ScoredPointTies> =
-            plain_result.iter().map(|x| x.into()).collect_vec();
+            plain_result.iter().map(Into::into).collect_vec();
         plain_result_sorted_ties.sort();
 
         let mut struct_result_sorted_ties: Vec<ScoredPointTies> =
-            struct_result.iter().map(|x| x.into()).collect_vec();
+            struct_result.iter().map(Into::into).collect_vec();
         struct_result_sorted_ties.sort();
 
         let mut mmap_result_sorted_ties: Vec<ScoredPointTies> =
-            mmap_result.iter().map(|x| x.into()).collect_vec();
+            mmap_result.iter().map(Into::into).collect_vec();
         mmap_result_sorted_ties.sort();
 
         ensure!(
@@ -1092,6 +1205,7 @@ fn test_struct_payload_geo_polygon_index(test_segments: &TestSegments) -> Result
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 fn test_struct_payload_index_nested_fields() {
     // Compare search with plain and struct indexes
     let dir1 = Builder::new().prefix("segment1_dir").tempdir().unwrap();
@@ -1140,7 +1254,8 @@ fn test_struct_payload_index_nested_fields() {
         let estimation = struct_segment
             .payload_index
             .borrow()
-            .estimate_cardinality(&query_filter, &hw_counter);
+            .with_view(|v| v.estimate_cardinality(&query_filter, &hw_counter))
+            .unwrap();
 
         assert!(estimation.min <= estimation.exp, "{estimation:#?}");
         assert!(estimation.exp <= estimation.max, "{estimation:#?}");
@@ -1190,15 +1305,15 @@ fn test_update_payload_index_type() {
     }
 
     let wrapped_payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
-    let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(point_num)));
+    let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(point_num)));
 
     let mut index = StructPayloadIndex::open(
         wrapped_payload_storage,
         id_tracker,
         HashMap::new(),
         dir.path(),
-        true,
-        true,
+        StorageType::Appendable,
+        IndexLoadMode::CreateIfMissing,
     )
     .unwrap();
 
@@ -1207,31 +1322,172 @@ fn test_update_payload_index_type() {
     // set field to Integer type
     index.set_indexed(&field, Integer, &hw_counter).unwrap();
     assert_eq!(
-        *index.indexed_fields().get(&field).unwrap(),
+        *index.with_view(|v| v.indexed_fields()).get(&field).unwrap(),
         FieldType(Integer)
     );
     let field_index = index.field_indexes.get(&field).unwrap();
-    assert_eq!(field_index[0].count_indexed_points(), point_num);
-    assert_eq!(field_index[1].count_indexed_points(), point_num);
+    assert_eq!(field_index[0].count_indexed_points().unwrap(), point_num);
+    assert_eq!(field_index[1].count_indexed_points().unwrap(), point_num);
 
     // update field to Keyword type
     index.set_indexed(&field, Keyword, &hw_counter).unwrap();
     assert_eq!(
-        *index.indexed_fields().get(&field).unwrap(),
+        *index.with_view(|v| v.indexed_fields()).get(&field).unwrap(),
         FieldType(Keyword)
     );
     let field_index = index.field_indexes.get(&field).unwrap();
-    assert_eq!(field_index[0].count_indexed_points(), 0); // only one field index for Keyword
+    assert_eq!(field_index[0].count_indexed_points().unwrap(), 0); // only one field index for Keyword
 
     // set field to Integer type (again)
     index.set_indexed(&field, Integer, &hw_counter).unwrap();
     assert_eq!(
-        *index.indexed_fields().get(&field).unwrap(),
+        *index.with_view(|v| v.indexed_fields()).get(&field).unwrap(),
         FieldType(Integer)
     );
     let field_index = index.field_indexes.get(&field).unwrap();
-    assert_eq!(field_index[0].count_indexed_points(), point_num);
-    assert_eq!(field_index[1].count_indexed_points(), point_num);
+    assert_eq!(field_index[0].count_indexed_points().unwrap(), point_num);
+    assert_eq!(field_index[1].count_indexed_points().unwrap(), point_num);
+}
+
+/// An appendable segment with a bool payload index must still accept updates
+/// after being reopened from disk.
+#[test]
+fn test_bool_index_appendable_reopen_accepts_updates() {
+    let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+    let field = JsonPath::new("flag");
+    let hw_counter = HardwareCounterCell::new();
+
+    {
+        let mut payload_storage = InMemoryPayloadStorage::default();
+        payload_storage
+            .set(0, &payload_json! {"flag": true}, &hw_counter)
+            .unwrap();
+
+        let payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
+        let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(2)));
+
+        let mut index = StructPayloadIndex::open(
+            payload_storage,
+            id_tracker,
+            HashMap::new(),
+            dir.path(),
+            StorageType::Appendable,
+            IndexLoadMode::CreateIfMissing,
+        )
+        .unwrap();
+
+        index
+            .set_indexed(&field, FieldType(PayloadSchemaType::Bool), &hw_counter)
+            .unwrap();
+
+        for field_index in index.field_indexes.get(&field).unwrap() {
+            field_index.flusher()().unwrap();
+        }
+    }
+
+    let payload_storage = Arc::new(AtomicRefCell::new(InMemoryPayloadStorage::default().into()));
+    let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(2)));
+    let mut index = StructPayloadIndex::open(
+        payload_storage,
+        id_tracker,
+        HashMap::new(),
+        dir.path(),
+        StorageType::Appendable,
+        IndexLoadMode::LoadExisting,
+    )
+    .unwrap();
+
+    index
+        .set_payload(1, &payload_json! {"flag": false}, &None, &hw_counter)
+        .expect("update on reopened bool index must succeed");
+
+    let field_indexes = index.field_indexes.get(&field).unwrap();
+    let bool_index = field_indexes
+        .iter()
+        .find(|fi| matches!(fi, FieldIndex::BoolIndex(_)))
+        .expect("bool index present after reopen");
+    assert_eq!(bool_index.count_indexed_points().unwrap(), 2);
+}
+
+/// An appendable segment with a payload field index carries a companion null
+/// index in its persisted `types`. On reopen that null index must be loaded
+/// from disk (not silently rebuilt from payload storage) and must accept
+/// subsequent updates.
+#[test]
+fn test_null_index_appendable_reopen_loads_and_accepts_updates() {
+    let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+    let field = JsonPath::new("name");
+    let hw_counter = HardwareCounterCell::new();
+
+    {
+        let mut payload_storage = InMemoryPayloadStorage::default();
+        payload_storage
+            .set(0, &payload_json! {"name": "foo"}, &hw_counter)
+            .unwrap();
+
+        let payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
+        let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(2)));
+
+        let mut index = StructPayloadIndex::open(
+            payload_storage,
+            id_tracker,
+            HashMap::new(),
+            dir.path(),
+            StorageType::Appendable,
+            IndexLoadMode::CreateIfMissing,
+        )
+        .unwrap();
+
+        index
+            .set_indexed(&field, FieldType(Keyword), &hw_counter)
+            .unwrap();
+
+        for field_index in index.field_indexes.get(&field).unwrap() {
+            field_index.flusher()().unwrap();
+        }
+    }
+
+    // Reopen with a fresh (empty) payload storage — same pattern as the bool
+    // test above.
+    let payload_storage = Arc::new(AtomicRefCell::new(InMemoryPayloadStorage::default().into()));
+    let id_tracker = Arc::new(AtomicRefCell::new(create_id_tracker_fixture(2)));
+    let mut index = StructPayloadIndex::open(
+        payload_storage,
+        id_tracker,
+        HashMap::new(),
+        dir.path(),
+        StorageType::Appendable,
+        IndexLoadMode::LoadExisting,
+    )
+    .unwrap();
+
+    // The null index is persisted with `{ mutability: Mutable, storage_type:
+    // Mmap }` because `MutableNullIndex` and `ImmutableNullIndex` share the
+    // same on-disk format. If the reload dispatched on storage_type alone, it
+    // would open `ImmutableNullIndex` and this write would fail with "Can't
+    // add values to immutable null index" (same class of bug as #8785 for the
+    // bool index).
+    index
+        .set_payload(1, &payload_json! {"name": "bar"}, &None, &hw_counter)
+        .expect("update on reopened null index must succeed");
+
+    let field_indexes = index.field_indexes.get(&field).unwrap();
+    let null_index = field_indexes
+        .iter()
+        .find(|fi| matches!(fi, FieldIndex::NullIndex(_)))
+        .expect("null index present after reopen");
+
+    let not_empty = FieldCondition::new_is_empty(field.clone(), false);
+    let with_values: Vec<_> = null_index
+        .filter(&not_empty, &hw_counter)
+        .unwrap()
+        .expect("null index must answer is_empty filter")
+        .collect();
+    assert_eq!(
+        with_values,
+        vec![0, 1],
+        "null index must retain point 0 from before reopen and include point 1 from after",
+    );
 }
 
 fn test_any_matcher_cardinality_estimation(test_segments: &TestSegments) -> Result<()> {
@@ -1252,7 +1508,8 @@ fn test_any_matcher_cardinality_estimation(test_segments: &TestSegments) -> Resu
         .struct_segment
         .payload_index
         .borrow()
-        .estimate_cardinality(&filter, &hw_counter);
+        .with_view(|v| v.estimate_cardinality(&filter, &hw_counter))
+        .unwrap();
 
     ensure!(estimation.primary_clauses.len() == 1);
     for clause in estimation.primary_clauses.iter() {
@@ -1260,7 +1517,7 @@ fn test_any_matcher_cardinality_estimation(test_segments: &TestSegments) -> Resu
 
         match clause {
             PrimaryCondition::Condition(field_condition) => {
-                ensure!(*field_condition == Box::new(expected_primary_clause));
+                ensure!(**field_condition == expected_primary_clause);
             }
             o => panic!("unexpected primary clause: {o:?}"),
         }
@@ -1269,21 +1526,70 @@ fn test_any_matcher_cardinality_estimation(test_segments: &TestSegments) -> Resu
     let hw_counter = HardwareCounterCell::new();
 
     let payload_index = test_segments.struct_segment.payload_index.borrow();
-    let filter_context = payload_index.filter_context(&filter, &hw_counter);
-    let exact = test_segments
-        .struct_segment
-        .id_tracker
-        .borrow()
-        .iter_internal()
-        .filter(|x| filter_context.check(*x))
-        .collect_vec()
-        .len();
+    let exact = payload_index.with_view(|v| {
+        let filter_context = v.filter_context(&filter, &hw_counter).unwrap();
+        test_segments
+            .struct_segment
+            .id_tracker
+            .borrow()
+            .point_mappings()
+            .iter_internal()
+            .filter(|x| filter_context.check(*x).unwrap())
+            .collect_vec()
+            .len()
+    });
 
     eprintln!("exact = {exact:#?}");
     eprintln!("estimation = {estimation:#?}");
 
     ensure!(exact <= estimation.max);
     ensure!(exact >= estimation.min);
+
+    Ok(())
+}
+
+/// Prefix match must return identical results on the plain segment (payload
+/// fallback), the appendable struct segment (mutable prefix structure) and
+/// the mmap segment (on-disk prefix index).
+fn test_prefix_match(test_segments: &TestSegments) -> Result<()> {
+    let hw_counter = HardwareCounterCell::new();
+
+    let read_with_prefix = |segment: &Segment, prefix: &str| {
+        let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
+            JsonPath::new(STR_KEY),
+            Match::new_prefix(prefix),
+        )));
+        let mut points = segment
+            .read_filtered(
+                None,
+                None,
+                Some(&filter),
+                &Default::default(),
+                &hw_counter,
+                DeferredBehavior::VisibleOnly,
+            )
+            .unwrap();
+        points.sort_unstable();
+        points
+    };
+
+    let mut matched_something = false;
+    for prefix in ["", "b", "bl", "re", "sol", "solid", "nonexistent-prefix"] {
+        let plain_result = read_with_prefix(&test_segments.plain_segment, prefix);
+        let struct_result = read_with_prefix(&test_segments.struct_segment, prefix);
+        let mmap_result = read_with_prefix(&test_segments.mmap_segment, prefix);
+
+        ensure!(
+            plain_result == struct_result,
+            "prefix {prefix:?}: plain vs struct mismatch",
+        );
+        ensure!(
+            plain_result == mmap_result,
+            "prefix {prefix:?}: plain vs mmap mismatch",
+        );
+        matched_something |= !plain_result.is_empty();
+    }
+    ensure!(matched_something, "test probes never matched anything");
 
     Ok(())
 }
@@ -1328,7 +1634,9 @@ fn validate_facet_result(
                 count_filter.as_ref(),
                 &Default::default(),
                 &hw_counter,
+                DeferredBehavior::VisibleOnly,
             )
+            .unwrap()
             .len();
 
         ensure!(*count == exact, "Facet value: {value:?}");

@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use api::grpc::DecayParamsExpression;
-use api::rest::GeoDistance;
-use api::{grpc, rest};
 use common::types::ScoreType;
 use itertools::Itertools;
 use segment::common::operation_error::{OperationError, OperationResult};
@@ -63,6 +60,8 @@ pub enum ExpressionInternal {
     DatetimeKey(JsonPath),
     Mult(Vec<ExpressionInternal>),
     Sum(Vec<ExpressionInternal>),
+    Max(Vec<ExpressionInternal>),
+    Min(Vec<ExpressionInternal>),
     Neg(Box<ExpressionInternal>),
     Div {
         left: Box<ExpressionInternal>,
@@ -77,6 +76,7 @@ pub enum ExpressionInternal {
     Exp(Box<ExpressionInternal>),
     Log10(Box<ExpressionInternal>),
     Ln(Box<ExpressionInternal>),
+    Acosh(Box<ExpressionInternal>),
     Abs(Box<ExpressionInternal>),
     Decay {
         kind: DecayKind,
@@ -138,6 +138,12 @@ impl ExpressionInternal {
                     .map(|expr| expr.parse_and_convert(payload_vars, conditions))
                     .try_collect()?,
             ),
+            ExpressionInternal::Max(expression_internals) => ParsedExpression::Max(
+                parse_non_empty_operands("max", expression_internals, payload_vars, conditions)?,
+            ),
+            ExpressionInternal::Min(expression_internals) => ParsedExpression::Min(
+                parse_non_empty_operands("min", expression_internals, payload_vars, conditions)?,
+            ),
             ExpressionInternal::Neg(expression_internal) => ParsedExpression::new_neg(
                 expression_internal.parse_and_convert(payload_vars, conditions)?,
             ),
@@ -164,6 +170,9 @@ impl ExpressionInternal {
                 expression_internal.parse_and_convert(payload_vars, conditions)?,
             )),
             ExpressionInternal::Ln(expression_internal) => ParsedExpression::Ln(Box::new(
+                expression_internal.parse_and_convert(payload_vars, conditions)?,
+            )),
+            ExpressionInternal::Acosh(expression_internal) => ParsedExpression::Acosh(Box::new(
                 expression_internal.parse_and_convert(payload_vars, conditions)?,
             )),
             ExpressionInternal::Abs(expression_internal) => ParsedExpression::Abs(Box::new(
@@ -198,286 +207,130 @@ impl ExpressionInternal {
     }
 }
 
+/// Parses the operands of a variadic operator which has no identity element to fall back on when
+/// given nothing. `sum` and `mult` can define the empty case as `0` and `1`, but `max` and `min`
+/// cannot: folding over no operands would yield -inf or +inf, and score every point with a
+/// non-finite value instead of reporting the mistake.
+fn parse_non_empty_operands(
+    operator: &str,
+    operands: Vec<ExpressionInternal>,
+    payload_vars: &mut HashSet<JsonPath>,
+    conditions: &mut Vec<Condition>,
+) -> OperationResult<Vec<ParsedExpression>> {
+    if operands.is_empty() {
+        return Err(OperationError::validation_error(format!(
+            "`{operator}` needs at least one operand"
+        )));
+    }
+
+    operands
+        .into_iter()
+        .map(|expr| expr.parse_and_convert(payload_vars, conditions))
+        .try_collect()
+}
+
 fn failed_to_parse(what: &str, value: &str, message: impl fmt::Display) -> OperationError {
     OperationError::validation_error(format!("failed to parse {what} {value}: {message}"))
 }
 
-impl From<rest::FormulaQuery> for FormulaInternal {
-    fn from(value: rest::FormulaQuery) -> Self {
-        let rest::FormulaQuery { formula, defaults } = value;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn parse(expression: ExpressionInternal) -> OperationResult<ParsedFormula> {
         FormulaInternal {
-            formula: ExpressionInternal::from(formula),
-            defaults,
-        }
-    }
-}
-
-impl TryFrom<grpc::Formula> for FormulaInternal {
-    type Error = tonic::Status;
-
-    fn try_from(formula: grpc::Formula) -> Result<Self, Self::Error> {
-        let grpc::Formula {
-            expression,
-            defaults,
-        } = formula;
-
-        let expression = expression
-            .ok_or_else(|| tonic::Status::invalid_argument("missing field: expression"))?;
-
-        let expression = ExpressionInternal::try_from(expression)?;
-        let defaults = defaults
-            .into_iter()
-            .map(|(key, value)| {
-                let value = api::conversions::json::proto_to_json(value)?;
-                Result::<_, tonic::Status>::Ok((key, value))
-            })
-            .try_collect()?;
-
-        Ok(Self {
             formula: expression,
-            defaults,
-        })
-    }
-}
-
-impl From<rest::Expression> for ExpressionInternal {
-    fn from(value: rest::Expression) -> Self {
-        match value {
-            rest::Expression::Constant(c) => ExpressionInternal::Constant(c),
-            rest::Expression::Variable(key) => ExpressionInternal::Variable(key),
-            rest::Expression::Condition(condition) => ExpressionInternal::Condition(condition),
-            rest::Expression::GeoDistance(GeoDistance {
-                geo_distance: rest::GeoDistanceParams { origin, to },
-            }) => ExpressionInternal::GeoDistance { origin, to },
-            rest::Expression::Datetime(rest::DatetimeExpression { datetime }) => {
-                ExpressionInternal::Datetime(datetime)
-            }
-            rest::Expression::DatetimeKey(rest::DatetimeKeyExpression { datetime_key }) => {
-                ExpressionInternal::DatetimeKey(datetime_key)
-            }
-            rest::Expression::Mult(rest::MultExpression { mult: exprs }) => {
-                ExpressionInternal::Mult(exprs.into_iter().map(ExpressionInternal::from).collect())
-            }
-            rest::Expression::Sum(rest::SumExpression { sum: exprs }) => {
-                ExpressionInternal::Sum(exprs.into_iter().map(ExpressionInternal::from).collect())
-            }
-            rest::Expression::Neg(rest::NegExpression { neg: expr }) => {
-                ExpressionInternal::Neg(Box::new(ExpressionInternal::from(*expr)))
-            }
-            rest::Expression::Div(rest::DivExpression {
-                div:
-                    rest::DivParams {
-                        left,
-                        right,
-                        by_zero_default,
-                    },
-            }) => {
-                let left = Box::new((*left).into());
-                let right = Box::new((*right).into());
-                ExpressionInternal::Div {
-                    left,
-                    right,
-                    by_zero_default,
-                }
-            }
-            rest::Expression::Sqrt(sqrt_expression) => {
-                ExpressionInternal::Sqrt(Box::new(ExpressionInternal::from(*sqrt_expression.sqrt)))
-            }
-            rest::Expression::Pow(rest::PowExpression { pow }) => ExpressionInternal::Pow {
-                base: Box::new(ExpressionInternal::from(*pow.base)),
-                exponent: Box::new(ExpressionInternal::from(*pow.exponent)),
-            },
-            rest::Expression::Exp(rest::ExpExpression { exp: expr }) => {
-                ExpressionInternal::Exp(Box::new(ExpressionInternal::from(*expr)))
-            }
-            rest::Expression::Log10(rest::Log10Expression { log10: expr }) => {
-                ExpressionInternal::Log10(Box::new(ExpressionInternal::from(*expr)))
-            }
-            rest::Expression::Ln(rest::LnExpression { ln: expr }) => {
-                ExpressionInternal::Ln(Box::new(ExpressionInternal::from(*expr)))
-            }
-            rest::Expression::Abs(rest::AbsExpression { abs: expr }) => {
-                ExpressionInternal::Abs(Box::new(ExpressionInternal::from(*expr)))
-            }
-            rest::Expression::LinDecay(rest::LinDecayExpression {
-                lin_decay:
-                    rest::DecayParamsExpression {
-                        x,
-                        target,
-                        midpoint,
-                        scale,
-                    },
-            }) => ExpressionInternal::Decay {
-                kind: DecayKind::Lin,
-                x: Box::new(ExpressionInternal::from(*x)),
-                target: target.map(|t| Box::new(ExpressionInternal::from(*t))),
-                midpoint,
-                scale,
-            },
-            rest::Expression::ExpDecay(rest::ExpDecayExpression {
-                exp_decay:
-                    rest::DecayParamsExpression {
-                        x,
-                        target,
-                        midpoint,
-                        scale,
-                    },
-            }) => ExpressionInternal::Decay {
-                kind: DecayKind::Exp,
-                x: Box::new(ExpressionInternal::from(*x)),
-                target: target.map(|t| Box::new(ExpressionInternal::from(*t))),
-                midpoint,
-                scale,
-            },
-            rest::Expression::GaussDecay(rest::GaussDecayExpression {
-                gauss_decay:
-                    rest::DecayParamsExpression {
-                        x,
-                        target,
-                        midpoint,
-                        scale,
-                    },
-            }) => ExpressionInternal::Decay {
-                kind: DecayKind::Gauss,
-                x: Box::new(ExpressionInternal::from(*x)),
-                target: target.map(|t| Box::new(ExpressionInternal::from(*t))),
-                midpoint,
-                scale,
-            },
+            defaults: HashMap::new(),
         }
+        .try_into()
     }
-}
 
-impl TryFrom<grpc::Expression> for ExpressionInternal {
-    type Error = tonic::Status;
-
-    fn try_from(expression: grpc::Expression) -> Result<Self, Self::Error> {
-        use grpc::expression::Variant;
-
-        let variant = expression
-            .variant
-            .ok_or_else(|| tonic::Status::invalid_argument("missing field: variant"))?;
-
-        let expression = match variant {
-            Variant::Constant(constant) => ExpressionInternal::Constant(constant),
-            Variant::Variable(variable) => ExpressionInternal::Variable(variable),
-            Variant::Condition(condition) => {
-                let condition = grpc::conversions::grpc_condition_into_condition(condition)?
-                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: condition"))?;
-                ExpressionInternal::Condition(Box::new(condition))
-            }
-            Variant::GeoDistance(grpc::GeoDistance { origin, to }) => {
-                let origin = origin
-                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: origin"))?
-                    .into();
-                let to = to
-                    .parse()
-                    .map_err(|_| tonic::Status::invalid_argument("invalid payload key"))?;
-                ExpressionInternal::GeoDistance { origin, to }
-            }
-            Variant::Datetime(dt_str) => ExpressionInternal::Datetime(dt_str),
-            Variant::DatetimeKey(dt_key) => {
-                let json_path = dt_key
-                    .parse()
-                    .map_err(|_| tonic::Status::invalid_argument("invalid payload key"))?;
-                ExpressionInternal::DatetimeKey(json_path)
-            }
-            Variant::Mult(grpc::MultExpression { mult }) => {
-                let mult = mult
-                    .into_iter()
-                    .map(ExpressionInternal::try_from)
-                    .try_collect()?;
-                ExpressionInternal::Mult(mult)
-            }
-            Variant::Sum(grpc::SumExpression { sum }) => {
-                let sum = sum
-                    .into_iter()
-                    .map(ExpressionInternal::try_from)
-                    .try_collect()?;
-                ExpressionInternal::Sum(sum)
-            }
-            Variant::Div(div) => {
-                let grpc::DivExpression {
-                    left,
-                    right,
-                    by_zero_default,
-                } = *div;
-
-                let left =
-                    *left.ok_or_else(|| tonic::Status::invalid_argument("missing field: left"))?;
-                let right = *right
-                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: right"))?;
-
-                ExpressionInternal::Div {
-                    left: Box::new(left.try_into()?),
-                    right: Box::new(right.try_into()?),
-                    by_zero_default,
-                }
-            }
-            Variant::Neg(expression) => {
-                ExpressionInternal::Neg(Box::new((*expression).try_into()?))
-            }
-            Variant::Abs(expression) => {
-                ExpressionInternal::Abs(Box::new((*expression).try_into()?))
-            }
-            Variant::Sqrt(expression) => {
-                ExpressionInternal::Sqrt(Box::new((*expression).try_into()?))
-            }
-            Variant::Pow(pow_expression) => {
-                let grpc::PowExpression { base, exponent } = *pow_expression;
-                let raw_base =
-                    *base.ok_or_else(|| tonic::Status::invalid_argument("missing field: base"))?;
-                let raw_exponent = *exponent
-                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: exponent"))?;
-
-                ExpressionInternal::Pow {
-                    base: Box::new(raw_base.try_into()?),
-                    exponent: Box::new(raw_exponent.try_into()?),
-                }
-            }
-            Variant::Exp(expression) => {
-                ExpressionInternal::Exp(Box::new((*expression).try_into()?))
-            }
-            Variant::Log10(expression) => {
-                ExpressionInternal::Log10(Box::new((*expression).try_into()?))
-            }
-            Variant::Ln(expression) => ExpressionInternal::Ln(Box::new((*expression).try_into()?)),
-            Variant::LinDecay(decay_params) => {
-                try_from_decay_params(*decay_params, DecayKind::Lin)?
-            }
-            Variant::ExpDecay(decay_params) => {
-                try_from_decay_params(*decay_params, DecayKind::Exp)?
-            }
-            Variant::GaussDecay(decay_params) => {
-                try_from_decay_params(*decay_params, DecayKind::Gauss)?
-            }
-        };
-
-        Ok(expression)
+    /// `sum` and `mult` have identity elements for the empty case (0 and 1), but `max` and `min`
+    /// do not: folding over nothing would silently yield ±infinity. Reject it at parse time
+    /// instead, which covers every entry point (REST, gRPC and the Edge FFI).
+    #[test]
+    fn empty_max_is_rejected() {
+        let err = parse(ExpressionInternal::Max(vec![])).unwrap_err();
+        assert!(
+            matches!(err, OperationError::ValidationError { .. }),
+            "expected a validation error, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("max"),
+            "error should name the operator, got {message:?}"
+        );
     }
-}
 
-fn try_from_decay_params(
-    params: DecayParamsExpression,
-    kind: DecayKind,
-) -> Result<ExpressionInternal, tonic::Status> {
-    let grpc::DecayParamsExpression {
-        x,
-        target,
-        midpoint,
-        scale,
-    } = params;
+    #[test]
+    fn empty_min_is_rejected() {
+        let err = parse(ExpressionInternal::Min(vec![])).unwrap_err();
+        assert!(
+            matches!(err, OperationError::ValidationError { .. }),
+            "expected a validation error, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("min"),
+            "error should name the operator, got {message:?}"
+        );
+    }
 
-    let x = *x.ok_or_else(|| tonic::Status::invalid_argument("missing field: x"))?;
+    #[test]
+    fn single_operand_min_is_accepted() {
+        let parsed = parse(ExpressionInternal::Min(vec![ExpressionInternal::Constant(
+            1.0,
+        )]))
+        .unwrap();
+        assert_eq!(
+            parsed.formula,
+            ParsedExpression::Min(vec![ParsedExpression::Constant(PreciseScoreOrdered::from(
+                1.0
+            ))])
+        );
+    }
 
-    let target = target.map(|t| (*t).try_into()).transpose()?.map(Box::new);
+    /// Payload variables and conditions nested inside `min` must still be collected, otherwise
+    /// the scorer would have no retriever for them.
+    #[test]
+    fn min_collects_nested_payload_vars() {
+        let parsed = parse(ExpressionInternal::Min(vec![
+            ExpressionInternal::Variable("popularity".to_string()),
+            ExpressionInternal::Variable("$score".to_string()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.payload_vars,
+            HashSet::from([JsonPath::new("popularity")])
+        );
+    }
 
-    Ok(ExpressionInternal::Decay {
-        kind,
-        x: Box::new(x.try_into()?),
-        target,
-        midpoint,
-        scale,
-    })
+    #[test]
+    fn single_operand_max_is_accepted() {
+        let parsed = parse(ExpressionInternal::Max(vec![ExpressionInternal::Constant(
+            1.0,
+        )]))
+        .unwrap();
+        assert_eq!(
+            parsed.formula,
+            ParsedExpression::Max(vec![ParsedExpression::Constant(PreciseScoreOrdered::from(
+                1.0
+            ))])
+        );
+    }
+
+    /// Payload variables and conditions nested inside `max` must still be collected, otherwise
+    /// the scorer would have no retriever for them.
+    #[test]
+    fn max_collects_nested_payload_vars() {
+        let parsed = parse(ExpressionInternal::Max(vec![
+            ExpressionInternal::Variable("popularity".to_string()),
+            ExpressionInternal::Variable("$score".to_string()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.payload_vars,
+            HashSet::from([JsonPath::new("popularity")])
+        );
+    }
 }

@@ -3,8 +3,8 @@ use std::path::Path;
 
 use fs_err as fs;
 use prost_for_raft::Message;
-use protobuf::Message as _;
 use raft::eraftpb::Entry as RaftEntry;
+use raft::protocompat::PbMessageExt as _;
 use wal::Wal;
 
 use crate::StorageError;
@@ -194,7 +194,6 @@ impl ConsensusOpWal {
 
                 // Check that new entry index is sequential (it's not greater than next WAL index),
                 // or truncate entries at the tail of WAL, if it overwrites some
-                #[allow(clippy::comparison_chain)] // stupid ahh diagnostics 🙄
                 if new_entry_wal_index > next_wal_index {
                     return Err(StorageError::service_error(format!(
                         "Can't append entry with Raft index {} (expected WAL index {}), \
@@ -310,6 +309,40 @@ impl ConsensusOpWal {
         Ok(())
     }
 
+    /// Drop all entries with a Raft index strictly greater than `raft_index`.
+    ///
+    /// Used during consensus re-initialization to discard committed-but-unapplied
+    /// entries inherited from the previous cluster (e.g. a `RemoveNode` conf-change
+    /// for this very peer, if it was removed from consensus before reinit).
+    pub fn truncate_after(&mut self, raft_index: u64) -> Result<(), StorageError> {
+        // Empty WAL - nothing to drop
+        let Some(offset) = self.index_offset_impl()? else {
+            return Ok(());
+        };
+
+        // First Raft index we want to drop, mapped to a WAL index. If it's below the
+        // first physical entry, the whole (remaining) WAL is beyond the cut point.
+        let from_wal_index = offset
+            .try_raft_to_wal(raft_index + 1)
+            .unwrap_or(offset.wal_index);
+
+        // Exclusive upper bound of physical WAL indices
+        let end_wal_index = offset.wal_index + self.wal.num_entries();
+        if from_wal_index >= end_wal_index {
+            // Nothing past the cut point
+            return Ok(());
+        }
+
+        log::debug!(
+            "Truncating consensus WAL after Raft index {raft_index} (from WAL index {from_wal_index})",
+        );
+
+        self.wal.truncate(from_wal_index)?;
+        self.wal.flush_open_segment()?;
+
+        Ok(())
+    }
+
     pub fn index_offset(&self) -> raft::Result<IndexOffset> {
         let res = self.index_offset_impl();
         into_raft_result(res)
@@ -400,6 +433,8 @@ fn into_raft_result<T>(result: Result<Option<T>, StorageError>) -> raft::Result<
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use raft::eraftpb::Entry;
 
     use super::*;
@@ -484,10 +519,10 @@ mod tests {
         }];
 
         // Some errors can't be corrected
-        assert!(matches!(
+        assert_matches!(
             wal.append_entries(broken_entry),
-            Err(StorageError::ServiceError { .. })
-        ));
+            Err(StorageError::ServiceError { .. }),
+        );
     }
 
     #[test]

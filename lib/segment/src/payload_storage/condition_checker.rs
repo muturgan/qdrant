@@ -1,14 +1,18 @@
 //! Contains functions for interpreting filter queries and defining if given points pass the conditions
 
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 
+use crate::data_types::index::TextIndexParams;
+use crate::index::field_index::full_text_index::tokenizers::{Tokenizer, TokenizerTextKind};
 use crate::types::{
-    AnyVariants, DateTimePayloadType, FieldCondition, FloatPayloadType, GeoBoundingBox, GeoPoint,
-    GeoPolygon, GeoRadius, Match, MatchAny, MatchExcept, MatchPhrase, MatchText, MatchTextAny,
-    MatchValue, Range, RangeInterface, ValueVariants, ValuesCount,
+    AnyVariants, CheckGeoPoint, DateTimePayloadType, FieldCondition, FloatPayloadType,
+    GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius, Match, MatchAny, MatchExcept, MatchPhrase,
+    MatchPrefix, MatchText, MatchTextAny, MatchValue, Range, RangeInterface, ValueVariants,
+    ValuesCount,
 };
 
 /// Threshold representing the point to which iterating through an IndexSet is more efficient than using hashing.
@@ -17,6 +21,51 @@ use crate::types::{
 /// For more information see <https://github.com/qdrant/qdrant/pull/3525>.
 pub const INDEXSET_ITER_THRESHOLD: usize = 13;
 
+/// Default tokenizer for unindexed text/phrase filters. Matches
+/// [`TextIndexParams::default`] (Word tokenizer, lowercase on).
+static DEFAULT_UNINDEXED_TEXT_TOKENIZER: LazyLock<Tokenizer> =
+    LazyLock::new(|| Tokenizer::new_from_text_index_params(&TextIndexParams::default()));
+
+fn collect_unindexed_document_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    DEFAULT_UNINDEXED_TEXT_TOKENIZER.tokenize(TokenizerTextKind::Document, text, |token| {
+        tokens.push(token.into_owned());
+    });
+    tokens
+}
+
+fn collect_unindexed_query_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    DEFAULT_UNINDEXED_TEXT_TOKENIZER.tokenize(TokenizerTextKind::Query, text, |token| {
+        tokens.push(token.into_owned());
+    });
+    tokens
+}
+
+fn unindexed_text_match(stored: &str, query: &str) -> bool {
+    let document_tokens = collect_unindexed_document_tokens(stored);
+    let query_tokens = collect_unindexed_query_tokens(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    query_tokens.iter().all(|query_token| {
+        document_tokens
+            .iter()
+            .any(|document_token| document_token == query_token)
+    })
+}
+
+fn unindexed_phrase_match(stored: &str, phrase: &str) -> bool {
+    let document_tokens = collect_unindexed_document_tokens(stored);
+    let phrase_tokens = collect_unindexed_query_tokens(phrase);
+    if phrase_tokens.is_empty() {
+        return false;
+    }
+    document_tokens
+        .windows(phrase_tokens.len())
+        .any(|window| window == phrase_tokens.as_slice())
+}
+
 pub trait ValueChecker {
     fn check_match(&self, payload: &Value) -> bool;
 
@@ -24,7 +73,11 @@ pub trait ValueChecker {
     fn _check(&self, payload: &Value) -> bool {
         match payload {
             Value::Array(values) => values.iter().any(|x| self.check_match(x)),
-            _ => self.check_match(payload),
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Object(_) => self.check_match(payload),
         }
     }
 
@@ -134,11 +187,17 @@ impl ValueChecker for FieldCondition {
             geo_radius: _,
             geo_bounding_box: _,
             geo_polygon: _,
-            values_count: _,
+            values_count,
             key: _,
             is_empty,
             is_null,
         } = self;
+        // A missing field is treated as having a value count of 0, so the
+        // `values_count` bounds must be evaluated against 0 instead of being
+        // skipped (which would incorrectly never match missing fields).
+        if let Some(values_count) = values_count {
+            return values_count.check_empty();
+        }
         if let Some(is_empty) = is_empty {
             return *is_empty;
         }
@@ -156,21 +215,43 @@ impl ValueChecker for Match {
                 (Value::Bool(stored), ValueVariants::Bool(val)) => stored == val,
                 (Value::String(stored), ValueVariants::String(val)) => stored == val,
                 (Value::Number(stored), ValueVariants::Integer(val)) => {
-                    stored.as_i64().map(|num| num == *val).unwrap_or(false)
+                    stored.as_i64().is_some_and(|num| num == *val)
                 }
                 _ => false,
             },
-            Match::Text(MatchText { text }) | Match::Phrase(MatchPhrase { phrase: text }) => {
-                match payload {
-                    Value::String(stored) => stored.contains(text),
-                    _ => false,
-                }
-            }
+            Match::Text(MatchText { text }) => match payload {
+                Value::String(stored) => unindexed_text_match(stored, text),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => false,
+            },
+            Match::Phrase(MatchPhrase { phrase }) => match payload {
+                Value::String(stored) => unindexed_phrase_match(stored, phrase),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => false,
+            },
             Match::TextAny(MatchTextAny { text_any }) => match payload {
                 Value::String(stored) => text_any
                     .split_whitespace()
                     .any(|token| stored.contains(token)),
-                _ => false,
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => false,
+            },
+            Match::Prefix(MatchPrefix { prefix }) => match payload {
+                Value::String(stored) => stored.starts_with(prefix),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => false,
             },
             Match::Any(MatchAny { any }) => match (payload, any) {
                 (Value::String(stored), AnyVariants::Strings(list)) => {
@@ -228,7 +309,11 @@ impl ValueChecker for Range<OrderedFloat<FloatPayloadType>> {
                 .as_f64()
                 .map(|number| self.check_range(OrderedFloat(number)))
                 .unwrap_or(false),
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Array(_)
+            | Value::Object(_) => false,
         }
     }
 }
@@ -254,7 +339,11 @@ impl ValueChecker for GeoBoundingBox {
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -271,7 +360,11 @@ impl ValueChecker for GeoRadius {
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -290,7 +383,11 @@ impl ValueChecker for GeoPolygon {
                 }
                 false
             }
-            _ => false,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => false,
         }
     }
 }
@@ -377,6 +474,62 @@ mod tests {
             lte: None,
         };
         assert!(gte_two_countries_query.check(&countries));
+    }
+
+    #[test]
+    fn test_value_count_missing_field() {
+        // A missing payload field must be treated as a value count of 0 by
+        // `values_count` filters (regression for
+        // https://github.com/qdrant/qdrant/issues/9586).
+        let key = JsonPath::new("tags");
+
+        let field_condition = |values_count: ValuesCount| FieldCondition {
+            r#match: None,
+            range: None,
+            geo_radius: None,
+            geo_bounding_box: None,
+            geo_polygon: None,
+            values_count: Some(values_count),
+            key: key.clone(),
+            is_empty: None,
+            is_null: None,
+        };
+
+        let lt_one = field_condition(ValuesCount {
+            lt: Some(1),
+            gt: None,
+            gte: None,
+            lte: None,
+        });
+        // 0 < 1 -> a missing field matches
+        assert!(lt_one.check_empty());
+
+        let gte_zero = field_condition(ValuesCount {
+            lt: None,
+            gt: None,
+            gte: Some(0),
+            lte: None,
+        });
+        // 0 >= 0 -> a missing field matches
+        assert!(gte_zero.check_empty());
+
+        let lte_zero = field_condition(ValuesCount {
+            lt: None,
+            gt: None,
+            gte: None,
+            lte: Some(0),
+        });
+        // 0 <= 0 -> a missing field matches
+        assert!(lte_zero.check_empty());
+
+        let gte_one = field_condition(ValuesCount {
+            lt: None,
+            gt: None,
+            gte: Some(1),
+            lte: None,
+        });
+        // 0 >= 1 is false -> a missing field does not match
+        assert!(!gte_one.check_empty());
     }
 
     #[test]

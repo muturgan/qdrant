@@ -21,17 +21,19 @@ class TestStorageCompatibility:
     """
 
     VERSIONS = [
+        "v1.19.0",
+        "v1.18.1",
+        "v1.18.0",
+        "v1.17.1",
+        "v1.17.0",
+        "v1.16.3",
+        "v1.16.2",
         "v1.16.1",
         "v1.16.0",
-        "v1.15.5",
-        "v1.15.4",
-        "v1.15.3",
-        "v1.15.2",
-        "v1.15.1",
-        # "v1.15.0", the archive triggers debug_assertion for the UUID payload index https://github.com/qdrant/qdrant/pull/6916
     ]
 
-    EXPECTED_COLLECTIONS = [
+    # Collections present in every published compatibility archive
+    BASE_COLLECTIONS = [
         "test_collection_vector_memory",
         "test_collection_vector_on_disk",
         "test_collection_vector_on_disk_threshold",
@@ -45,6 +47,36 @@ class TestStorageCompatibility:
         "test_collection_vector_datatype_u8",
         "test_collection_vector_datatype_f16"
     ]
+
+    # Collections added to `populate_db.py` later on, keyed by the oldest release
+    # whose published archive contains them. Archives are generated once per
+    # release, so older ones keep the collection set of their own generation.
+    #
+    # TurboQuant quantization is supported since v1.18.0 and the `turbo4` datatype
+    # since v1.18.3, but the generator only started creating these collections for
+    # v1.19.0. Lower the key if an older archive is regenerated.
+    VERSIONED_COLLECTIONS = {
+        (1, 19, 0): [
+            "test_collection_turbo_bits1_5",
+            "test_collection_turbo_bits4",
+            "test_collection_vector_datatype_turbo4",
+        ],
+    }
+
+    @staticmethod
+    def _parse_version(version: str) -> tuple[int, ...]:
+        """Turn a version tag such as "v1.19.1" into a comparable tuple."""
+        return tuple(int(part) for part in version.lstrip("v").split("."))
+
+    @classmethod
+    def _expected_collections(cls, version: str) -> list[str]:
+        """Collections the archive of `version` is expected to contain."""
+        parsed = cls._parse_version(version)
+        collections = list(cls.BASE_COLLECTIONS)
+        for min_version, names in cls.VERSIONED_COLLECTIONS.items():
+            if parsed >= min_version:
+                collections.extend(names)
+        return collections
 
     @staticmethod
     def _download_compatibility_data(version: str, storage_test_dir: Path) -> Path:
@@ -72,7 +104,16 @@ class TestStorageCompatibility:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
+        except requests.exceptions.HTTPError as e:
+            # A missing archive means the version was never published, which no
+            # amount of retrying fixes. Skipping it would report the version as
+            # covered while nothing ran, so fail loudly instead.
+            if e.response is not None and e.response.status_code == 404:
+                pytest.fail(f"No published compatibility archive for {version}: {url}")
+            pytest.skip(f"Could not download compatibility data for {version}: {e}")
         except requests.exceptions.RequestException as e:
+            # Connection resets, timeouts and the like are transient, do not turn
+            # unrelated pull requests red over them
             pytest.skip(f"Could not download compatibility data for {version}: {e}")
 
         return compatibility_file
@@ -100,7 +141,10 @@ class TestStorageCompatibility:
 
         return None
 
-    def _check_collections(self, host: str, port: int) -> tuple[bool, str]:
+    DENSE_DIM = 256
+    MULTI_DENSE_DIM = 128
+
+    def _check_collections(self, host: str, port: int, version: str) -> tuple[bool, str]:
         """Check that all collections are loaded properly.
 
         Returns:
@@ -113,7 +157,7 @@ class TestStorageCompatibility:
         except Exception as e:
             return False, f"Error listing collections: {e}"
 
-        expected = set(self.EXPECTED_COLLECTIONS)
+        expected = set(self._expected_collections(version))
         found = set(collections)
         missing = expected - found
         if missing:
@@ -126,6 +170,159 @@ class TestStorageCompatibility:
                     return False, f"Collection {collection} returned status {collection_info['status']}"
             except Exception as error:
                 return False, f"Failed to get collection info for {collection}: {error}"
+
+        return True, ""
+
+    def _query_collections(self, host: str, port: int, version: str) -> tuple[bool, str]:
+        """Run queries against all collections to verify data is actually accessible.
+
+        Sends one query of each kind per collection: dense, sparse, and multivector
+        search, plus scroll with filters covering every payload index type.
+        """
+        base_url = f"http://{host}:{port}"
+
+        for collection in self._expected_collections(version):
+            try:
+                # Dense vector search
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/query",
+                    json={"query": [0.1] * self.DENSE_DIM, "using": "image", "limit": 3},
+                )
+                if not resp.ok:
+                    return False, f"Dense search failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Sparse vector search
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/query",
+                    json={
+                        "query": {"indices": [0, 10, 50], "values": [0.5, 0.3, 0.1]},
+                        "using": "text",
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Sparse search failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Multivector search
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/query",
+                    json={
+                        "query": [[0.1] * self.MULTI_DENSE_DIM, [0.2] * self.MULTI_DENSE_DIM],
+                        "using": "multi-image",
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Multivector search failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with keyword filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "keyword_field", "match": {"value": "hello"}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Keyword filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with keyword prefix filter, archives without the `prefix`
+                # index option answer it by scanning
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "keyword_field", "match": {"prefix": "hel"}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Keyword prefix filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with float range filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "float_field", "range": {"gte": 0.0, "lte": 1.0}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Float filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with integer range filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "integer_field", "range": {"gte": 0, "lte": 50}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Integer filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with boolean filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "boolean_field", "match": {"value": True}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Boolean filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with geo bounding box filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{
+                            "key": "geo_field",
+                            "geo_bounding_box": {
+                                "top_left": {"lat": 1.0, "lon": 0.0},
+                                "bottom_right": {"lat": 0.0, "lon": 1.0},
+                            },
+                        }]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Geo filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with full-text match filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "text_field", "match": {"text": "hello"}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Text filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with uuid filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "uuid_field", "match": {"value": "00000000-0000-0000-0000-000000000000"}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"UUID filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+                # Scroll with datetime range filter
+                resp = requests.post(
+                    f"{base_url}/collections/{collection}/points/scroll",
+                    json={
+                        "filter": {"must": [{"key": "datetime_field", "range": {"gte": "2020-01-01T00:00:00Z", "lte": "2030-01-01T00:00:00Z"}}]},
+                        "limit": 3,
+                    },
+                )
+                if not resp.ok:
+                    return False, f"Datetime filter scroll failed on {collection}: {resp.status_code} {resp.text}"
+
+            except Exception as e:
+                return False, f"Query failed on {collection}: {e}"
 
         return True, ""
 
@@ -159,9 +356,13 @@ class TestStorageCompatibility:
             if not client.wait_for_server():
                 return False, f"Server failed to start for {test_name} test ({version})"
 
-            success, error_msg = self._check_collections(container_info.host, container_info.http_port)
+            success, error_msg = self._check_collections(container_info.host, container_info.http_port, version)
             if not success:
                 return False, f"{test_name.capitalize()} compatibility failed for {version}: {error_msg}"
+
+            success, error_msg = self._query_collections(container_info.host, container_info.http_port, version)
+            if not success:
+                return False, f"{test_name.capitalize()} query verification failed for {version}: {error_msg}"
 
             return True, ""
         finally:

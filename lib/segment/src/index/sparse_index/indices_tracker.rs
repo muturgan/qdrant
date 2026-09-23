@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use ahash::AHashMap;
 use common::fs::{atomic_save_json, read_json};
+use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use serde::{Deserialize, Serialize};
 use sparse::common::sparse_vector::{RemappedSparseVector, SparseVector};
 use sparse::common::types::{DimId, DimOffset};
@@ -18,7 +19,12 @@ pub struct IndicesTracker {
 impl IndicesTracker {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let path = Self::file_path(path);
-        Ok(read_json(&path)?)
+        read_json(&path)
+    }
+
+    /// Universal-IO variant of [`Self::open`].
+    pub fn open_universal<Fs: UniversalReadFs>(fs: &Fs, path: &Path) -> UioResult<Self> {
+        read_json_via(fs, Self::file_path(path))
     }
 
     pub fn save(&self, path: &Path) -> OperationResult<()> {
@@ -32,9 +38,8 @@ impl IndicesTracker {
 
     pub fn register_indices(&mut self, vector: &SparseVector) {
         for index in &vector.indices {
-            if !self.map.contains_key(index) {
-                self.map.insert(*index, self.map.len() as DimId);
-            }
+            let next = self.map.len() as DimId;
+            self.map.entry(*index).or_insert(next);
         }
     }
 
@@ -42,21 +47,25 @@ impl IndicesTracker {
         self.map.get(&index).copied()
     }
 
+    /// Remap a sparse vector to internal segment-specific indices.
+    ///
+    /// Unknown dimensions ids are filtered out.
     pub fn remap_vector(&self, vector: SparseVector) -> RemappedSparseVector {
-        let mut placeholder_indices = self.map.len() as DimOffset;
         let SparseVector {
             mut indices,
-            values,
+            mut values,
         } = vector;
 
-        indices.iter_mut().for_each(|index| {
-            *index = if let Some(index) = self.remap_index(*index) {
-                index
-            } else {
-                placeholder_indices += 1;
-                placeholder_indices
+        let mut write = 0;
+        for read in 0..indices.len() {
+            if let Some(remapped_index) = self.remap_index(indices[read]) {
+                indices[write] = remapped_index;
+                values[write] = values[read];
+                write += 1;
             }
-        });
+        }
+        indices.truncate(write);
+        values.truncate(write);
 
         let mut remapped_vector = RemappedSparseVector { indices, values };
         remapped_vector.sort_by_indices();

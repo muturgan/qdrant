@@ -29,30 +29,42 @@ pub struct SegmentConfigV5 {
 
 impl From<SegmentConfigV5> for SegmentConfig {
     fn from(old_segment: SegmentConfigV5) -> Self {
-        let vector_data = old_segment
-            .vector_data
+        let SegmentConfigV5 {
+            vector_data,
+            index,
+            storage_type,
+            payload_storage_type,
+            quantization_config,
+        } = old_segment;
+
+        let vector_data = vector_data
             .into_iter()
             .map(|(vector_name, old_data)| {
+                let VectorDataConfigV5 {
+                    size,
+                    distance,
+                    hnsw_config,
+                    quantization_config: vec_quantization_config,
+                    on_disk,
+                } = old_data;
+
                 let new_data = VectorDataConfig {
-                    size: old_data.size,
-                    distance: old_data.distance,
+                    size,
+                    distance,
                     // Use HNSW index if vector specific one is set, or fall back to segment index
-                    index: match old_data.hnsw_config {
+                    index: match hnsw_config {
                         Some(hnsw_config) => Indexes::Hnsw(hnsw_config),
-                        None => old_segment.index.clone(),
+                        None => index.clone(),
                     },
                     // Remove vector specific quantization config if no segment one is set
                     // This is required because in some cases this was incorrectly set on the vector
                     // level
-                    quantization_config: old_segment
-                        .quantization_config
-                        .as_ref()
-                        .and(old_data.quantization_config),
+                    quantization_config: quantization_config.as_ref().and(vec_quantization_config),
                     // Mmap if explicitly on disk, otherwise convert old storage type
-                    storage_type: if old_data.on_disk == Some(true) {
+                    storage_type: if on_disk == Some(true) {
                         VectorStorageType::Mmap
                     } else {
-                        old_segment.storage_type.into()
+                        storage_type.into()
                     },
                     multivector_config: None,
                     datatype: None,
@@ -64,18 +76,12 @@ impl From<SegmentConfigV5> for SegmentConfig {
 
         // ToDo: remove this whole thing once we drop rocksdb support
 
-        #[cfg(feature = "rocksdb")]
-        let default_storage_type = PayloadStorageType::OnDisk;
-
-        #[cfg(not(feature = "rocksdb"))]
         let default_storage_type = PayloadStorageType::Mmap;
 
         SegmentConfig {
             vector_data,
             sparse_vector_data: Default::default(),
-            payload_storage_type: old_segment
-                .payload_storage_type
-                .unwrap_or(default_storage_type),
+            payload_storage_type: payload_storage_type.unwrap_or(default_storage_type),
         }
     }
 }
@@ -160,6 +166,7 @@ mod tests {
                         size: 10,
                         distance: Distance::Dot,
                         hnsw_config: Some(HnswConfig {
+                            memory: None,
                             m: 20,
                             ef_construct: 100,
                             full_scan_threshold: 10000,
@@ -180,6 +187,7 @@ mod tests {
                         hnsw_config: None,
                         quantization_config: Some(QuantizationConfig::Scalar(ScalarQuantization {
                             scalar: ScalarQuantizationConfig {
+                                memory: None,
                                 r#type: Default::default(),
                                 quantile: Some(0.99),
                                 always_ram: Some(true),
@@ -192,6 +200,7 @@ mod tests {
             .into_iter()
             .collect(),
             index: Indexes::Hnsw(HnswConfig {
+                memory: None,
                 m: 25,
                 ef_construct: 120,
                 full_scan_threshold: 10000,
@@ -256,6 +265,7 @@ mod tests {
                         hnsw_config: None,
                         quantization_config: Some(QuantizationConfig::Scalar(ScalarQuantization {
                             scalar: ScalarQuantizationConfig {
+                                memory: None,
                                 r#type: Default::default(),
                                 quantile: Some(0.99),
                                 always_ram: Some(true),
@@ -268,6 +278,7 @@ mod tests {
             .into_iter()
             .collect(),
             index: Indexes::Hnsw(HnswConfig {
+                memory: None,
                 m: 25,
                 ef_construct: 120,
                 full_scan_threshold: 10000,
@@ -280,6 +291,7 @@ mod tests {
             payload_storage_type: None,
             quantization_config: Some(QuantizationConfig::Scalar(ScalarQuantization {
                 scalar: ScalarQuantizationConfig {
+                    memory: None,
                     r#type: Default::default(),
                     quantile: Some(0.95),
                     always_ram: Some(true),
@@ -315,6 +327,9 @@ mod tests {
                     panic!("expected scalar quantization")
                 }
                 QuantizationConfig::Binary(_) => {
+                    panic!("expected scalar quantization")
+                }
+                QuantizationConfig::Turbo(_) => {
                     panic!("expected scalar quantization")
                 }
             },

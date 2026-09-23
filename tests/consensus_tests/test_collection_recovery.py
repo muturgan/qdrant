@@ -25,7 +25,9 @@ def test_collection_recovery(tmp_path: pathlib.Path):
         assert shard["points_count"] > 0
 
     # Kill last peer
-    processes.pop().kill()
+    p = processes.pop()
+    restart_port = p.p2p_port
+    p.kill()
 
     # Delete collection files from disk
     collection_path = Path(peer_dirs[-1]) / "storage" / "collections" / COLLECTION_NAME
@@ -33,10 +35,14 @@ def test_collection_recovery(tmp_path: pathlib.Path):
     shutil.rmtree(collection_path)
 
     # Restart the peer
-    peer_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_url)
+    peer_url = start_peer(peer_dirs[-1], "peer_0_restarted.log", bootstrap_url, port=restart_port)
 
     # Wait until peer is up
     wait_for_peer_online(peer_url)
+
+    # Snapshot request needs a known leader; recover before that is a silent no-op
+    # (POST /cluster/recover returns 200 even when raft drops the request).
+    wait_for(leader_is_defined, peer_url)
 
     # Recover Raft state
     recover_raft_state(peer_url)

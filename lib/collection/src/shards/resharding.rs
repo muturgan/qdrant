@@ -37,20 +37,37 @@ impl ReshardState {
     }
 
     pub fn matches(&self, key: &ReshardKey) -> bool {
-        self.uuid == key.uuid
-            && self.direction == key.direction
-            && self.peer_id == key.peer_id
-            && self.shard_id == key.shard_id
-            && self.shard_key == key.shard_key
+        let ReshardKey {
+            uuid,
+            direction,
+            peer_id,
+            shard_id,
+            shard_key,
+        } = key;
+
+        self.uuid == *uuid
+            && self.direction == *direction
+            && self.peer_id == *peer_id
+            && self.shard_id == *shard_id
+            && self.shard_key == *shard_key
     }
 
     pub fn key(&self) -> ReshardKey {
+        let ReshardState {
+            uuid,
+            peer_id,
+            shard_id,
+            shard_key,
+            direction,
+            stage: _,
+        } = self;
+
         ReshardKey {
-            uuid: self.uuid,
-            direction: self.direction,
-            peer_id: self.peer_id,
-            shard_id: self.shard_id,
-            shard_key: self.shard_key.clone(),
+            uuid: *uuid,
+            direction: *direction,
+            peer_id: *peer_id,
+            shard_id: *shard_id,
+            shard_key: shard_key.clone(),
         }
     }
 }
@@ -79,6 +96,23 @@ pub struct ReshardKey {
     pub peer_id: PeerId,
     pub shard_id: ShardId,
     pub shard_key: Option<ShardKey>,
+}
+
+impl ReshardKey {
+    /// Pin the auto-sharding invariant that resharding always targets the
+    /// last shard id. `shard_number` must equal `shard_id` or `shard_id + 1`;
+    /// any other value would silently corrupt the count via the id-derived
+    /// `shard_number` update.
+    pub(crate) fn debug_assert_targets_last_shard(&self, shard_number: u32) {
+        let shard_id = self.shard_id;
+        debug_assert!(
+            shard_id
+                .checked_add(1)
+                .is_some_and(|next| shard_number == shard_id || shard_number == next),
+            "auto-sharding resharding must target the last shard id; \
+             shard_number={shard_number} shard_id={shard_id}",
+        );
+    }
 }
 
 impl fmt::Display for ReshardKey {
