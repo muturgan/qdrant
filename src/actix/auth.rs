@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn test_blacklist_parsing() {
-        let blacklist = Blacklist::try_from("").unwrap().into_inner();
-        assert!(blacklist.is_empty());
+        let blacklist = Blacklist::try_from("").unwrap();
+        assert!(blacklist.into_inner().is_empty());
 
         let blacklist = Blacklist::try_from(
             "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
