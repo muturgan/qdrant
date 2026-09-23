@@ -135,7 +135,7 @@ impl TryFrom<HashMap<String, HashSet<String>>> for Blacklist {
     type Error = std::io::Error;
 
     fn try_from(val: HashMap<String, HashSet<String>>) -> Result<Self, Self::Error> {
-        let mut blacklist = HashMap::new();
+        let mut blacklist = HashMap::with_capacity(val.len());
 
         for (method_str, paths) in val {
             let method =
@@ -156,48 +156,54 @@ impl TryFrom<&str> for Blacklist {
     type Error = std::io::Error;
 
     fn try_from(blacklist_str: &str) -> Result<Self, Self::Error> {
+        let blacklist_str = blacklist_str.trim();
+
+        if blacklist_str.is_empty() {
+            return Ok(Self(Default::default()));
+        }
+
         if let Ok(json) = serde_json::from_str::<HashMap<String, HashSet<String>>>(blacklist_str) {
             return Self::try_from(json);
         }
 
         let mut blacklist = HashMap::new();
 
-        if !blacklist_str.is_empty() {
-            for pair in blacklist_str.trim().split(',') {
-                let mut pair_iter = pair.trim().split(' ');
+        for pair in blacklist_str.split(',') {
+            let mut pair_iter = pair.trim().split(' ');
 
-                let Some(method_str) = pair_iter.next() else {
-                    return Err(Self::Error::other(
-                        "No method provided for a blacklist item",
-                    ));
-                };
-                let method = Method::from_bytes(method_str.trim().to_uppercase().as_bytes())
-                    .map_err(|_| {
-                        Self::Error::other(format!(
-                            "Provided invalid method for a blacklist: {method_str}"
-                        ))
-                    })?;
+            let Some(method_str) = pair_iter.next() else {
+                return Err(Self::Error::other(
+                    "No method provided for a blacklist item",
+                ));
+            };
+            let method =
+                Method::from_bytes(method_str.trim().to_uppercase().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
 
-                let Some(path_str) = pair_iter.next() else {
-                    return Err(Self::Error::other("No path provided for a blacklist item"));
-                };
-                if pair_iter.next().is_some() {
-                    return Err(Self::Error::other(
-                        "Provided extra parts for a blacklist item",
-                    ));
-                }
-
-                match blacklist.get_mut(&method) {
-                    None => {
-                        let paths = HashSet::from([path_str.trim().to_string()]);
-                        blacklist.insert(method, paths);
-                    }
-                    Some(paths) => {
-                        paths.insert(path_str.trim().to_string());
-                    }
-                };
+            let Some(path_str) = pair_iter.next() else {
+                return Err(Self::Error::other("No path provided for a blacklist item"));
+            };
+            if pair_iter.next().is_some() {
+                return Err(Self::Error::other(
+                    "Provided extra parts for a blacklist item",
+                ));
             }
-        };
+
+            let path_str = path_str.trim().to_owned();
+
+            match blacklist.get_mut(&method) {
+                None => {
+                    let paths = HashSet::from([path_str]);
+                    blacklist.insert(method, paths);
+                }
+                Some(paths) => {
+                    paths.insert(path_str);
+                }
+            };
+        }
 
         Ok(Self(blacklist))
     }
