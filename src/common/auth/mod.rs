@@ -205,12 +205,6 @@ impl AuthKeys {
                 ));
             }
 
-            if blacklist_matches {
-                return Err(AuthError::Forbidden(
-                    "This path is blacklisted by config".to_string(),
-                ));
-            }
-
             return Ok((access, InferenceToken(sub), AuthType::Jwt, subject));
         }
 
