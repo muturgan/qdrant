@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use actix_web::body::EitherBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
+use actix_web::http::Method;
 use actix_web::{Error, FromRequest, HttpMessage, HttpResponse, ResponseError};
 use futures_util::future::LocalBoxFuture;
 use storage::audit::{audit_trust_forwarded_headers, extract_tracing_id};
@@ -12,6 +14,7 @@ use storage::rbac::{Access, AccessRequirements, CollectionMultipass};
 use super::forwarded;
 use super::helpers::HttpError;
 use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
+use crate::settings::BlacklistConfig;
 
 /// Actix middleware factory that validates API keys / JWTs and inserts an
 /// [`Auth`] object into request extensions.
@@ -21,13 +24,15 @@ use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
 pub struct AuthTransform {
     auth_keys: AuthKeys,
     whitelist: Vec<WhitelistItem>,
+    blacklist: Blacklist,
 }
 
 impl AuthTransform {
-    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>) -> Self {
+    pub fn new(auth_keys: AuthKeys, whitelist: Vec<WhitelistItem>, blacklist: Blacklist) -> Self {
         Self {
             auth_keys,
             whitelist,
+            blacklist,
         }
     }
 }
@@ -48,6 +53,7 @@ where
         ready(Ok(AuthMiddleware {
             auth_keys: Arc::new(self.auth_keys.clone()),
             whitelist: self.whitelist.clone(),
+            blacklist: self.blacklist.clone(),
             service: Arc::new(service),
         }))
     }
@@ -87,10 +93,143 @@ impl PathMode {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Blacklist(HashMap<Method, HashSet<String>>);
+
+impl Blacklist {
+    pub fn matches(&self, method: &Method, path: &str) -> bool {
+        let Some(paths) = self.0.get(method) else {
+            return false;
+        };
+
+        paths.iter().any(|path_str| {
+            let mut blacklist_iter = path_str.split('/');
+            let mut passed_iter = path.split('/');
+
+            loop {
+                match blacklist_iter.next() {
+                    Some(blacklist_part) => match passed_iter.next() {
+                        Some(passed_part) => {
+                            if blacklist_part != passed_part && blacklist_part != "*" {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    },
+                    None => match passed_iter.next() {
+                        Some(_passed_part) => return false,
+                        None => return true,
+                    },
+                };
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> HashMap<Method, HashSet<String>> {
+        self.0
+    }
+}
+
+impl TryFrom<HashMap<String, HashSet<String>>> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(val: HashMap<String, HashSet<String>>) -> Result<Self, Self::Error> {
+        let mut blacklist = HashMap::with_capacity(val.len());
+
+        for (method_str, paths) in val {
+            let method =
+                Method::from_bytes(method_str.to_uppercase().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
+
+            blacklist.insert(method, paths);
+        }
+
+        Ok(Self(blacklist))
+    }
+}
+
+impl TryFrom<&str> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(blacklist_str: &str) -> Result<Self, Self::Error> {
+        let blacklist_str = blacklist_str.trim();
+
+        if blacklist_str.is_empty() {
+            return Ok(Self(Default::default()));
+        }
+
+        if let Ok(json) = serde_json::from_str::<HashMap<String, HashSet<String>>>(blacklist_str) {
+            return Self::try_from(json);
+        }
+
+        let mut blacklist = HashMap::new();
+
+        for pair in blacklist_str.split(',') {
+            let mut pair_iter = pair.trim().split(' ');
+
+            let Some(method_str) = pair_iter.next() else {
+                return Err(Self::Error::other(
+                    "No method provided for a blacklist item",
+                ));
+            };
+            let method =
+                Method::from_bytes(method_str.trim().to_uppercase().as_bytes()).map_err(|_| {
+                    Self::Error::other(format!(
+                        "Provided invalid method for a blacklist: {method_str}"
+                    ))
+                })?;
+
+            let Some(path_str) = pair_iter.next() else {
+                return Err(Self::Error::other("No path provided for a blacklist item"));
+            };
+            if pair_iter.next().is_some() {
+                return Err(Self::Error::other(
+                    "Provided extra parts for a blacklist item",
+                ));
+            }
+
+            let path_str = path_str.trim().to_owned();
+
+            match blacklist.get_mut(&method) {
+                None => {
+                    let paths = HashSet::from([path_str]);
+                    blacklist.insert(method, paths);
+                }
+                Some(paths) => {
+                    paths.insert(path_str);
+                }
+            };
+        }
+
+        Ok(Self(blacklist))
+    }
+}
+
+impl TryFrom<Option<&BlacklistConfig>> for Blacklist {
+    type Error = std::io::Error;
+
+    fn try_from(config: Option<&BlacklistConfig>) -> Result<Self, Self::Error> {
+        let Some(config) = config else {
+            return Ok(Self(Default::default()));
+        };
+
+        match config {
+            BlacklistConfig::Raw(s) => Self::try_from(s.as_str()),
+            BlacklistConfig::Parsed(val) => Self::try_from(val.clone()),
+        }
+    }
+}
+
 pub struct AuthMiddleware<S> {
     auth_keys: Arc<AuthKeys>,
     /// List of items whitelisted from authentication.
     whitelist: Vec<WhitelistItem>,
+    /// List of items blackisted for JWT authentication by configuration.
+    blacklist: Blacklist,
     service: Arc<S>,
 }
 
@@ -126,6 +265,8 @@ where
 
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
+        let path = req.path();
+        let blacklist_matches = self.blacklist.matches(req.method(), path);
         Box::pin(async move {
             let remote = if audit_trust_forwarded_headers() {
                 forwarded::forwarded_for(&req)
@@ -142,7 +283,10 @@ where
             });
 
             match auth_keys
-                .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+                .validate_request(
+                    |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+                    blacklist_matches,
+                )
                 .await
             {
                 Ok((access, inference_token, auth_type, subject)) => {
@@ -252,5 +396,75 @@ impl FromRequest for ActixAccessManage {
             Ok(multipass) => ready(Ok(Self { auth, multipass })),
             Err(err) => ready(Err(HttpError::from(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blacklist_parsing() {
+        let blacklist = Blacklist::try_from("").unwrap();
+        assert!(blacklist.into_inner().is_empty());
+
+        let blacklist = Blacklist::try_from(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover",
+        )
+        .unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let blacklist = Blacklist::try_from(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(
+            "GET /debugger, put /cluster/metadata/keys/*, PUT /collections/*/snapshots/recover"
+                .to_string(),
+        );
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = BlacklistConfig::Raw(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#.to_string());
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let map = serde_json::from_str::<HashMap<String, HashSet<String>>>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let config = BlacklistConfig::Parsed(map);
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
+
+        let config = serde_json::from_str::<BlacklistConfig>(r#"{"get":["/debugger"],"PUT":["/cluster/metadata/keys/*","/collections/*/snapshots/recover"]}"#).unwrap();
+        let blacklist = Blacklist::try_from(Some(&config)).unwrap();
+        assert!(blacklist.matches(&Method::GET, "/debugger"));
+        assert!(!blacklist.matches(&Method::GET, "/debuggerr"));
+        assert!(!blacklist.matches(&Method::POST, "/debugger"));
+        assert!(blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots/recover/1"));
+        assert!(!blacklist.matches(&Method::PUT, "/collections/c1/snapshots"));
     }
 }
